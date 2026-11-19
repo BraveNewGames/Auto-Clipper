@@ -44,6 +44,10 @@ function fmtDur(sec) {
   if (sec === null || sec === undefined) return "?";
   return sec >= 60 ? `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, "0")}s` : `${sec.toFixed(1)}s`;
 }
+function appendAll(el, ...children) {
+  for (const c of children.flat(Infinity)) if (c !== null && c !== undefined && c !== false) el.append(c);
+  return el;
+}
 function basename(p) { return p ? String(p).split(/[\\/]/).pop() : ""; }
 function dirname(p) { const s = String(p || ""); const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\")); return i > 0 ? s.slice(0, i) : s; }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
@@ -193,7 +197,7 @@ function renderSession(main) {
       recentBox.appendChild(h("li", null,
         h("a", { onclick: () => { pathInput.value = folder; doOpen(); } }, it.session_id || basename(folder)),
         " ", h("span", { class: "muted mono small" }, folder),
-        it.opened_at || it.updated_at ? h("span", { class: "muted small" }, "  · " + (it.opened_at || it.updated_at)) : null));
+        it.opened_at || it.updated_at ? h("span", { class: "muted small" }, "  · last used " + new Date(it.opened_at || it.updated_at).toLocaleString()) : null));
     }
   }).catch(() => { recentBox.innerHTML = ""; recentBox.appendChild(h("li", { class: "muted" }, "Unavailable.")); });
 
@@ -233,21 +237,24 @@ function partEnd(p) {
   return d == null ? null : p.offset + d;
 }
 
+const SEAM_TOL = 0.5; // gaps/overlaps this small between consecutive parts are alignment noise
+
 function analyzeCoverage(s) {
   // Per POV: gaps between consecutive parts and overlaps, computed from offset/duration.
   const out = {};
   for (const pov of s.povs) {
     const parts = pov.parts.slice().sort((a, b) => a.offset - b.offset);
-    const gaps = [], overlaps = [], unknown = [];
+    const gaps = [], overlaps = [], unknown = [], seams = [];
     for (const p of parts) if (p.duration == null) unknown.push(p);
     for (let i = 1; i < parts.length; i++) {
       const prevEnd = partEnd(parts[i - 1]);
       if (prevEnd == null) continue;
       const st = parts[i].offset;
-      if (st > prevEnd + 0.05) gaps.push([prevEnd, st, parts[i - 1], parts[i]]);
-      else if (st < prevEnd - 0.05) overlaps.push([st, Math.min(prevEnd, partEnd(parts[i]) ?? prevEnd), parts[i - 1], parts[i]]);
+      if (Math.abs(st - prevEnd) <= SEAM_TOL) { if (Math.abs(st - prevEnd) > 0.001) seams.push([prevEnd, st, parts[i - 1], parts[i]]); }
+      else if (st > prevEnd) gaps.push([prevEnd, st, parts[i - 1], parts[i]]);
+      else overlaps.push([st, Math.min(prevEnd, partEnd(parts[i]) ?? prevEnd), parts[i - 1], parts[i]]);
     }
-    out[pov.pov_id] = { gaps, overlaps, unknown };
+    out[pov.pov_id] = { gaps, overlaps, unknown, seams };
   }
   return out;
 }
@@ -379,6 +386,7 @@ function renderCoverageNotes(s) {
     const c = cov[pov.pov_id];
     for (const g of c.gaps) items.push(h("li", null, h("span", { class: "badge bad" }, "gap"), ` ${pov.name}: no footage ${fmt(g[0])} – ${fmt(g[1])} (${fmtDur(g[1] - g[0])}) between part ${g[2].index} and part ${g[3].index}`));
     for (const o of c.overlaps) items.push(h("li", null, h("span", { class: "badge warn" }, "overlap"), ` ${pov.name}: part ${o[2].index} and part ${o[3].index} overlap ${fmt(o[0])} – ${fmt(o[1])}`));
+    for (const sm of c.seams) items.push(h("li", { class: "muted small" }, `${pov.name}: part ${sm[2].index} → part ${sm[3].index} join is ${sm[1] > sm[0] ? "a gap" : "an overlap"} of ${Math.abs(sm[1] - sm[0]).toFixed(2)}s (likely estimate noise; set offsets manually or chain if the files are back-to-back)`));
     for (const p of c.unknown) items.push(h("li", null, h("span", { class: "badge warn" }, "duration?"), ` ${pov.name} part ${p.index}: video duration unknown — enter it manually for exact cuts`));
     for (const p of pov.parts) if (p.index > 1 && p.offset_source === "default")
       items.push(h("li", null, h("span", { class: "badge warn" }, "unaligned"), ` ${pov.name} part ${p.index}: offset never set — chain parts or suggest offsets`));
@@ -723,7 +731,7 @@ function guideCard(sg) {
     sg.needs_visual_check ? h("div", { class: "v" }, h("b", null, "Needs visual check: "), sg.needs_visual_check) : null,
     sg.uncertainty ? h("div", { class: "u" }, h("b", null, "Uncertainty: "), sg.uncertainty) : null) : null;
 
-  card.append(
+  appendAll(card,
     h("div", { class: "card-top" },
       h("span", { class: "mono", style: { color: "var(--accent)" } }, sg.event_id || "—"),
       h("span", { class: "mono muted" }, sg.suggestion_id),
@@ -822,7 +830,7 @@ function renderExport(main) {
         h("thead", null, h("tr", null, ["Reviewer", "POV", "Part", "Pass", "Rows", "CSV file", "Load into", ""].map((x) => h("th", null, x)))),
         h("tbody", null, r.files.map((f) => h("tr", null,
           h("td", null, h("span", { class: "badge rev" }, f.reviewer)), h("td", null, f.pov_name), h("td", null, f.part_index ?? f.part_id),
-          h("td", null, f.pass_no), h("td", null, f.rows), h("td", { class: "mono small" }, f.csv_path),
+          h("td", null, f.pass_no), h("td", null, f.rows), h("td", { class: "mono small", title: f.csv_path }, f.csv_path.startsWith(r.out_dir) ? f.csv_path.slice(r.out_dir.length + 1) : f.csv_path),
           h("td", { class: "mono small muted" }, basename(f.video_path) || "(no video)"),
           h("td", null, h("button", { class: "btn small", onclick: action(() => api("/api/open-path", { path: f.folder })) }, "Open folder"))))))
         : h("div", { class: "muted" }, "No rows matched the selected statuses.")));
@@ -830,7 +838,7 @@ function renderExport(main) {
 
   const infoBox = h("div", { class: "panel" }, h("h2", null, "Expected export filenames"), h("div", { class: "muted" }, "Loading…"));
   const setupBox = h("div", { class: "panel" }, h("h2", null, "LosslessCut one-time setup"), h("div", { class: "muted" }, "Loading…"));
-  main.append(h("div", { class: "grid2" }, infoBox, setupBox));
+  main.appendChild(h("div", { class: "grid2" }, infoBox, setupBox));
   const fill = (info) => {
     infoBox.lastChild.remove();
     const entries = Object.entries(info.expected || {});
