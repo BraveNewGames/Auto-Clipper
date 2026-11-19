@@ -43,8 +43,8 @@ def _estimated_duration(session, part):
 def map_range(session, start, end, pad_before=None, pad_after=None) -> list[LocalRange]:
     if end <= start:
         return []
-    start -= session.pad_before if pad_before is None else pad_before
-    end += session.pad_after if pad_after is None else pad_after
+    padded_start = start - (session.pad_before if pad_before is None else pad_before)
+    padded_end = end + (session.pad_after if pad_after is None else pad_after)
     ranges = []
     for pov in session.povs:
         pieces = []
@@ -57,13 +57,16 @@ def map_range(session, start, end, pad_before=None, pad_after=None) -> list[Loca
                 duration = _estimated_duration(session, part)
             if duration is None:
                 continue
-            first = max(start, part.offset)
-            last = min(end, part.offset + duration)
+            part_end = part.offset + duration
+            if min(end, part_end) <= max(start, part.offset):
+                continue
+            first = max(padded_start, part.offset)
+            last = min(padded_end, part_end)
             if last > first:
                 pieces.append(LocalRange(
                     pov.pov_id, pov.name, part.part_id, part.index,
                     first - part.offset, last - part.offset, first, last,
-                    first > start, last < end, len(pieces) + 1, 0, unknown,
+                    first > padded_start, last < padded_end, len(pieces) + 1, 0, unknown,
                 ))
         for piece in pieces:
             piece.pieces = len(pieces)

@@ -61,7 +61,7 @@ class PipelineE2ETest(unittest.TestCase):
             self.assertEqual(session.part_by_id("cindy-p3").offset_source, "chained")
             self.assertEqual(coverage["povs"]["andres"]["gaps"], [[312.5, 330]])
 
-            # Editorial padding would deliberately reach across the edges of this gap.
+            # Compare exact CSV ranges to the original review windows.
             mapped = self.cli("map", folder, "--pad-before", "0", "--pad-after", "0")
             self.assertEqual(len(mapped), 5)
             session = load_session(folder)

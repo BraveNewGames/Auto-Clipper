@@ -59,6 +59,23 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([(r.local_start, r.local_end, r.piece, r.pieces) for r in ranges],
                          [(19, 20, 1, 3), (0, 10, 2, 3), (0, 2, 3, 3)])
 
+    def test_padding_does_not_fill_andres_gap(self):
+        parts = [Part("andres-p1", 1, duration=300, offset=12.5),
+                 Part("andres-p2", 2, duration=270, offset=330)]
+        session = Session(povs=[POV("andres", "Andres", parts)])
+        self.assertEqual(map_range(session, 315, 328), [])
+
+    def test_padding_does_not_add_a_third_piece_to_a_boundary_crossing(self):
+        parts = [Part("cindy-p1", 1, duration=10, offset=0),
+                 Part("cindy-p2", 2, duration=10, offset=10),
+                 Part("cindy-p3", 3, duration=10, offset=20)]
+        session = Session(povs=[POV("cindy", "Cindy", parts)])
+        ranges = map_range(session, 9, 18)
+        self.assertEqual(
+            [(r.part_id, r.local_start, r.local_end, r.piece, r.pieces) for r in ranges],
+            [("cindy-p1", 4, 10, 1, 2), ("cindy-p2", 0, 10, 2, 2)],
+        )
+
     def test_unknown_duration_uses_transcript(self):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "p.srt").write_text(

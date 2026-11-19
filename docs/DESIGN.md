@@ -234,8 +234,10 @@ python -m autoclipper.cli map samples/NB-2026-11-16 --pad-before 0 --pad-after 0
 python -m autoclipper.cli export samples/NB-2026-11-16
 ```
 
-Use zero padding when verifying the 315–328 s sample gap. The standard 5 s
-padding deliberately reaches footage on both sides of Andres's 312.5–330 s gap.
+The walkthrough uses zero padding for direct comparison with the unpadded
+review windows. Mapping selects parts that overlap the original event and
+then clips padding to those parts. The 315–328 s event has no Andres range
+with either zero or standard 5 s padding.
 Padding options persist for subsequent commands. Use `chain --offset PART_ID=TIME`
 for manual anchors on other recordings. Map and export accept repeatable
 `--review PATH`; a fresh sample session automatically loads its review JSONs.
