@@ -84,19 +84,27 @@ def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _part_ranges(session):
+def _part_ranges(session, cues_by_part=None):
+    """[(pov, [(part, start, end|None, estimated:bool)])]; unknown durations estimated from the SRT."""
     out = []
     for pov in session.povs:
         rows = []
         for pt in sorted(pov.parts, key=lambda p: (p.index, p.part_id)):
             start = pt.offset or 0.0
-            end = None if pt.duration is None else start + pt.duration
-            rows.append((pt, start, end))
+            est = False
+            if pt.duration is not None and pt.duration_source != "srt_estimate":
+                end = start + pt.duration
+            else:
+                cues = (cues_by_part or {}).get(pt.part_id) or []
+                last = max((c.local_end for c in cues), default=pt.duration)
+                end = None if last is None else start + last
+                est = end is not None
+            rows.append((pt, start, end, est))
         out.append((pov, rows))
     return out
 
 
-def session_summary(session) -> str:
+def session_summary(session, cues_by_part=None) -> str:
     lines = [f"Session: {session.session_id or '(unnamed)'}"]
     if getattr(session, "game", ""):
         lines.append(f"Game: {session.game}")
@@ -104,20 +112,25 @@ def session_summary(session) -> str:
         lines.append(f"Notes: {session.notes}")
     lines.append("Recordings on the session timeline (one POV = one player's camera):")
     unaligned = []
-    for pov, rows in _part_ranges(session):
+    estimated = False
+    for pov, rows in _part_ranges(session, cues_by_part):
         segs = []
-        for pt, s, e in rows:
-            segs.append(f"part {pt.index} {fmt_ts(s)}-{fmt_ts(e) if e is not None else '?'}")
+        for pt, s, e, est in rows:
+            estimated = estimated or est
+            end_txt = "?" if e is None else ("~" if est else "") + fmt_ts(e)
+            segs.append(f"part {pt.index} {fmt_ts(s)}-{end_txt}")
             if pt.offset_source == "default" and not (pt is rows[0][0] and pov is session.povs[0]):
                 unaligned.append(f"{pov.name} part {pt.index}")
         gaps = []
-        for (a, _, ae), (b, bs, _) in zip(rows, rows[1:]):
+        for (a, _, ae, _), (b, bs, _, _) in zip(rows, rows[1:]):
             if ae is not None and bs - ae > 0.5:
                 gaps.append(f"{fmt_ts(ae)}-{fmt_ts(bs)}")
         line = f"  - {pov.name}: " + "; ".join(segs)
         if gaps:
             line += "  (NO footage during gap " + ", ".join(gaps) + ")"
         lines.append(line)
+    if estimated:
+        lines.append("  (~ = end estimated from the transcript; video length unknown)")
     if unaligned:
         lines.append("  Alignment not yet verified for: " + ", ".join(unaligned)
                      + " (timestamps for these may be off).")
@@ -125,7 +138,9 @@ def session_summary(session) -> str:
 
 
 def build_review_packet(session, reviewer_name, cues_by_part=None) -> str:
-    from .reconcile import build_session_transcript, transcript_text
+    from .reconcile import build_session_transcript, load_cues, transcript_text
+    if cues_by_part is None:
+        cues_by_part = load_cues(session)
     lines = build_session_transcript(session, cues_by_part)
     example = json.dumps(_EXAMPLE, indent=2).replace("<REVIEWER>", reviewer_name or "Reviewer")
     return f"""You are {reviewer_name or 'an'} independent editorial reviewer for a video game marketing team.
@@ -165,7 +180,7 @@ JSON schema:
 {json.dumps(REVIEW_JSON_SCHEMA, indent=1)}
 
 COVERAGE
-{session_summary(session)}
+{session_summary(session, cues_by_part)}
 
 TRANSCRIPT FORMAT
 [session time] Speaker: text  {{confidence / uncertainty, src: <part> <local SRT time> <Named|Team>; ...}}
