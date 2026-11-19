@@ -194,17 +194,77 @@ class ReconcileTests(unittest.TestCase):
         lines = build_session_transcript(s, cues)
         self.assertEqual([l.speaker for l in lines], ["Didi"])
 
-    def test_followup_team_repeat_across_povs_collapsed(self):
+    def test_followup_team_repeat_across_povs(self):
         s = self.four_povs()
+        # every content word of the shorter Team line is in the longer one -> one line, two sources
         cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 500.0, 504.0, "team",
                                  "The way to revive is you grab with one hand and slap with the other.")],
-                "didi-p1": [cue("didi-p1", "didi", 1, 502.5, 505.0, "team",
-                                "you grab with one hand, and you slap him awake.")],
+                "didi-p1": [cue("didi-p1", "didi", 1, 502.5, 505.0, "team", "you grab with one hand and slap")],
                 "andres-p1": [], "rika-p1": []}
         lines = build_session_transcript(s, cues)
+        self.assertEqual([len(l.sources) for l in lines], [2])
+        # "awake" is not accounted for -> uncertain, keep both (prefer retaining over suppressing)
+        cues["didi-p1"] = [cue("didi-p1", "didi", 1, 502.5, 505.0, "team",
+                               "you grab with one hand, and you slap him awake.")]
+        self.assertEqual(len(build_session_transcript(s, cues)), 2)
+
+    # ---- review of removed samples: composite segments, strict any-order rule, variants
+    def test_composite_team_segment_references_all_named_lines(self):
+        s = self.four_povs()     # sample #2: one Team cue = Didi's line + Cindy's line
+        cues = {"didi-p1": [cue("didi-p1", "didi", 1, 206.0, 207.5, "named", "What's your damage bro?", "Didi"),
+                            cue("didi-p1", "didi", 2, 204.0, 210.0, "team",
+                                "what's your damage bro no for really you're covering up my screen like")],
+                "cindy-p1": [cue("cindy-p1", "cindy", 1, 208.0, 210.0, "named",
+                                 "No, for real. You're covering up my screen.", "Cindy")],
+                "andres-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(sorted(l.speaker for l in lines), ["Cindy", "Didi"])
+        team_src = [src for l in lines for src in l.sources if src["channel"] == "team"]
+        self.assertEqual(len(team_src), 1)
+        didi = next(l for l in lines if l.speaker == "Didi")
+        cindy = next(l for l in lines if l.speaker == "Cindy")
+        other = didi if team_src[0] in cindy.sources else cindy
+        self.assertEqual(team_src[0]["also_lines"], [other.line_id])
+
+    def test_window_rule_keeps_unaccounted_word_during_overlap(self):
+        s = self.four_povs()     # sample #10 at 00:28:07 and the 00:28:09 line next to it
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 1684.9, 1687.0, "named", "roll the dice and see what you get", "Cindy"),
+                             cue("cindy-p1", "cindy", 2, 1687.9, 1689.2, "named", "gambler through and through", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 1685.1, 1689.3, "named",
+                                  "yeah we'll find out i'm still learning this game", "Andres")],
+                "rika-p1": [cue("rika-p1", "rika", 1, 1687.7, 1688.8, "named", "What content do you want?", "Rika"),
+                            cue("rika-p1", "rika", 2, 1687.9, 1689.6, "team", "What content is it? Gamble in the room.")],
+                "didi-p1": [cue("didi-p1", "didi", 1, 1689.6, 1690.2, "team", "I'm still in the room. I'm still in the room.")]}
+        lines = build_session_transcript(s, cues)
+        team = sorted(l.text for l in lines if l.speaker is None)
+        self.assertEqual(team, ["I'm still in the room. I'm still in the room.",
+                                "What content is it? Gamble in the room."])
+
+    def test_short_unique_reaction_kept(self):
+        s = self.four_povs()     # 00:38:27: brief, but its words were not said nearby
+        cues = {"andres-p1": [cue("andres-p1", "andres", 1, 2306.2, 2307.9, "named", "He's supposed to be on the slide!", "Andres")],
+                "cindy-p1": [cue("cindy-p1", "cindy", 1, 2306.8, 2307.8, "named", "I got it. I got it.", "Cindy")],
+                "rika-p1": [cue("rika-p1", "rika", 1, 2307.2, 2308.3, "team", "I was like, I was fine.")],
+                "didi-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertIn("I was like, I was fine.", [l.text for l in lines if l.speaker is None])
+
+    def test_meaning_conflict_variant_kept_as_evidence(self):
+        s = self.four_povs()     # sample #19: weren't vs were
+        cues = {"andres-p1": [cue("andres-p1", "andres", 1, 2676.0, 2678.0, "named",
+                                  "You were the only participant. Yeah.", "Andres")],
+                "cindy-p1": [cue("cindy-p1", "cindy", 1, 2676.1, 2678.0, "team", "You weren't the only participant. Yeah.")],
+                "didi-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
         self.assertEqual(len(lines), 1)
-        self.assertIsNone(lines[0].speaker)
-        self.assertEqual(len(lines[0].sources), 2)
+        l = lines[0]
+        self.assertEqual(l.text, "You were the only participant. Yeah.")        # named mic preferred
+        self.assertEqual(l.sources[1]["text"], "You weren't the only participant. Yeah.")
+        self.assertIn("werent", l.sources[1]["variant"])
+        self.assertIn("conflicting Team wording", l.note)
+        # identical meaning: no variant flag
+        cues["cindy-p1"] = [cue("cindy-p1", "cindy", 1, 2676.1, 2678.0, "team", "you were the only participant yeah")]
+        self.assertNotIn("variant", build_session_transcript(s, cues)[0].sources[1])
 
     def test_followup_new_content_kept_and_gap_is_conservative(self):
         s = self.four_povs()

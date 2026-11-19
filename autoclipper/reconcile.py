@@ -39,6 +39,7 @@ SHORT_TOKENS = 2
 SHORT_WINDOW = 1.2          # short lines ("yeah", "oh no") need tighter timing
 SAME_SPEAKER_DUP = 0.8      # merge a speaker's duplicate named cue from overlapping parts
 AGREE_THRESHOLD = 0.75      # Team renditions with mean similarity below this "disagree"
+TEAM_WORD_AGREE = 0.5       # Team-vs-Team clustering: word-sequence agreement required
 FRAGMENT_CONTAIN = 0.8      # share of a Team fragment's words found (in order) inside a named line
 ECHO_WINDOW = 1.5           # owner's voice leaking into their own Team channel: same clock, tight timing
 ECHO_SIM = 0.8
@@ -179,6 +180,19 @@ def _match_score(a: _Item, b: _Item):
     if sim < (SHORT_THRESHOLD if short else MATCH_THRESHOLD):
         return None
     return sim - 0.04 * dt, sim
+
+
+def _team_team_score(a: _Item, b: _Item):
+    """Like _match_score, but two Team renditions must also agree word by word: the character
+    ratio alone lets different sentences with a shared tail ("...in the room") fuse."""
+    m = _match_score(a, b)
+    if m is None:
+        return None
+    if min(len(a.toks), len(b.toks)) > SHORT_TOKENS:
+        words = difflib.SequenceMatcher(None, a.toks, b.toks, autojunk=False).ratio()
+        if words < TEAM_WORD_AGREE and max(contain(a.toks, b.toks), contain(b.toks, a.toks)) < FRAGMENT_CONTAIN:
+            return None
+    return m
 
 
 def _gap(a: _Item, b: _Item) -> float:
@@ -363,7 +377,7 @@ def build_session_transcript(session, cues_by_part=None) -> list:
     for score, sim, a, b in _windowed_pairs(
             rest, rest,
             lambda a, b: a.key < b.key and a.part.part_id != b.part.part_id
-            and a.channel == b.channel):
+            and a.channel == b.channel, scorer=_team_team_score):
         ga, gb = gid[a.key], gid[b.key]
         if ga == gb:
             continue
@@ -407,7 +421,8 @@ def build_session_transcript(session, cues_by_part=None) -> list:
     #    recording a few seconds apart (one utterance, phrase boundaries differed).
     leftovers = _collapse_team_repeats(leftovers)
 
-    lines = [_named_line(c) for c in anchors]
+    extras = _source_extras(anchors, starts)
+    lines = [_named_line(c, extras) for c in anchors]
     for g in leftovers:
         lines.append(_team_line(g))
 
@@ -422,7 +437,7 @@ i id ill im in is it its ive just know let lets like literally lol me mhm my no 
 okay on or our out right so some something such that thats the them then there theyre this to too
 uh uhh um umm up us very wait want was we well were what whats when where who why will with wow
 yay yeah yep yes yo you youre your if about because into over off than these those its theres
-any been being am i'm how much more really even still also maybe kind sort thing things way""".split())
+any been being am i'm how also kind sort thing things way""".split())
 
 INTERJECTION_WINDOW = 3.0
 
@@ -436,10 +451,6 @@ def _stem(t):
         if len(t) > len(suf) + 2 and t.endswith(suf):
             return t[:-len(suf)]
     return t
-
-
-def _misses_allowed(n):
-    return 2 if n >= 6 else 1 if n >= 3 else 0
 
 
 def _token_found(t, pool):
@@ -513,10 +524,8 @@ def _window_cover_anchor(group, anchors, starts, strict=False):
     pool = set(t for c in near for t in c["anchor"].toks)
     found = sum(1 for t in words if _token_found(t, pool))
     n = len(words)
-    if strict:
-        ok = n >= 2 and found == n
-    else:
-        ok = found >= n - _misses_allowed(n)
+    # any-order matching is the loosest rule: every content word must be accounted for
+    ok = found == n and (n >= 2 or not strict)
     if not ok:
         return None
 
@@ -529,14 +538,14 @@ def _window_cover_anchor(group, anchors, starts, strict=False):
 def _collapse_team_repeats(groups):
     """Fold a Team group into another one from different recordings when its content words are all
     found in it (+-TIME_WINDOW). Longer groups absorb shorter ones."""
-    order = sorted(groups, key=lambda g: (-max(len(content_tokens(x.toks)) for x in g),
+    order = sorted(groups, key=lambda g: (-max(len(set(content_tokens(x.toks))) for x in g),
                                           min(x.start for x in g), g[0].key))
     kept = []
     for g in order:
         parts = {x.part.part_id for x in g}
         lo = min(x.start for x in g)
         hi = max(x.end for x in g)
-        words = content_tokens(max(g, key=lambda x: len(content_tokens(x.toks))).toks)
+        words = sorted(set(content_tokens(max(g, key=lambda x: len(set(content_tokens(x.toks)))).toks)))
         host = None
         if len(words) >= 2:
             for k in kept:
@@ -547,8 +556,7 @@ def _collapse_team_repeats(groups):
                 if max(0.0, max(lo, klo) - min(hi, khi)) > TIME_WINDOW:
                     continue
                 pool = set(t for x in k for t in x.toks)
-                found = sum(1 for t in words if _token_found(t, pool))
-                if found >= len(words) - _misses_allowed(len(words)):
+                if all(_token_found(t, pool) for t in words):
                     host = k
                     break
         if host is None:
@@ -579,14 +587,53 @@ def _covering_anchor(group, anchors, starts):
     return max(near, key=lambda c: (contain(longest.toks, c["anchor"].toks), -abs(c["anchor"].start - lo)))
 
 
-def _named_line(c) -> SessionLine:
+NEGATIONS = set("""not no never nothing nobody none nowhere cant cannot dont doesnt didnt wont
+wouldnt shouldnt couldnt isnt arent wasnt werent aint havent hasnt hadnt""".split())
+
+
+def _negations(toks):
+    return sorted(t for t in toks if t in NEGATIONS)
+
+
+def _source_extras(anchors, starts):
+    """Per attached Team cue (by key): other named lines it also quotes (multi-speaker composite
+    Team segments) and meaning conflicts with the preferred named text (e.g. weren't vs were)."""
+    extras = {}
+    for c in anchors:
+        a = c["anchor"]
+        own = set(a.toks)
+        for x, _sim, kind in c["team"]:
+            info = {}
+            if kind != "echo":
+                rest = [t for t in content_tokens(x.toks) if not _token_found(t, own)]
+                if rest:
+                    others = []
+                    for o in _near_anchors(anchors, starts, x.start, x.end, TIME_WINDOW):
+                        if o is c or o["anchor"].key in others:
+                            continue
+                        if any(_token_found(t, set(o["anchor"].toks)) for t in rest):
+                            others.append(o["anchor"].key)
+                    if others:
+                        info["also_lines"] = others
+            if kind in ("rendition", "fragment", "echo") and _negations(a.toks) != _negations(x.toks):
+                info["variant"] = "negation differs: named %s vs Team %s" % (
+                    "/".join(_negations(a.toks)) or "none", "/".join(_negations(x.toks)) or "none")
+            if info:
+                extras[x.key] = info
+    return extras
+
+
+def _named_line(c, extras=None) -> SessionLine:
     a = c["anchor"]
     srcs = [_source(a, None)]
     for it, sim in c["extra_named"]:
         srcs.append(_source(it, sim))
     team = sorted(c["team"], key=lambda p: (p[0].start, p[0].key))
+    extras = extras or {}
     for it, sim, kind in team:
-        srcs.append(_source(it, sim, kind))
+        src = _source(it, sim, kind)
+        src.update(extras.get(it.key, {}))
+        srcs.append(src)
     notes = []
     if c["extra_named"]:
         notes.append("also captured by an overlapping part of the same recording")
@@ -603,6 +650,12 @@ def _named_line(c) -> SessionLine:
         notes.append("own mic only (no Team corroboration)")
     if echoes:
         notes.append("own voice also echoed in this recording's Team channel")
+    variants = [x for x in srcs if x.get("variant")]
+    if variants:
+        notes.append("conflicting Team wording kept as evidence (%s): %s" % (
+            variants[0]["variant"], "; ".join(f'{v["pov_name"]}: "{v["text"]}"' for v in variants[:3])))
+    if any(x.get("also_lines") for x in srcs):
+        notes.append("some Team segments also contain other speakers' lines")
     return SessionLine(
         line_id=a.key,
         session_start=round(a.start, 3),
