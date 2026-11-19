@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto-Clipper</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Auto-Clipper</div>
+  <nav id="tabs" class="tabs">
+    <button data-tab="session">1 · Session</button>
+    <button data-tab="recordings">2 · Recordings &amp; Alignment</button>
+    <button data-tab="transcript">3 · Transcript</button>
+    <button data-tab="reviews">4 · AI Reviews</button>
+    <button data-tab="guide">5 · Guide</button>
+    <button data-tab="export">6 · Export</button>
+  </nav>
+  <div id="session-badge" class="session-badge">No session open</div>
+</header>
+<main id="main"></main>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>
