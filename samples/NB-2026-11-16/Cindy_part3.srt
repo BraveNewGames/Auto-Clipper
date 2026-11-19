@@ -1,0 +1,31 @@
+1
+00:00:01,100 --> 00:00:03,200
+(Team) Whole cart landed on the roof.
+
+2
+00:00:04,000 --> 00:00:06,100
+Cindy: There goes our getaway vehicle.
+
+3
+00:00:07,300 --> 00:00:09,400
+(Team) caught the landing from the playground.
+
+4
+00:00:51,800 --> 00:00:53,900
+(Team) We should race four carts down the slide.
+
+5
+00:01:18,000 --> 00:01:20,100
+Cindy: The green one is fast but it rolls over.
+
+6
+00:01:50,000 --> 00:01:52,100
+(Team) Someone left the ramp beside the truck.
+
+7
+00:02:33,100 --> 00:02:35,200
+(Team) Let us park everything under the bridge.
+
+8
+00:02:58,000 --> 00:03:00,100
+Cindy: I can still see the cart on the roof.

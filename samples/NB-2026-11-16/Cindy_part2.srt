@@ -1,0 +1,51 @@
+1
+00:00:02,100 --> 00:00:04,200
+[Team]: I will grab the cart on the other side.
+
+2
+00:00:29,200 --> 00:00:31,300
+[Team]: vending machine is coming with us.
+
+3
+00:00:51,000 --> 00:00:53,100
+Cindy: Leave the door open for the last cart.
+
+4
+00:01:19,700 --> 00:01:21,800
+[Team]: I will restart my recording at the gate.
+
+5
+00:01:45,800 --> 00:01:47,900
+[Team]: for the gate to go all the way up.
+
+6
+00:01:56,900 --> 00:01:59,000
+[Team]: Cart is balanced on the railing.
+
+7
+00:01:58,750 --> 00:02:00,850
+Cindy: It is moving and nobody is pushing it.
+
+8
+00:02:04,100 --> 00:02:06,200
+[Team]: tipped straight into the fountain.
+
+9
+00:02:16,200 --> 00:02:18,300
+[Team]: My recording is back after the gate.
+
+10
+00:02:38,000 --> 00:02:40,100
+Cindy: Bring it over to the playground slide.
+
+11
+00:03:08,700 --> 00:03:10,800
+[Team]: is a zombie in the shopping cart.
+
+12
+00:03:17,200 --> 00:03:19,300
+Cindy: Throw the zombie down the slide!
+
+13
+00:03:18,000 --> 00:03:20,000
+[Team]: Wait, the cart is sliding too!

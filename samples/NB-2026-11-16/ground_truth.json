@@ -1,0 +1,222 @@
+{
+  "session_id": "NB-2026-11-16",
+  "event_prefix": "NB",
+  "offsets": {
+    "cindy-p1": 0,
+    "cindy-p2": 200,
+    "cindy-p3": 400,
+    "andres-p1": 12.5,
+    "andres-p2": 330,
+    "didi-p1": 45,
+    "rika-p1": 30
+  },
+  "durations": {
+    "cindy-p1": 200,
+    "cindy-p2": 200,
+    "cindy-p3": 200,
+    "andres-p1": 300,
+    "andres-p2": 270,
+    "didi-p1": 520,
+    "rika-p1": 560
+  },
+  "lines": [
+    {
+      "time": 6,
+      "speaker": "Cindy",
+      "text": "The lobby finally loaded.",
+      "local_only": true
+    },
+    {
+      "time": 19,
+      "speaker": "Andres",
+      "text": "My camera is floating behind the truck.",
+      "local_only": false
+    },
+    {
+      "time": 48,
+      "speaker": "Didi",
+      "text": "Everyone grab a cart by the entrance.",
+      "local_only": false
+    },
+    {
+      "time": 50,
+      "speaker": "Rika",
+      "text": "Mine has one wheel and no brakes.",
+      "local_only": false
+    },
+    {
+      "time": 67,
+      "speaker": "Cindy",
+      "text": "Save the yellow cart for the steep hill.",
+      "local_only": false
+    },
+    {
+      "time": 89,
+      "speaker": "Andres",
+      "text": "I see two zombies by the fountain.",
+      "local_only": false
+    },
+    {
+      "time": 111,
+      "speaker": "Didi",
+      "text": "The bridge is blocked by a delivery van.",
+      "local_only": false
+    },
+    {
+      "time": 142,
+      "speaker": "Rika",
+      "text": "I found another ramp behind the garage.",
+      "local_only": false
+    },
+    {
+      "time": 183,
+      "speaker": "Cindy",
+      "text": "The back wheel is stuck in the fence.",
+      "local_only": false
+    },
+    {
+      "time": 197,
+      "speaker": "Didi",
+      "text": "Take the blue route around the corner.",
+      "local_only": false
+    },
+    {
+      "time": 202,
+      "speaker": "Andres",
+      "text": "I will grab the cart on the other side.",
+      "local_only": false
+    },
+    {
+      "time": 229,
+      "speaker": "Rika",
+      "text": "The vending machine is coming with us.",
+      "local_only": false
+    },
+    {
+      "time": 251,
+      "speaker": "Cindy",
+      "text": "Leave the door open for the last cart.",
+      "local_only": false
+    },
+    {
+      "time": 280,
+      "speaker": "Andres",
+      "text": "I will restart my recording at the gate.",
+      "local_only": false
+    },
+    {
+      "time": 306,
+      "speaker": "Didi",
+      "text": "Wait for the gate to go all the way up.",
+      "local_only": false
+    },
+    {
+      "time": 317,
+      "speaker": "Rika",
+      "text": "The cart is balanced on the railing.",
+      "local_only": false
+    },
+    {
+      "time": 318.75,
+      "speaker": "Cindy",
+      "text": "It is moving and nobody is pushing it.",
+      "local_only": false
+    },
+    {
+      "time": 324,
+      "speaker": "Didi",
+      "text": "It tipped straight into the fountain.",
+      "local_only": false
+    },
+    {
+      "time": 336,
+      "speaker": "Andres",
+      "text": "My recording is back after the gate.",
+      "local_only": false
+    },
+    {
+      "time": 358,
+      "speaker": "Cindy",
+      "text": "Bring it over to the playground slide.",
+      "local_only": false
+    },
+    {
+      "time": 389,
+      "speaker": "Didi",
+      "text": "There is a zombie in the shopping cart.",
+      "local_only": false
+    },
+    {
+      "time": 397.2,
+      "speaker": "Cindy",
+      "text": "Throw the zombie down the slide!",
+      "local_only": false
+    },
+    {
+      "time": 398.1,
+      "speaker": "Rika",
+      "text": "Wait, the cart is sliding too!",
+      "local_only": false
+    },
+    {
+      "time": 401,
+      "speaker": "Andres",
+      "text": "The whole cart landed on the roof.",
+      "local_only": false
+    },
+    {
+      "time": 404,
+      "speaker": "Cindy",
+      "text": "There goes our getaway vehicle.",
+      "local_only": false
+    },
+    {
+      "time": 407,
+      "speaker": "Didi",
+      "text": "I caught the landing from the playground.",
+      "local_only": false
+    },
+    {
+      "time": 420,
+      "speaker": "Rika",
+      "text": "That was a very expensive shortcut.",
+      "local_only": true
+    },
+    {
+      "time": 452,
+      "speaker": "Andres",
+      "text": "We should race four carts down the slide.",
+      "local_only": false
+    },
+    {
+      "time": 478,
+      "speaker": "Cindy",
+      "text": "The green one is fast but it rolls over.",
+      "local_only": false
+    },
+    {
+      "time": 510,
+      "speaker": "Didi",
+      "text": "Someone left the ramp beside the truck.",
+      "local_only": false
+    },
+    {
+      "time": 553,
+      "speaker": "Rika",
+      "text": "Let us park everything under the bridge.",
+      "local_only": false
+    },
+    {
+      "time": 578,
+      "speaker": "Cindy",
+      "text": "I can still see the cart on the roof.",
+      "local_only": false
+    },
+    {
+      "time": 595,
+      "speaker": "Andres",
+      "text": "That is the end of my recording.",
+      "local_only": true
+    }
+  ]
+}

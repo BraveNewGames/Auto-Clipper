@@ -1,0 +1,55 @@
+1
+00:00:06,500 --> 00:00:08,600
+Andres: My camera is floating behind the truck.
+
+2
+00:00:35,700 --> 00:00:37,800
+Team: Everyone grab a cart by the entrance.
+
+3
+00:00:37,800 --> 00:00:39,900
+Team: has one wheel and no brakes.
+
+4
+00:00:54,200 --> 00:00:56,300
+Team: Save the yellow cart for the steep hill.
+
+5
+00:01:16,500 --> 00:01:18,600
+Andres: I see two zombies by the fountain.
+
+6
+00:01:38,400 --> 00:01:40,500
+Team: bridge is blocked by a delivery van.
+
+7
+00:02:09,500 --> 00:02:11,600
+Team: I found another ramp behind the garage.
+
+8
+00:02:50,600 --> 00:02:52,700
+Team: The back wheel is stuck in the fence.
+
+9
+00:03:04,700 --> 00:03:06,800
+Team: the blue route around the corner.
+
+10
+00:03:09,500 --> 00:03:11,600
+Andres: I will grab the cart on the other side.
+
+11
+00:03:36,200 --> 00:03:38,300
+Team: The vending machine is coming with us.
+
+12
+00:03:58,300 --> 00:04:00,400
+Team: the door open for the last cart.
+
+13
+00:04:27,500 --> 00:04:29,600
+Andres: I will restart my recording at the gate.
+
+14
+00:04:53,500 --> 00:04:55,600
+Team: Wait for the gate to go all the way up.

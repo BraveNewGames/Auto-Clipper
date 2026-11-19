@@ -1,0 +1,39 @@
+1
+00:00:06,000 --> 00:00:08,100
+Cindy: The lobby finally loaded.
+
+2
+00:00:18,800 --> 00:00:20,900
+Team: My camera is floating behind the truck.
+
+3
+00:00:47,900 --> 00:00:50,000
+Team: Everyone grab a cart by the entrance.
+
+4
+00:00:50,000 --> 00:00:52,100
+Team: has one wheel and no brakes.
+
+5
+00:01:07,000 --> 00:01:09,100
+Cindy: Save the yellow cart for the steep hill.
+
+6
+00:01:29,200 --> 00:01:31,300
+Team: I see two zombies by the fountain.
+
+7
+00:01:51,300 --> 00:01:53,400
+Team: bridge is blocked by a delivery van.
+
+8
+00:02:21,700 --> 00:02:23,800
+Team: I found another ramp behind the garage.
+
+9
+00:03:03,000 --> 00:03:05,100
+Cindy: The back wheel is stuck in the fence.
+
+10
+00:03:16,900 --> 00:03:19,000
+Team: the blue route around the corner.
