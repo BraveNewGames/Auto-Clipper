@@ -20,7 +20,8 @@ Options: `python -m autoclipper [session_folder] [--port N] [--no-browser]`.
 
 1. **Session** — *Browse…* (or paste a path) to the folder holding every POV's videos and SRTs,
    then *Open*. A new folder is scanned and grouped Session → POV → Part
-   (`Cindy_part1.mkv`, `Cindy - Part 2.mp4`, OBS-style `Didi 2026-11-16 20-00-45.mkv`, …).
+   (`Cindy_part1.mkv`, `Cindy - Part 2.mp4`, `Cindy__2.mkv`, `Cindy p3.mkv`, OBS-style
+   `Didi 2026-11-16 20-00-45.mkv` / `Andres__2026-11-16 16-39-24.mkv` — timestamped parts are ordered by time).
    Set the session ID, event prefix (`NB` → `NB-003`) and the padding added around clips.
 2. **Recordings & Alignment** — fix POV/part assignments, durations and offsets inline.
    *Chain parts by duration* places back-to-back parts; *Suggest offsets from transcripts*
