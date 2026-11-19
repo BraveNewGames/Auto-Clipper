@@ -21,6 +21,7 @@ MIN_TOKENS = 3            # ignore very short lines ("yeah", "oh no") - too ambi
 PAIR_SIM = 0.72           # min fuzzy similarity for a candidate pair
 WINDOW = 2.0              # width (s) of the densest-difference window
 INLIER = 1.0              # inlier radius (s) around the estimate
+HOP_DECAY = 0.95          # each extra hop away from the reference costs a little confidence
 MIN_SUPPORT = 3           # min inlier matches for an edge between two parts
 
 _STOP = set("""a an and are as at be but by can did do does for from get go got had has have he her
@@ -126,7 +127,7 @@ def _robust(diffs):
         while j < len(rest) and rest[j] - rest[i] <= WINDOW:
             j += 1
         second = max(second, j - i)
-    conf = (1 - math.exp(-support / 3.0)) * max(0.0, 1 - mad / INLIER) * (support / (support + second))
+    conf = (1 - math.exp(-support / 3.0)) * max(0.0, 1 - mad / (2 * INLIER)) * (support / (support + second))
     return est, support, mad, conf
 
 
@@ -172,7 +173,7 @@ def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
         return []
     edges = _edges(session, cues_by_part)
 
-    # Most-confident path from the reference (Dijkstra on -log(conf); path conf = product).
+    # Most-confident path from the reference: path confidence = weakest edge, decayed per hop.
     ref_off = session.part_by_id(ref).offset or 0.0
     result = {ref: (ref_off, 1.0, 0, None)}
     heap = [(-1.0, ref)]
@@ -186,7 +187,7 @@ def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
         conf_here = -negc
         off_here = result[pid][0]
         for other, delta, conf, support, mad in edges.get(pid, ()):
-            c = conf_here * conf
+            c = min(conf_here, conf) * (1.0 if pid == ref else HOP_DECAY)
             if other in done or c <= best.get(other, 0.0):
                 continue
             best[other] = c
