@@ -383,15 +383,29 @@ def build_session_transcript(session, cues_by_part=None) -> list:
     # 4. a leftover Team line whose words are (almost) all said in nearby named lines - e.g. one
     #    Team cue spanning two or three speakers' lines - is a duplicate: keep it as a source of the
     #    named line it overlaps most instead of a standalone line.
+    #    Order-tolerant content-word coverage against ALL speakers' named speech nearby catches
+    #    phrase splits/merges and fragments; interjection-only cues are matched within +-3 s.
+    #    Where some player has no recording at that moment the rules get stricter.
     starts = [c["anchor"].start for c in anchors]
+    spans = _coverage_spans(session, items)
+    n_povs = len(spans)
     leftovers = []
-    for g in groups.values():
+    for g in sorted(groups.values(), key=lambda g: (min(x.start for x in g), g[0].key)):
         target = _covering_anchor(g, anchors, starts)
+        kind = "covered"
+        if target is None:
+            full = _all_povs_recording(spans, n_povs, g)
+            target = _window_cover_anchor(g, anchors, starts, strict=not full)
+            kind = "window"
         if target is None:
             leftovers.append(g)
             continue
         for x in g:
-            target["team"].append((x, similarity(target["anchor"].toks, x.toks), "covered"))
+            target["team"].append((x, similarity(target["anchor"].toks, x.toks), kind))
+
+    # 5. collapse remaining Team lines that repeat another remaining Team line from a different
+    #    recording a few seconds apart (one utterance, phrase boundaries differed).
+    leftovers = _collapse_team_repeats(leftovers)
 
     lines = [_named_line(c) for c in anchors]
     for g in leftovers:
@@ -400,6 +414,148 @@ def build_session_transcript(session, cues_by_part=None) -> list:
     lines.sort(key=lambda l: (l.session_start, l.line_id))
     _apply_overrides(session, lines)
     return lines
+
+
+FILLER = set("""a ah aha all alright an and are as at be but by can cause could did do does doing
+dont for from get go going gonna got gotta guys guy dude had has have he hey her hi him his hm hmm huh
+i id ill im in is it its ive just know let lets like literally lol me mhm my no nope not now of oh ok
+okay on or our out right so some something such that thats the them then there theyre this to too
+uh uhh um umm up us very wait want was we well were what whats when where who why will with wow
+yay yeah yep yes yo you youre your if about because into over off than these those its theres
+any been being am i'm how much more really even still also maybe kind sort thing things way""".split())
+
+INTERJECTION_WINDOW = 3.0
+
+
+def content_tokens(toks):
+    return [t for t in toks if t not in FILLER and not t.isdigit()]
+
+
+def _stem(t):
+    for suf in ("ing", "ed", "es", "ly", "s"):
+        if len(t) > len(suf) + 2 and t.endswith(suf):
+            return t[:-len(suf)]
+    return t
+
+
+def _misses_allowed(n):
+    return 2 if n >= 6 else 1 if n >= 3 else 0
+
+
+def _token_found(t, pool):
+    if t in pool:
+        return True
+    st = _stem(t)
+    if any(_stem(u) == st for u in pool):
+        return True
+    if len(t) >= 5:
+        for u in pool:
+            if len(u) >= 5 and u[:4] == t[:4] and abs(len(u) - len(t)) <= 3 \
+                    and difflib.SequenceMatcher(None, t, u).ratio() >= 0.8:
+                return True
+    return False
+
+
+def _coverage_spans(session, items):
+    """{pov_id: [(start, end)]} session intervals where each POV has a recording."""
+    spans = {}
+    ends = {}
+    for it in items:
+        ends[it.part.part_id] = max(ends.get(it.part.part_id, 0.0), it.cue.local_end)
+    for pov, part in session.all_parts():
+        dur = part.duration if part.duration else ends.get(part.part_id)
+        if dur is None:
+            continue
+        off = part.offset or 0.0
+        spans.setdefault(pov.pov_id, []).append((off, off + dur))
+    return spans
+
+
+def _all_povs_recording(spans, n_povs, group):
+    lo = min(x.start for x in group)
+    hi = max(x.end for x in group)
+    if n_povs == 0:
+        return False
+    return all(any(a <= lo and hi <= b for a, b in iv) for iv in spans.values())
+
+
+def _near_anchors(anchors, starts, lo, hi, window):
+    i = bisect.bisect_left(starts, lo - window - 30)
+    out = []
+    while i < len(anchors) and anchors[i]["anchor"].start <= hi + window:
+        a = anchors[i]["anchor"]
+        if max(0.0, max(lo, a.start) - min(hi, a.end)) <= window:
+            out.append(anchors[i])
+        i += 1
+    return out
+
+
+def _window_cover_anchor(group, anchors, starts, strict=False):
+    """Named anchor that best covers this Team group's content words, or None to keep it."""
+    lo = min(x.start for x in group)
+    hi = max(x.end for x in group)
+    best_member = max(group, key=lambda x: (len(content_tokens(x.toks)), len(x.toks), x.key))
+    words = content_tokens(best_member.toks)
+    if not words:
+        # interjection-only ("Oh,", "Okay, okay."): a duplicate if those words were said nearby
+        if strict or not best_member.toks:
+            return None
+        near = _near_anchors(anchors, starts, lo, hi, INTERJECTION_WINDOW)
+        hits = [c for c in near if set(best_member.toks) & set(c["anchor"].toks)]
+        if not hits:
+            return None
+        mine = set(best_member.toks)
+        return min(hits, key=lambda c: (-len(mine & set(c["anchor"].toks)),
+                                        abs(c["anchor"].start - lo), c["anchor"].key))
+    near = _near_anchors(anchors, starts, lo, hi, TIME_WINDOW)
+    if not near:
+        return None
+    pool = set(t for c in near for t in c["anchor"].toks)
+    found = sum(1 for t in words if _token_found(t, pool))
+    n = len(words)
+    if strict:
+        ok = n >= 2 and found == n
+    else:
+        ok = found >= n - _misses_allowed(n)
+    if not ok:
+        return None
+
+    def overlap(c):
+        own = set(c["anchor"].toks)
+        return (sum(1 for t in words if _token_found(t, own)), -abs(c["anchor"].start - lo))
+    return max(near, key=overlap)
+
+
+def _collapse_team_repeats(groups):
+    """Fold a Team group into another one from different recordings when its content words are all
+    found in it (+-TIME_WINDOW). Longer groups absorb shorter ones."""
+    order = sorted(groups, key=lambda g: (-max(len(content_tokens(x.toks)) for x in g),
+                                          min(x.start for x in g), g[0].key))
+    kept = []
+    for g in order:
+        parts = {x.part.part_id for x in g}
+        lo = min(x.start for x in g)
+        hi = max(x.end for x in g)
+        words = content_tokens(max(g, key=lambda x: len(content_tokens(x.toks))).toks)
+        host = None
+        if len(words) >= 2:
+            for k in kept:
+                if parts & {x.part.part_id for x in k}:
+                    continue
+                klo = min(x.start for x in k)
+                khi = max(x.end for x in k)
+                if max(0.0, max(lo, klo) - min(hi, khi)) > TIME_WINDOW:
+                    continue
+                pool = set(t for x in k for t in x.toks)
+                found = sum(1 for t in words if _token_found(t, pool))
+                if found >= len(words) - _misses_allowed(len(words)):
+                    host = k
+                    break
+        if host is None:
+            kept.append(list(g))
+        else:
+            host.extend(g)
+    return kept
 
 
 def _covering_anchor(group, anchors, starts):

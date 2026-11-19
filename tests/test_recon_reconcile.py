@@ -151,14 +151,77 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(all(l.speaker is None for l in team))
         self.assertEqual(sorted(len(l.sources) for l in team), [1, 2])
 
-    def test_generic_three_word_piece_not_absorbed_far_away(self):
+    def test_generic_piece_far_away_kept(self):
         s = three_povs()
         cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 108.0, "named",
                                  "oh my god the cart is on the roof and nobody saw it happen", "Cindy")],
-                "andres-p1": [cue("andres-p1", "andres", 1, 100.0, 101.0, "team", "Oh my god!")],
-                "rika-p1": []}  # session 110 s: after Cindy's line ended
+                "andres-p1": [cue("andres-p1", "andres", 1, 106.0, 107.0, "team", "Oh my god!")],
+                "rika-p1": []}  # session 116 s: 8 s after Cindy's line ended
         lines = build_session_transcript(s, cues)
         self.assertEqual(len(lines), 2)
+
+    # ---- follow-up patterns from the real session (all four players recording)
+    def four_povs(self):
+        return make_session([("Cindy", [("cindy-p1", 0.0, 1800.0)]), ("Andres", [("andres-p1", 0.0, 1800.0)]),
+                             ("Didi", [("didi-p1", 0.0, 1800.0)]), ("Rika", [("rika-p1", 0.0, 1800.0)])])
+
+    def test_followup_substring_short_team(self):
+        s = self.four_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 1239.0, 1242.0, "named",
+                                 "Oh, I'm floating. I'm flying. Sorry.", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 1241.0, 1242.0, "team", "I'm flying.")],
+                "didi-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual([l.speaker for l in lines], ["Cindy"])
+        self.assertEqual(len(lines[0].sources), 2)
+
+    def test_followup_one_team_line_two_named_lines(self):
+        s = self.four_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 1248.0, 1249.5, "named", "Guys, I can't. Oh.", "Cindy"),
+                             cue("cindy-p1", "cindy", 2, 1252.0, 1253.0, "named", "Take me back.", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 1248.2, 1252.5, "team",
+                                  "Guys, I can't- Oh, oh, oh, oh Just take me back!")],
+                "didi-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual([l.speaker for l in lines], ["Cindy", "Cindy"])
+        self.assertEqual(sum(len(l.sources) for l in lines), 3)
+
+    def test_followup_reordered_fragment(self):
+        s = self.four_povs()
+        cues = {"didi-p1": [cue("didi-p1", "didi", 1, 672.0, 674.0, "named", "We're like in raccoon city.", "Didi")],
+                "rika-p1": [cue("rika-p1", "rika", 1, 672.5, 673.5, "team", "like raccoon city")],
+                "cindy-p1": [], "andres-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual([l.speaker for l in lines], ["Didi"])
+
+    def test_followup_team_repeat_across_povs_collapsed(self):
+        s = self.four_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 500.0, 504.0, "team",
+                                 "The way to revive is you grab with one hand and slap with the other.")],
+                "didi-p1": [cue("didi-p1", "didi", 1, 502.5, 505.0, "team",
+                                "you grab with one hand, and you slap him awake.")],
+                "andres-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 1)
+        self.assertIsNone(lines[0].speaker)
+        self.assertEqual(len(lines[0].sources), 2)
+
+    def test_followup_new_content_kept_and_gap_is_conservative(self):
+        s = self.four_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 300.0, 302.0, "named", "Grab the zombie by the legs.", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 300.5, 302.0, "team", "Who took the ambulance keys from the garage")],
+                "didi-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 2)                     # "ambulance keys", "garage" are new content
+        # Rika not recording -> an interjection is not absorbed, a one-word line needs 2 content words
+        s2 = make_session([("Cindy", [("cindy-p1", 0.0, 900.0)]), ("Andres", [("andres-p1", 0.0, 900.0)]),
+                           ("Rika", [("rika-p1", 600.0, 300.0)])])
+        cues2 = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 300.0, 302.0, "named", "Okay grab the zombie", "Cindy")],
+                 "andres-p1": [cue("andres-p1", "andres", 1, 301.0, 302.0, "team", "Okay."),
+                               cue("andres-p1", "andres", 2, 303.0, 304.0, "team", "Zombie!")],
+                 "rika-p1": []}
+        lines2 = build_session_transcript(s2, cues2)
+        self.assertEqual(sum(1 for l in lines2 if l.speaker is None), 2)
 
     def test_disagreeing_team_renditions_flagged(self):
         s = three_povs()
