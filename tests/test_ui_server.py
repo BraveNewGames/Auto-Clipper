@@ -210,7 +210,10 @@ class TestEndToEnd(ServerTestCase):
         # gap event: Andres absent
         gap = [s for s in g["suggestions"] if s["kind"] == "clip_now" and 315 <= s["start"] and s["end"] <= 329]
         self.assertTrue(gap)
-        self.assertFalse([rg for rg in gap[0]["ranges"] if rg["pov_name"] == "Andres"])
+        g0 = gap[0]
+        # padding may touch Andres footage at the gap edges, but nothing inside the suggestion itself
+        self.assertFalse([rg for rg in g0["ranges"] if rg["pov_name"] == "Andres"
+                          and rg["session_end"] > g0["start"] and rg["session_start"] < g0["end"]])
 
         # 7. review decisions ----------------------------------------------
         sids = [s["suggestion_id"] for s in g["suggestions"] if s["kind"] == "clip_now"]
@@ -250,7 +253,7 @@ class TestEndToEnd(ServerTestCase):
             self.assertTrue(p.resolve().is_relative_to((self.folder / "autoclipper_exports").resolve()))
             self.assertEqual(len([ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]), f["rows"])
             self.assertTrue(self.call("/api/open-path", {"path": f["folder"]})["ok"])
-        self.assertTrue(any(f["pass_no"] > 1 for f in ex["files"]), "overlapping suggestions need a 2nd pass")
+        self.assertTrue(any(f["pass_no"] > 1 for f in ex_all["files"]), "overlapping suggestions need a 2nd pass")
         names = [n for lst in ex["expected"].values() for n in lst]
         self.assertTrue(any(n.startswith("NB-") and n.endswith(" - Cindy.mkv") or "Cindy (1 of 2)" in n for n in names))
 
