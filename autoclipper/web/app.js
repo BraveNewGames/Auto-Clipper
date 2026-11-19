@@ -313,6 +313,10 @@ function renderRecordings(main) {
     render();
   });
 
+  const refSel = h("select", { title: "Reference part: keeps its current offset; every other part is placed relative to it" },
+    h("option", { value: "" }, "Reference: first part"),
+    s.povs.flatMap((pov) => pov.parts.map((p) => h("option", { value: p.part_id }, `Reference: ${pov.name} part ${p.index} (${fmtShort(p.offset)})`))));
+  refSel.value = state.alignRef || "";
   main.appendChild(h("div", { class: "panel" },
     h("div", { class: "row" },
       h("h2", { style: { margin: 0 } }, "Session timeline"),
@@ -320,9 +324,11 @@ function renderRecordings(main) {
       h("button", { class: "btn", title: "Within each POV, start part N+1 where part N ends (manual offsets are kept)",
         onclick: action(async () => { applyPayload(await api("/api/align/chain", {})); toast("Parts chained by duration", "ok"); render(); }) },
         "Chain parts by duration"),
+      refSel,
       h("button", { class: "btn primary", title: "Match Team/named lines across recordings to estimate offsets",
         onclick: action(async () => {
-          const r = await api("/api/align/suggest", {});
+          state.alignRef = refSel.value;
+          const r = await api("/api/align/suggest", { reference_part_id: refSel.value || null });
           state.alignSuggestions = r.suggestions;
           if (!r.suggestions.length) toast("No transcript-based offset suggestions found");
           render();
@@ -386,13 +392,15 @@ function renderAlignSuggestions() {
   const sugg = state.alignSuggestions;
   const checks = [];
   const rows = sugg.map((x) => {
-    const cb = h("input", { type: "checkbox", checked: (x.confidence ?? 0) >= 0.5 && x.current_source !== "manual" });
+    const usable = x.offset != null && x.method !== "reference";
+    const cb = h("input", { type: "checkbox", disabled: !usable,
+      checked: usable && (x.confidence ?? 0) >= 0.5 && x.current_source !== "manual" && Math.abs(x.delta ?? 1) > 0.001 });
     checks.push([cb, x]);
     const delta = x.current_offset != null && x.offset != null ? x.offset - x.current_offset : null;
     const conf = x.confidence == null ? null : Math.round(x.confidence * 100);
     return h("tr", null, h("td", null, cb), h("td", null, x.label || x.part_id),
       h("td", { class: "mono" }, fmt(x.current_offset), " ", h("span", { class: "src " + (x.current_source || "") }, x.current_source || "")),
-      h("td", { class: "mono" }, fmt(x.offset)),
+      h("td", { class: "mono" }, x.method === "reference" ? "reference (kept)" : x.offset == null ? h("span", { class: "muted" }, "no reliable match") : fmt(x.offset)),
       h("td", { class: "mono " + (delta && Math.abs(delta) > 1 ? "warn-text" : "muted") }, delta == null ? "" : (delta >= 0 ? "+" : "") + delta.toFixed(2) + "s"),
       h("td", null, conf == null ? "—" : h("span", { class: "badge " + (conf >= 70 ? "good" : conf >= 40 ? "warn" : "bad") }, conf + "%")),
       h("td", null, x.support ?? ""), h("td", null, x.matched_label || x.matched_with || ""), h("td", { class: "muted small" }, x.method || ""));
@@ -783,7 +791,7 @@ document.addEventListener("keydown", (e) => {
 
 // ---------------------------------------------------------------- 6. Export
 const EXPORT_MODES = {
-  all: { label: "All suggestions", statuses: null },
+  all: { label: "All suggestions (incl. rejected)", statuses: ["keep", "maybe", "reject", null] },
   exclude_rejected: { label: "Exclude rejected", statuses: ["keep", "maybe", null] },
   keep: { label: "Keep only", statuses: ["keep"] },
 };

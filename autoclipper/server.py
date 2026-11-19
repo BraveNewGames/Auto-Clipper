@@ -320,10 +320,13 @@ class App:
             self.save(invalidate_transcript=True)
             return self.session_payload()
 
-    def suggest(self, _body):
+    def suggest(self, body):
         with self.lock:
             s = self.require()
-            sugg = _plain(_mod("autoalign").suggest_offsets(s))
+            ref = (body or {}).get("reference_part_id") or None
+            if ref is not None and _part(s, ref) is None:
+                raise ApiError(f"Unknown reference part {ref}", 404)
+            sugg = _plain(_mod("autoalign").suggest_offsets(s, reference_part_id=ref))
             for item in sugg:
                 part = _part(s, item.get("part_id"))
                 if part is not None:
