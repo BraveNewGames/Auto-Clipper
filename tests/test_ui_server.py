@@ -246,6 +246,12 @@ class TestEndToEnd(ServerTestCase):
         self.assertGreater(rows(ex_def), rows(ex_keep))
         self.assertGreater(rows(ex_keep), 0)
         self.assertEqual({f["reviewer"] for f in ex_keep["files"]}, {"claude"} if keep.startswith("claude") else {"chatgpt"})
+        # a narrower re-export must not leave CSVs from the wider one behind
+        exports = self.folder / "autoclipper_exports"
+        (exports / "notes.txt").write_text("user file", encoding="utf-8")
+        on_disk = {str(p.resolve()) for p in exports.glob("*/*.csv")}
+        self.assertEqual(on_disk, {str(Path(f["csv_path"]).resolve()) for f in ex_keep["files"]})
+        self.assertTrue((exports / "notes.txt").exists())
         ex = self.call("/api/export", {"statuses": ["keep", "maybe", None]})
         for f in ex["files"]:
             p = Path(f["csv_path"])

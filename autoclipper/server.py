@@ -527,6 +527,7 @@ class App:
         with self.lock:
             s = self.require()
             lc = _mod("losslesscut")
+            removed = self._clear_old_exports()
             files = lc.export_all(s, statuses=statuses)
             rows = []
             for f in files:
@@ -543,7 +544,31 @@ class App:
                 except Exception as exc:
                     expected[r] = [f"(preview failed: {exc})"]
             return {"files": rows, "expected": expected, "setup": lc.LOSSLESSCUT_SETUP,
-                    "out_dir": str(self.folder() / "autoclipper_exports"), "statuses": statuses}
+                    "out_dir": str(self.folder() / "autoclipper_exports"), "statuses": statuses,
+                    "removed_stale": removed}
+
+    def _clear_old_exports(self):
+        """Delete CSVs from earlier exports so a smaller re-export leaves no stale passes.
+
+        Only touches generated files (<reviewer>/<POV>_part<N>[_k]_pass<K>.csv) directly inside
+        the app-owned autoclipper_exports folder.
+        """
+        root = self.folder() / "autoclipper_exports"
+        removed = 0
+        if not root.is_dir():
+            return 0
+        pattern = re.compile(r"^.+_part\d+(?:_\d+)?_pass\d+\.csv$", re.I)
+        for sub in root.iterdir():
+            if not sub.is_dir():
+                continue
+            for f in sub.iterdir():
+                if f.is_file() and pattern.match(f.name):
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        return removed
 
     def export_info(self, _q=None):
         with self.lock:
