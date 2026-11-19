@@ -215,3 +215,9 @@ Session "NB-2026-11-16", prefix "NB". Ground-truth offsets (session t=0 = Cindy 
 
 - A missing part ID raises KeyError. Older schema-v1 documents can omit fields with defaults.
 - SRT cue indices and overlaps are retained. Malformed cue blocks are skipped.
+
+- Discovery scans the session folder itself. When several video formats share a stem, the first filename in sorted order is paired with the transcript.
+- An unanchored chain stops at an unknown duration until a manual anchor starts it again. Mapping can still use the final valid SRT cue as an estimated boundary.
+- Default exports include Keep, Maybe and unreviewed clip suggestions. Filming ideas remain in the editorial guide. The CSVs listed in the current README describe the current export. Filename previews assume the source container and use .mkv for SRT-only parts.
+- LosslessCut's [CSV documentation](https://github.com/mifi/lossless-cut/blob/master/docs/index.md#csv-files) shows one headerless comma-separated row per segment, with start and end in seconds followed by the label.
+- LosslessCut's [filename template documentation](https://github.com/mifi/lossless-cut/blob/master/docs/file-name-template.md) confirms that SEG_LABEL is the segment label in separate-files mode and EXT includes the leading dot. Use the template ${SEG_LABEL}${EXT}.

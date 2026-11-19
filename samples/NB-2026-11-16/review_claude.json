@@ -1,0 +1,80 @@
+{
+  "reviewer": "Claude",
+  "suggestions": [
+    {
+      "id": "C-01",
+      "title": "Zombie Slide",
+      "start": "00:06:30.125",
+      "end": "00:06:50.250",
+      "priority": "high",
+      "kind": "clip_now",
+      "what_happens": "Cindy sends a zombie down the playground slide.",
+      "why": "A setup and surprise payoff fit a short edit.",
+      "hook": "Open on the object about to move.",
+      "structure": "Setup, motion, reaction.",
+      "quotes": [
+        {
+          "time": "00:06:37.2",
+          "speaker": "Cindy",
+          "text": "Throw the zombie down the slide!",
+          "source": "cindy-p2 00:03:17,200 Named"
+        }
+      ],
+      "povs": [
+        "Cindy",
+        "Andres",
+        "Didi",
+        "Rika"
+      ],
+      "pov_notes": "Compare angles and reactions.",
+      "confirmed_by_transcript": "Players describe the action.",
+      "needs_visual_check": "Check that the object and landing are visible.",
+      "uncertainty": "Camera framing is unknown."
+    },
+    {
+      "id": "C-02",
+      "title": "Cart Landing: Roof?",
+      "start": 402.125,
+      "end": 414.875,
+      "priority": "high",
+      "kind": "clip_now",
+      "what_happens": "The getaway vehicle lands on a roof.",
+      "why": "A setup and surprise payoff fit a short edit.",
+      "hook": "Open on the object about to move.",
+      "structure": "Setup, motion, reaction.",
+      "quotes": [],
+      "povs": [
+        "Cindy",
+        "Andres",
+        "Didi",
+        "Rika"
+      ],
+      "pov_notes": "Compare angles and reactions.",
+      "confirmed_by_transcript": "Players describe the action.",
+      "needs_visual_check": "Check that the object and landing are visible.",
+      "uncertainty": "Camera framing is unknown."
+    },
+    {
+      "id": "C-03",
+      "title": "Fountain Drop",
+      "start": 315,
+      "end": 328,
+      "priority": "high",
+      "kind": "clip_now",
+      "what_happens": "A cart balances on the railing and tips into the fountain.",
+      "why": "A setup and surprise payoff fit a short edit.",
+      "hook": "Open on the object about to move.",
+      "structure": "Setup, motion, reaction.",
+      "quotes": [],
+      "povs": [
+        "Cindy",
+        "Didi",
+        "Rika"
+      ],
+      "pov_notes": "Compare angles and reactions.",
+      "confirmed_by_transcript": "Players describe the action.",
+      "needs_visual_check": "Check that the object and landing are visible.",
+      "uncertainty": "Camera framing is unknown."
+    }
+  ]
+}

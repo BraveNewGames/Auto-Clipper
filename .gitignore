@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.autoclipper/
+autoclipper_exports/
+samples/**/*.mkv
+
