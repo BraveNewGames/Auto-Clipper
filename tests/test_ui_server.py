@@ -132,6 +132,12 @@ class TestEndToEnd(ServerTestCase):
         r = self.call("/api/session/meta", {"session_id": "NB-2026-11-16", "event_prefix": "NB", "game": "Test game",
                                             "notes": "n", "pad_before": "3", "pad_after": 4})
         self.assertEqual((r["session"]["pad_before"], r["session"]["pad_after"]), (3.0, 4.0))
+        self.assertIn("Nightbrats", r["session"]["game_context"])          # default for new sessions
+        r = self.call("/api/session/meta", {"game_context": "Goat racing sim."})
+        self.assertEqual(r["session"]["game_context"], "Goat racing sim.")
+        self.assertIn("Goat racing sim.", self.call("/api/review-packet?reviewer=Claude", raw=True)[0])
+        r = self.call("/api/session/meta", {"game_context": "  "})
+        self.assertIn("Nightbrats", r["session"]["game_context"])          # empty -> default
         self.call("/api/session/meta", {"pad_before": "-1"}, expect=400)
 
         # 2. durations (no video in sample) + manual edit validation ------------
@@ -294,7 +300,10 @@ class TestUntimedSuggestions(ServerTestCase):
             {"id": "T-1", "title": "Timed clip", "start": "00:01:00", "end": "00:01:10", "kind": "clip_now"},
             {"id": "T-2", "title": "Idea without time", "kind": "clip_now", "what_happens": "stage a race"},
             {"id": "T-3", "title": "Filming idea", "kind": "needs_filming"}]}
-        self.call("/api/reviews/import", {"reviewer_name": "Tester", "text": json.dumps(review)})
+        r = self.call("/api/reviews/import", {"reviewer_name": "Tester", "text": json.dumps(review)})
+        self.assertEqual(r["imported"], 3)
+        self.assertEqual(len(r["warnings"]), 1)                  # clip_now without times; idea is fine
+        self.assertIn("Idea without time", r["warnings"][0])
         g = self.call("/api/guide")
         by_title = {s["title"]: s for s in g["suggestions"]}
         self.assertFalse(by_title["Timed clip"]["untimed"])

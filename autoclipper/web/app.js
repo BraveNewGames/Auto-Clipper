@@ -86,6 +86,7 @@ const state = {
   pendingCreate: null,
   alignSuggestions: null,
   transcriptQ: "",
+  importWarnings: null,
   guide: null,
   filters: { q: "", reviewer: "", status: "", pov: "", event: "", priority: "", kind: "" },
   focusIdx: -1,
@@ -208,6 +209,7 @@ function renderSession(main) {
     game: h("input", { value: s.game || "" }), pad_before: h("input", { class: "num", value: s.pad_before, type: "number", step: "0.5", min: "0" }),
     pad_after: h("input", { class: "num", value: s.pad_after, type: "number", step: "0.5", min: "0" }),
     notes: h("textarea", { rows: 3 }, s.notes || ""),
+    game_context: h("textarea", { rows: 3 }, s.game_context || ""),
   };
   const nParts = s.povs.reduce((a, p) => a + p.parts.length, 0);
   main.appendChild(h("div", { class: "panel" },
@@ -219,6 +221,8 @@ function renderSession(main) {
       h("label", { class: "f" }, "Pad before (s)", f.pad_before),
       h("label", { class: "f" }, "Pad after (s)", f.pad_after)),
     h("div", { class: "row" }, h("label", { class: "f grow" }, "Notes", f.notes)),
+    h("div", { class: "row" }, h("label", { class: "f grow" },
+      "Game & editorial context for AI reviewers (included in every review packet; empty = default)", f.game_context)),
     h("div", { class: "row" },
       h("button", { class: "btn primary", onclick: action(async () => {
         const body = {}; for (const [k, el] of Object.entries(f)) body[k] = el.value;
@@ -529,10 +533,16 @@ function renderReviews(main) {
         if (!name) throw new Error("Enter the reviewer name");
         const r = await api("/api/reviews/import", { reviewer_name: name, text: itext.value });
         applyPayload(r);
-        toast(`Imported ${r.imported} suggestion(s) from ${name}`, "ok");
+        state.importWarnings = { reviewer: name, items: r.warnings || [] };
+        toast(`Imported ${r.imported} suggestion(s) from ${name}` +
+          ((r.warnings || []).length ? ` — ${r.warnings.length} warning(s)` : ""), (r.warnings || []).length ? "warn" : "ok");
         render();
       }) }, "Import"),
-      h("span", { class: "muted small" }, "Importing the same reviewer again adds to its suggestions; delete the reviewer first to replace them."))));
+      h("span", { class: "muted small" }, "Importing the same reviewer again adds to its suggestions; delete the reviewer first to replace them.")),
+    state.importWarnings && state.importWarnings.items.length ? h("div", { class: "import-warnings" },
+      h("b", { class: "warn-text" }, `Last import (${state.importWarnings.reviewer}): ${state.importWarnings.items.length} warning(s)`),
+      h("ul", null, state.importWarnings.items.map((w) => h("li", null, w))),
+      h("button", { class: "btn small", onclick: () => { state.importWarnings = null; render(); } }, "Dismiss")) : null));
 
   const revs = state.reviewers;
   main.appendChild(h("div", { class: "panel" },

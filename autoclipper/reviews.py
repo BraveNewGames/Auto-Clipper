@@ -10,11 +10,15 @@ import json
 import re
 from datetime import datetime, timezone
 
-from .models import Event, Suggestion, fmt_ts, parse_ts
+from .models import DEFAULT_GAME_CONTEXT, Event, Suggestion, fmt_ts, parse_ts
 
 DEFAULT_PREFIX = "EV"
 EVENT_OVERLAP = 0.5          # overlap / shorter range needed to share an event
 DEFAULT_LENGTH = 15.0        # assumed clip length when a reviewer gives only a start time
+
+_TIME = {"type": ["string", "null"],
+         "description": "Session time HH:MM:SS from the transcript. Required for clip_now; omit or null "
+                        "for needs_filming ideas that are not tied to a moment."}
 
 REVIEW_JSON_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -27,26 +31,30 @@ REVIEW_JSON_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["id", "title", "start", "end", "priority", "kind", "what_happens", "why"],
+                "required": ["id", "title", "priority", "kind", "what_happens", "why"],
+                "if": {"properties": {"kind": {"const": "clip_now"}}},
+                "then": {"required": ["start", "end"],
+                         "properties": {"start": {"type": "string"}, "end": {"type": "string"}}},
                 "properties": {
-                    "id": {"type": "string", "description": "Your own short ID, e.g. C-01"},
+                    "id": {"type": "string", "description": "Your own short ID, e.g. R-01"},
                     "title": {"type": "string", "description": "2-5 word memorable title"},
-                    "start": {"type": "string", "description": "Session time HH:MM:SS(.mmm) where the clip should start"},
-                    "end": {"type": "string", "description": "Session time HH:MM:SS(.mmm) where the clip should end"},
+                    "start": _TIME,
+                    "end": {**_TIME, "description": "Session time HH:MM:SS, after start (clip_now)."},
                     "priority": {"enum": ["high", "medium", "low"]},
                     "kind": {"enum": ["clip_now", "needs_filming"]},
                     "what_happens": {"type": "string"},
-                    "why": {"type": "string", "description": "Why it is marketable / funny / interesting"},
+                    "why": {"type": "string", "description": "Why it works as a short video"},
                     "hook": {"type": "string", "description": "First 1-2 seconds / caption hook"},
-                    "structure": {"type": "string", "description": "Setup -> escalation -> punchline, edit approach"},
+                    "structure": {"type": "string", "description": "Setup -> escalation -> payoff, edit approach"},
                     "quotes": {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "required": ["time", "text"],
+                            "required": ["text"],
                             "properties": {
+                                "line": {"type": "string", "description": "Transcript line id, e.g. L0042"},
                                 "time": {"type": "string"}, "speaker": {"type": "string"},
-                                "text": {"type": "string"}, "source": {"type": "string"}}}},
+                                "text": {"type": "string"}}}},
                     "povs": {"type": "array", "items": {"type": "string"}},
                     "pov_notes": {"type": "string"},
                     "confirmed_by_transcript": {"type": "string"},
@@ -55,22 +63,26 @@ REVIEW_JSON_SCHEMA = {
                 }}}},
 }
 
+# Deliberately content-free so it cannot bias reviewers toward any real moment.
 _EXAMPLE = {
     "reviewer": "<REVIEWER>",
-    "suggestions": [{
-        "id": "X-01", "title": "Zombie Slide", "start": "00:06:35", "end": "00:06:50",
-        "priority": "high", "kind": "clip_now",
-        "what_happens": "Cindy proposes throwing a zombie down the slide; the team tries it.",
-        "why": "Absurd physics setup with an immediate payoff; easy to understand without context.",
-        "hook": "\"Throw the zombie down the slide!\"",
-        "structure": "Setup (the idea) -> attempt -> reaction. Cut on the laugh.",
-        "quotes": [{"time": "00:06:37.200", "speaker": "Cindy", "text": "Throw the zombie down the slide!",
-                    "source": "cindy-p2 00:03:17,200 Named"}],
-        "povs": ["Cindy", "Andres"],
-        "pov_notes": "Cindy says it; Andres's POV may show the slide (unverified).",
-        "confirmed_by_transcript": "The line and the laughter that follows.",
-        "needs_visual_check": "Whether the zombie actually goes down the slide on camera.",
-        "uncertainty": "Reaction speaker is Team (unattributed)."}]}
+    "suggestions": [
+        {"id": "R-01", "title": "<short title>", "start": "<HH:MM:SS>", "end": "<HH:MM:SS>",
+         "priority": "<high|medium|low>", "kind": "clip_now",
+         "what_happens": "<what happens, from the transcript>",
+         "why": "<why it works as a self-contained short video>",
+         "hook": "<opening line or caption>", "structure": "<setup -> escalation -> payoff; edit notes>",
+         "quotes": [{"line": "<line id>", "time": "<HH:MM:SS>", "speaker": "<speaker as shown>",
+                     "text": "<verbatim transcript text>"}],
+         "povs": ["<player>"], "pov_notes": "<which camera likely shows it and why>",
+         "confirmed_by_transcript": "<what the transcript proves>",
+         "needs_visual_check": "<what must be checked in the footage>",
+         "uncertainty": "<doubts, unknown speakers, timing>"},
+        {"id": "R-02", "title": "<short title>", "priority": "<high|medium|low>", "kind": "needs_filming",
+         "what_happens": "<the idea to stage or film>", "why": "<why it would work>",
+         "hook": "<opening line or caption>", "structure": "<shot plan>",
+         "povs": [], "uncertainty": "<anything unclear>"},
+    ]}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -107,7 +119,7 @@ def _part_ranges(session, cues_by_part=None):
 def session_summary(session, cues_by_part=None) -> str:
     lines = [f"Session: {session.session_id or '(unnamed)'}"]
     if getattr(session, "game", ""):
-        lines.append(f"Game: {session.game}")
+        lines.append(f"Game / client: {session.game}")
     if getattr(session, "notes", ""):
         lines.append(f"Notes: {session.notes}")
     lines.append("Recordings on the session timeline (one POV = one player's camera):")
@@ -137,56 +149,69 @@ def session_summary(session, cues_by_part=None) -> str:
     return "\n".join(lines)
 
 
-def build_review_packet(session, reviewer_name, cues_by_part=None) -> str:
-    from .reconcile import build_session_transcript, load_cues, transcript_text
+def game_context(session) -> str:
+    return (getattr(session, "game_context", "") or "").strip() or DEFAULT_GAME_CONTEXT
+
+
+def session_packet_lines(session, cues_by_part=None):
+    """The AI-facing transcript lines for the session's current state (ids are re-derivable)."""
+    from .reconcile import build_session_transcript, load_cues, packet_lines
     if cues_by_part is None:
         cues_by_part = load_cues(session)
-    lines = build_session_transcript(session, cues_by_part)
-    example = json.dumps(_EXAMPLE, indent=2).replace("<REVIEWER>", reviewer_name or "Reviewer")
-    return f"""You are {reviewer_name or 'an'} independent editorial reviewer for a video game marketing team.
-Below is the reconciled transcript of ONE multiplayer playtest session, recorded from several
-player POVs. Find the moments most worth turning into short-form social videos (TikTok / Shorts /
-Reels), and ideas worth filming or staging later.
+    return packet_lines(build_session_transcript(session, cues_by_part))
 
-LOOK FOR
-- Funny dialogue and reactions that probably have a visual payoff on screen.
-- Emergent physics comedy, mistakes, traps, rescues, disasters, unexpected interactions.
-- Clear setup -> escalation -> reversal/punchline arcs.
-- Game mechanics demonstrated naturally through what players do.
-- Strong short-form hooks and repeatable formats (series potential).
-- Ideas that need additional filming or staging (kind = "needs_filming").
+
+def build_review_packet(session, reviewer_name, cues_by_part=None) -> str:
+    """Prompt + format + coverage + compact transcript. Uses only the session's own recordings:
+    never other reviewers' suggestions or earlier imports (independent reviews)."""
+    from .reconcile import COMPACT_LEGEND, compact_transcript, load_cues
+    if cues_by_part is None:
+        cues_by_part = load_cues(session)
+    plines = session_packet_lines(session, cues_by_part)
+    reviewer = reviewer_name or "Reviewer"
+    example = json.dumps(_EXAMPLE, indent=1).replace("<REVIEWER>", reviewer)
+    return f"""You are {reviewer}, an independent editorial reviewer for a video game marketing team.
+Below is the transcript of ONE multiplayer playtest session recorded from several player POVs.
+Find the moments most worth turning into short-form social videos (TikTok / Shorts / Reels),
+plus ideas worth filming or staging later.
+
+GAME CONTEXT
+{game_context(session)}
+
+PRIORITIES (most important first)
+1. Funny, self-contained short videos that make sense without the rest of the session.
+2. Natural gameplay moments: emergent physics comedy, mistakes, traps, rescues, disasters.
+3. Comedic setups and payoffs: setup -> escalation -> reversal/punchline.
+4. Repeatable formats that could become a series; mechanics shown naturally by players.
+5. Ideas that need staging or extra filming (kind "needs_filming").
 
 RULES
-- Work independently; do not assume anyone else's review exists.
-- Use SESSION timestamps exactly as shown in the transcript (HH:MM:SS.mmm). Give each clip a
-  start/end window with a few seconds of context; typical clips are 10-60 seconds.
-- You only have the transcript. Separate what is CONFIRMED by the transcript
-  (confirmed_by_transcript) from what you INFER might be visible (needs_visual_check).
-  Never claim a visual payoff is verified.
-- Speaker names come from each player's own clean microphone. "Team (unattributed)" lines were
-  heard over Discord and the speaker is unknown - do not invent a speaker for them. Lines marked
-  "uncertain" have disagreeing renditions (alternatives shown as alt:).
-- POVs: list players whose camera likely shows the moment and explain in pov_notes. A POV with
-  no footage at that time (see coverage below) cannot be used.
-- Quote the transcript verbatim with its time, speaker and source tag.
+- Work independently; you have not seen any other review.
+- clip_now: start and end are required session times (HH:MM:SS) copied from the transcript, start
+  before end, with a few seconds of context; typical clips are 10-60 s.
+  needs_filming: omit start/end (or use null) unless the idea comes from a specific moment.
+- You only have the transcript. Put what the transcript proves in confirmed_by_transcript and what
+  you infer might be on screen in needs_visual_check. Never claim a visual payoff is verified.
+- Do not invent speakers for "Team?" lines.
+- POVs: players whose camera likely shows the moment (pov_notes says why). A player with no
+  footage at that time (see COVERAGE) cannot be used.
+- Quotes: copy text verbatim and include its line id.
 - Priority: high = post-worthy as is; medium = good with editing; low = worth a look.
-- Prefer quality over quantity (roughly 5-20 suggestions for a session this long).
+- Quality over quantity (roughly 5-20 suggestions).
 
 OUTPUT
-Return ONLY a JSON object (no prose before or after) in exactly this format:
+Return ONLY a JSON object (no prose before or after) shaped like this (<...> are placeholders):
 {example}
 
-JSON schema:
-{json.dumps(REVIEW_JSON_SCHEMA, indent=1)}
+JSON schema: {json.dumps(REVIEW_JSON_SCHEMA, separators=(",", ":"))}
 
 COVERAGE
 {session_summary(session, cues_by_part)}
 
-TRANSCRIPT FORMAT
-[session time] Speaker: text  {{confidence / uncertainty, src: <part> <local SRT time> <Named|Team>; ...}}
+TRANSCRIPT ({len(plines)} lines)
+{COMPACT_LEGEND}
 
-TRANSCRIPT ({len(lines)} lines)
-{transcript_text(lines, include_sources=True)}
+{compact_transcript(plines)}
 """
 
 
@@ -342,11 +367,24 @@ def _quotes(v):
                 spk, rest = m2.group(1).strip(), m2.group(2)
             out.append({"text": rest.strip().strip('"'), "speaker": spk, "time": t, "source": ""})
         elif isinstance(q, dict):
-            out.append({"text": _text(_first(q, "text", "quote", "line")),
-                        "speaker": _first(q, "speaker", "who", "name"),
-                        "time": _time(_first(q, "time", "timestamp", "at", "start")),
-                        "source": _text(_first(q, "source", "src", "provenance"))})
+            line_id = _line_id(_first(q, "line", "line_id", "id", "ref"))
+            text = _first(q, "text", "quote") or ("" if line_id else _first(q, "line"))
+            item = {"text": _text(text),
+                    "speaker": _first(q, "speaker", "who", "name"),
+                    "time": _time(_first(q, "time", "timestamp", "at", "start")),
+                    "source": _text(_first(q, "source", "src", "provenance"))}
+            if line_id:
+                item["line"] = line_id
+            out.append(item)
     return out
+
+
+_LINE_ID = re.compile(r"^\s*\[?\s*(L\d{1,6})\s*\]?\s*$", re.I)
+
+
+def _line_id(v):
+    m = _LINE_ID.match(str(v)) if isinstance(v, (str, int)) and v != "" else None
+    return m.group(1).upper() if m else None
 
 
 def _povs(v):
@@ -364,25 +402,35 @@ def _povs(v):
     return out
 
 
-def _one(d, reviewer, reviewer_name, n, now):
-    start = _time(_first(d, "start", "start_time", "from", "begin", "session_start"))
-    end = _time(_first(d, "end", "end_time", "to", "until", "stop", "session_end"))
+_START_KEYS = ("start", "start_time", "from", "begin", "session_start")
+_END_KEYS = ("end", "end_time", "to", "until", "stop", "session_end")
+_RANGE_KEYS = ("time_range", "range", "time", "timestamp", "window", "timestamps")
+
+
+def _one(d, reviewer, reviewer_name, n, now, warnings):
+    """One raw suggestion -> Suggestion. Untimed (start == end == 0.0, what the guide/export treat
+    as an untimed idea) when no valid range is given; a clip_now without one also adds a warning."""
+    raw_start, raw_end = _first(d, *_START_KEYS), _first(d, *_END_KEYS)
+    start, end = _time(raw_start), _time(raw_end)
     if start is None or end is None:
-        rs, re_ = _range(_first(d, "time_range", "range", "time", "timestamp", "window", "timestamps"))
+        rs, re_ = _range(_first(d, *_RANGE_KEYS))
         start = start if start is not None else rs
         end = end if end is not None else re_
+    title = _text(_first(d, "title", "name", "headline")) or f"Untitled {n}"
+    kind = _kind(_first(d, "kind", "type", "category"), d)
+    given = any(_first(d, k) is not None for k in _START_KEYS + _END_KEYS + _RANGE_KEYS)
     notes = []
-    if start is None and end is None:
+    if start is None or end is None or not end > start:
+        if given:
+            got = f"start={_text(raw_start) or '?'}, end={_text(raw_end) or '?'}"
+            notes.append(f"no valid session time range from the reviewer ({got})")
+        else:
+            notes.append("no session time given by the reviewer")
+        if kind == "clip_now" or given:
+            warnings.append(f"\"{title}\" ({reviewer}-{n:02d}): {kind} without a valid start/end "
+                            f"({'got ' + got if given else 'none given'}); imported as untimed - "
+                            "set the range by hand or ask the reviewer.")
         start = end = 0.0
-        notes.append("no session time given by the reviewer")
-    elif start is None:
-        start = max(0.0, end - DEFAULT_LENGTH)
-        notes.append(f"start time missing; assumed {DEFAULT_LENGTH:g} s before end")
-    elif end is None:
-        end = start + DEFAULT_LENGTH
-        notes.append(f"end time missing; assumed {DEFAULT_LENGTH:g} s after start")
-    if end < start:
-        start, end = end, start
     unc = _text(_first(d, "uncertainty", "uncertain", "caveats", "risks"))
     if notes:
         unc = "; ".join([unc] + notes if unc else notes)
@@ -391,11 +439,11 @@ def _one(d, reviewer, reviewer_name, n, now):
         reviewer=reviewer,
         reviewer_name=reviewer_name,
         event_id="",
-        title=_text(_first(d, "title", "name", "headline")) or f"Untitled {n}",
+        title=title,
         start=round(float(start), 3),
         end=round(float(end), 3),
         priority=_priority(_first(d, "priority", "rating", "tier")),
-        kind=_kind(_first(d, "kind", "type", "category"), d),
+        kind=kind,
         what_happens=_text(_first(d, "what_happens", "summary", "description", "context")),
         why=_text(_first(d, "why", "reason", "why_it_matters", "rationale")),
         hook=_text(_first(d, "hook", "caption")),
@@ -411,8 +459,17 @@ def _one(d, reviewer, reviewer_name, n, now):
     )
 
 
+class ImportResult(list):
+    """A list of Suggestions with .warnings (human-readable strings) from parsing/import."""
+
+    def __init__(self, items=(), warnings=None):
+        super().__init__(items)
+        self.warnings = list(warnings or [])
+
+
 def parse_review(text_or_obj, reviewer_name) -> list:
-    """Tolerant parse of a pasted review -> [Suggestion] with provisional IDs "<slug>-NN"."""
+    """Tolerant parse of a pasted review -> ImportResult([Suggestion]) with provisional IDs
+    "<slug>-NN" and .warnings for suggestions that could not be fully understood."""
     val = text_or_obj
     if isinstance(val, (bytes, bytearray)):
         val = val.decode("utf-8-sig", errors="replace")
@@ -426,7 +483,9 @@ def parse_review(text_or_obj, reviewer_name) -> list:
         raise ValueError("The review JSON contains no suggestions.")
     slug = reviewer_slug(reviewer_name)
     now = _now()
-    return [_one(d, slug, reviewer_name, n, now) for n, d in enumerate(items, 1)]
+    warnings = []
+    out = [_one(d, slug, reviewer_name, n, now, warnings) for n, d in enumerate(items, 1)]
+    return ImportResult(out, warnings)
 
 
 # --------------------------------------------------------------------------- import + events
@@ -440,16 +499,104 @@ def _next_suggestion_id(slug, used):
 
 
 def import_review(session, text_or_obj, reviewer_name) -> list:
+    """Parse + unique IDs + quote line resolution + events. Returns ImportResult (.warnings)."""
     new = parse_review(text_or_obj, reviewer_name)
     used = {s.suggestion_id for s in session.suggestions}
     if any(s.suggestion_id in used for s in new):
         # re-import / collision: number after this reviewer's existing suggestions
+        old_ids = [s.suggestion_id for s in new]
         for s in new:
             s.suggestion_id = _next_suggestion_id(s.reviewer, used)
             used.add(s.suggestion_id)
+        remap = dict(zip(old_ids, (s.suggestion_id for s in new)))
+        new.warnings = [_renumber(w, remap) for w in new.warnings]
+    resolve_quote_lines(session, new, new.warnings)
     session.suggestions.extend(new)
     assign_events(session, new)
     return new
+
+
+def _renumber(text, remap):
+    return re.sub(r"\(([a-z0-9]+-\d+)\)", lambda m: f"({remap.get(m.group(1), m.group(1))})", text)
+
+
+def _source_detail(src):
+    from .reconcile import source_ref
+    return {"part_id": src.get("part_id"), "pov_name": src.get("pov_name"),
+            "srt_time": source_ref(src).split(" ")[1], "local_start": src.get("local_start"),
+            "channel": src.get("channel"), "text": src.get("text"), "ref": source_ref(src)}
+
+
+def _quote_fits(text, pline):
+    from .reconcile import contain, similarity
+    if not text:
+        return True
+    return contain(text, pline.text) >= 0.6 or similarity(text, pline.text) >= 0.6
+
+
+def _best_text_match(text, t, sug, plines):
+    """Best line for a quote: text similarity first, then named speaker, then time proximity
+    (quote time, else the suggestion's window)."""
+    from .reconcile import contain, similarity
+    if t is not None:
+        lo, hi = t - 20, t + 20
+    elif sug.end > sug.start:
+        lo, hi = sug.start - 30, sug.end + 30
+    else:
+        lo, hi = float("-inf"), float("inf")
+    best, best_key = None, None
+    for p in plines:
+        if not (lo <= p.session_start <= hi) or not _quote_fits(text, p):
+            continue
+        centre = t if t is not None else (lo + hi) / 2 if hi != float("inf") else p.session_start
+        key = (round(max(similarity(text, p.text), contain(text, p.text)), 2), p.speaker is not None,
+               -abs(p.session_start - centre))
+        if best_key is None or key > best_key:
+            best, best_key = p, key
+    return best
+
+
+def resolve_quote_lines(session, suggestions, warnings=None, plines=None) -> int:
+    """Resolve quotes that cite transcript line ids ("L0042") to detailed sources (POV, part, SRT
+    time, channel). If the id no longer matches the quoted text (e.g. offsets changed after the
+    packet was made) the best text match near the quote time is used instead. Quotes without a
+    line id are left exactly as imported. Returns the number of resolved quotes."""
+    cited = [(s, q) for s in suggestions for q in s.quotes if q.get("line")]
+    if not cited:
+        return 0
+    if plines is None:
+        try:
+            plines = session_packet_lines(session)
+        except Exception:
+            plines = []
+    by_id = {p.packet_id: p for p in plines}
+    resolved = 0
+    for sug, q in cited:
+        pl = by_id.get(q["line"])
+        if pl is not None and not _quote_fits(q.get("text"), pl):
+            pl = None
+        if pl is None and q.get("text"):
+            pl = _best_text_match(q["text"], q.get("time"), sug, plines)
+        if pl is None:
+            q["line_unresolved"] = True
+            if warnings is not None:
+                warnings.append(f"\"{sug.title}\" ({sug.suggestion_id}): quote line {q['line']} "
+                                "not found in the current transcript; kept as quoted.")
+            continue
+        if pl.packet_id != q["line"]:
+            q["line_cited"] = q["line"]
+        q["line"] = pl.packet_id
+        q["sources"] = [_source_detail(src) for src in pl.sources]
+        if not q.get("source") and q["sources"]:
+            q["source"] = q["sources"][0]["ref"]
+        if q.get("time") is None:
+            q["time"] = pl.session_start
+        if not q.get("speaker"):
+            q["speaker"] = pl.label
+        if not q.get("text"):
+            q["text"] = pl.text
+        resolved += 1
+    return resolved
 
 
 def remove_reviewer(session, reviewer) -> int:
@@ -525,7 +672,7 @@ def assign_events(session, new_suggestions) -> None:
 
     # 2. new events (numbered in session-time order), still merging different-reviewer
     #    suggestions within this batch (e.g. a combined import)
-    for s in sorted(pending, key=lambda x: (x.start, x.end, x.suggestion_id)):
+    for s in sorted(pending, key=lambda x: (not x.end > x.start, x.start, x.end, x.suggestion_id)):
         if s.suggestion_id in placed:
             continue
         target = None

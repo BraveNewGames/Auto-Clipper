@@ -10,6 +10,7 @@ from pathlib import Path
 from autoclipper.autoalign import suggest_offsets, apply_suggested_offsets
 from autoclipper.reconcile import build_session_transcript, load_cues, similarity
 from autoclipper.reviews import build_review_packet, import_review, parse_review
+from autoclipper.models import parse_ts
 from autoclipper.scan import scan_folder
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +115,32 @@ class SampleSessionTests(unittest.TestCase):
         self.assertTrue(all(l.speaker is None for l in lines))
 
     # ---------------------------------------------------------------- reviews
+    def test_sample_reviews_import_backward_compatible(self):
+        s = self.aligned()
+        for name, reviewer in (("review_claude.json", "Claude"), ("review_chatgpt.json", "ChatGPT")):
+            raw = json.loads((self.folder / name).read_text(encoding="utf-8"))["suggestions"]
+            res = import_review(s, json.dumps({"suggestions": raw}), reviewer)
+            self.assertEqual(res.warnings, [], name)
+            for r, sg in zip(raw, res):
+                if r["kind"] == "clip_now":
+                    self.assertAlmostEqual(sg.start, parse_ts(r["start"]), places=3)
+                    self.assertAlmostEqual(sg.end, parse_ts(r["end"]), places=3)
+                self.assertEqual([q["text"] for q in sg.quotes], [q["text"] for q in r.get("quotes", [])])
+                self.assertTrue(all("sources" not in q for q in sg.quotes))   # no line ids -> unchanged
+
+    def test_quote_line_id_resolves_on_sample(self):
+        s = self.aligned()
+        packet = build_review_packet(s, "Claude")
+        lid = next(l.split(" ")[0] for l in packet.splitlines() if "Throw the zombie down the slide" in l)
+        res = import_review(s, {"suggestions": [{"title": "X", "start": "00:06:30", "end": "00:06:50",
+                                                 "kind": "clip_now",
+                                                 "quotes": [{"line": lid, "text": "Throw the zombie down the slide!"}]}]},
+                            "Claude")
+        q = res[0].quotes[0]
+        self.assertEqual(q["speaker"], "Cindy")
+        self.assertEqual(q["source"], "cindy-p2 00:03:17,200 Named")
+        self.assertIn("andres-p2", {x["part_id"] for x in q["sources"]})
+
     def test_review_import_event_ids(self):
         s = self.aligned()
         c = import_review(s, (self.folder / "review_claude.json").read_text(encoding="utf-8"), "Claude")
@@ -130,8 +157,8 @@ class SampleSessionTests(unittest.TestCase):
     def test_review_packet_roundtrip(self):
         s = self.aligned()
         packet = build_review_packet(s, "ChatGPT")
-        self.assertIn("Cindy: Throw the zombie down the slide!", packet)
-        self.assertIn("cindy-p2 00:03:17,200 Named", packet)
+        self.assertRegex(packet, r"L\d{4} 00:06:37 Cindy: Throw the zombie down the slide!")
+        self.assertNotIn("cindy-p2 00:03:17,200", packet)        # provenance stays internal
         self.assertIn("Andres: part 1 00:00:12.500-00:05:12.500; part 2 00:05:30.000-", packet)
         self.assertIn("NO footage during gap 00:05:12.500-00:05:30.000", packet)
         self.assertNotIn("Alignment not yet verified", packet)

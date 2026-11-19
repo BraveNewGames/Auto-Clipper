@@ -29,6 +29,10 @@ def parse_ts(s: str | float) -> float:
     return result
 
 
+DEFAULT_GAME_CONTEXT = ("Nightbrats is a four-player physics-based horror-comedy game about "
+                        "livestreaming haunted adventures.")
+
+
 class _Model:
     def to_dict(self):
         return asdict(self)
@@ -120,11 +124,13 @@ class Session(_Model):
     events: list[Event] = field(default_factory=list)
     reviews: dict[str, Review] = field(default_factory=dict)
     transcript_overrides: dict = field(default_factory=dict)
+    game_context: str = DEFAULT_GAME_CONTEXT     # editorial context given to AI reviewers
 
     @classmethod
     def from_dict(cls, data):
         return cls(**{
             **data,
+            "game_context": (data.get("game_context") or "").strip() or DEFAULT_GAME_CONTEXT,
             "povs": [POV.from_dict(p) for p in data.get("povs", [])],
             "suggestions": [Suggestion.from_dict(s) for s in data.get("suggestions", [])],
             "events": [Event.from_dict(e) for e in data.get("events", [])],

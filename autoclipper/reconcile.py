@@ -560,3 +560,75 @@ def transcript_text(lines, include_sources=False) -> str:
             s += "  {" + ", ".join(tags) + "}"
         out.append(s)
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- compact AI view
+
+MERGE_GAP = 1.5             # merge consecutive same-speaker fragments closer than this (s)
+MERGE_MAX_CHARS = 320       # ... while the merged text stays reasonably short
+
+COMPACT_LEGEND = """\
+Format: <line id> <session time HH:MM:SS> <speaker>: <text>
+Speaker names come from that player's own microphone (reliable). "Team?" = heard over voice chat,
+speaker unknown (never guess who). "(?)" = wording uncertain. Cite line ids in quotes."""
+
+
+@dataclass
+class PacketLine:
+    """One AI-facing transcript line; may merge consecutive same-speaker SessionLines."""
+    packet_id: str
+    session_start: float
+    session_end: float
+    speaker: str | None
+    channel: str
+    text: str
+    uncertain: bool
+    members: list = field(default_factory=list)     # SessionLine objects (full provenance)
+
+    @property
+    def sources(self):
+        return [src for m in self.members for src in m.sources]
+
+    @property
+    def label(self):
+        if self.speaker:
+            return self.speaker
+        return "Team?" if self.channel == "team" else "?"
+
+
+def _hms(sec: float) -> str:
+    sign = "-" if sec < 0 else ""
+    t = int(abs(sec))
+    return f"{sign}{t // 3600:02d}:{t // 60 % 60:02d}:{t % 60:02d}"
+
+
+def packet_lines(lines, merge_gap=MERGE_GAP) -> list:
+    """Compact, deterministic AI view of a session transcript (ids L0001.. in session order)."""
+    groups = []
+    for l in sorted(lines, key=lambda x: (x.session_start, x.line_id)):
+        g = groups[-1] if groups else None
+        if (g is not None and l.speaker and g[-1].speaker == l.speaker
+                and l.session_start - g[-1].session_end <= merge_gap
+                and sum(len(m.text) + 1 for m in g) + len(l.text) <= MERGE_MAX_CHARS):
+            g.append(l)
+        else:
+            groups.append([l])
+    width = max(4, len(str(len(groups))))
+    out = []
+    for n, g in enumerate(groups, 1):
+        out.append(PacketLine(
+            packet_id=f"L{n:0{width}d}",
+            session_start=g[0].session_start,
+            session_end=max(m.session_end for m in g),
+            speaker=g[0].speaker,
+            channel=g[0].channel,
+            text=" ".join(m.text.strip() for m in g),
+            uncertain=any(m.uncertain for m in g),
+            members=g,
+        ))
+    return out
+
+
+def compact_transcript(plines) -> str:
+    return "\n".join(f"{p.packet_id} {_hms(p.session_start)} {p.label}: {p.text}"
+                     + (" (?)" if p.uncertain else "") for p in plines)

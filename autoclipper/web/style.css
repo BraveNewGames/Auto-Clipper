@@ -74,6 +74,7 @@ table.t tr:hover td { background: rgba(255,255,255,.02); }
   padding: 7px 12px; border-radius: 4px; max-width: 520px; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
 .toast.error { border-left-color: var(--bad); }
 .toast.ok { border-left-color: var(--good); }
+.toast.warn { border-left-color: var(--warn); }
 
 /* timeline */
 .timeline { position: relative; margin-top: 6px; }
@@ -149,3 +150,5 @@ table.t tr:hover td { background: rgba(255,255,255,.02); }
 pre.setup { white-space: pre-wrap; background: #12141a; border: 1px solid var(--line); padding: 10px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
 .namelist { font-family: var(--mono); font-size: 12px; max-height: 260px; overflow: auto; background: #12141a;
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+.import-warnings { margin-top: 8px; padding: 8px 10px; border: 1px solid #6e5726; border-radius: 4px; background: rgba(240,181,69,.08); }
+.import-warnings ul { margin: 4px 0 6px 18px; padding: 0; }

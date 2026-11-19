@@ -229,6 +229,9 @@ class App:
             for key in ("session_id", "event_prefix", "game", "notes"):
                 if key in body and body[key] is not None:
                     setattr(s, key, str(body[key]))
+            if "game_context" in body and body["game_context"] is not None:
+                s.game_context = (str(body["game_context"]).strip()
+                                  or _mod("models").DEFAULT_GAME_CONTEXT)
             for key in ("pad_before", "pad_after"):
                 if key in body and body[key] not in (None, ""):
                     v = _time(body[key])
@@ -407,6 +410,7 @@ class App:
             out = self.session_payload()
             out["imported"] = len(added)
             out["suggestion_ids"] = [a.suggestion_id for a in added]
+            out["warnings"] = list(getattr(added, "warnings", []) or [])
             return out
 
     def reviews_delete(self, body):
