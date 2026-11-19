@@ -22,6 +22,8 @@ PAIR_SIM = 0.72           # min fuzzy similarity for a candidate pair
 WINDOW = 2.0              # width (s) of the densest-difference window
 INLIER = 1.0              # inlier radius (s) around the estimate
 HOP_DECAY = 0.95          # each extra hop away from the reference costs a little confidence
+OUTLIER = 1.5             # edges disagreeing with the tree solution by more are ignored
+MAX_CANDIDATES = 8        # per cue: only the lines sharing the most keywords are compared
 MIN_SUPPORT = 3           # min inlier matches for an edge between two parts
 
 _STOP = set("""a an and are as at be but by can did do does for from get go got had has have he her
@@ -34,11 +36,12 @@ def _keywords(toks):
 
 
 class _C:
-    __slots__ = ("cue", "toks", "kw", "pov_id")
+    __slots__ = ("cue", "toks", "tset", "kw", "pov_id")
 
     def __init__(self, cue, pov_id):
         self.cue = cue
         self.toks = tokens(cue.text)
+        self.tset = set(self.toks)
         self.kw = _keywords(self.toks)
         self.pov_id = pov_id
 
@@ -71,12 +74,16 @@ def _pair_diffs(A, B, same_pov):
             for j in index.get(k, ()):
                 counts[j] += 1
         need = 1 if len(a.kw) <= 2 else 2
+        cands = [(n, j) for j, n in counts.items() if n >= need]
+        cands.sort(key=lambda x: (-x[0], x[1]))
         best = {}
-        for j, n in counts.items():
-            if n < need:
-                continue
+        ta = set(a.toks)
+        for n, j in cands[:MAX_CANDIDATES]:
             b = B[j]
             if len(b.toks) < MIN_TOKENS or not _allowed(a, b, same_pov):
+                continue
+            # cheap upper-bound-ish prefilter (token multiset overlap) before the fuzzy ratio
+            if 2 * len(ta & b.tset) / (len(ta) + len(b.tset)) < PAIR_SIM - 0.25:
                 continue
             sim = similarity(a.toks, b.toks)
             if sim < PAIR_SIM:
@@ -152,6 +159,32 @@ def _edges(session, cues_by_part):
     return edges
 
 
+def _refine(result, edges, ref, iterations=200):
+    """Weighted least-squares over every edge consistent with the tree solution, reference fixed.
+
+    The tree (most confident paths) accumulates small per-hop errors; averaging over all
+    pairwise estimates (Gauss-Seidel) cancels most of them."""
+    offs = {pid: v[0] for pid, v in result.items()}
+    good = defaultdict(list)
+    for pid in offs:
+        for other, delta, conf, support, mad in edges.get(pid, ()):
+            if other in offs and abs(offs[pid] + delta - offs[other]) <= OUTLIER:
+                good[other].append((pid, delta, conf * support))
+    for _ in range(iterations):
+        moved = 0.0
+        for pid in offs:
+            if pid == ref or not good[pid]:
+                continue
+            wsum = sum(w for _, _, w in good[pid])
+            new = sum((offs[n] + d) * w for n, d, w in good[pid]) / wsum
+            moved = max(moved, abs(new - offs[pid]))
+            offs[pid] = new
+        if moved < 1e-4:
+            break
+    for pid, (off, c, sup, via) in list(result.items()):
+        result[pid] = (offs[pid], c, sup, via)
+
+
 def _part(session, part_id):
     for _, pt in session.all_parts():
         if pt.part_id == part_id:
@@ -167,7 +200,11 @@ def default_reference(session):
 
 
 def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
-    """Suggest offsets for every part relative to a reference part (keeps its current offset).
+    """Suggest offsets for every part relative to a reference part.
+
+    The reference keeps its current offset when it was chosen explicitly or when any part has a
+    manual offset (the user anchored the timeline). Otherwise (fresh session) the suggestions are
+    shifted so the earliest matched recording starts at session t=0.
 
     Returns one dict per part:
       {"part_id", "offset", "confidence", "support", "matched_with", "method", "current_offset", "delta"}
@@ -201,12 +238,23 @@ def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
             result[other] = (off_here + delta, c, support, pid)
             heapq.heappush(heap, (-c, other))
 
+    _refine(result, edges, ref)
+
+    shift = 0.0
+    anchored = reference_part_id is not None or any(
+        pt.offset_source == "manual" for _, pt in session.all_parts())
+    if not anchored:
+        shift = -min(off for off, _, _, _ in result.values())
+    result = {pid: (off + shift, c, sup, via) for pid, (off, c, sup, via) in result.items()}
+
     out = []
     for pov, pt in session.all_parts():
         cur = pt.offset or 0.0
         if pt.part_id == ref:
-            out.append({"part_id": pt.part_id, "offset": round(cur, 3), "confidence": 1.0, "support": 0,
-                        "matched_with": None, "method": "reference", "current_offset": cur, "delta": 0.0})
+            off = result[ref][0]
+            out.append({"part_id": pt.part_id, "offset": round(off, 3), "confidence": 1.0, "support": 0,
+                        "matched_with": None, "method": "reference", "current_offset": cur,
+                        "delta": round(off - cur, 3)})
         elif pt.part_id in result:
             off, c, support, via = result[pt.part_id]
             out.append({"part_id": pt.part_id, "offset": round(off, 3), "confidence": round(c, 3),
@@ -221,8 +269,10 @@ def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
 def apply_suggested_offsets(session, suggestions, min_confidence=0.5) -> None:
     """Apply suggestions with confidence >= min_confidence; never touches manual offsets."""
     for s in suggestions or []:
-        if not isinstance(s, dict) or s.get("method") == "reference" or s.get("offset") is None:
+        if not isinstance(s, dict) or s.get("offset") is None:
             continue
+        if s.get("method") == "reference" and abs((s.get("delta") or 0.0)) < 1e-6:
+            continue          # reference part unchanged
         conf = s.get("confidence") or 0.0
         if conf < min_confidence:
             continue
