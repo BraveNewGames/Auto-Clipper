@@ -152,6 +152,13 @@ def _edges(session, cues_by_part):
     return edges
 
 
+def _part(session, part_id):
+    for _, pt in session.all_parts():
+        if pt.part_id == part_id:
+            return pt
+    return None
+
+
 def default_reference(session):
     for pov in session.povs:
         if pov.parts:
@@ -169,12 +176,12 @@ def suggest_offsets(session, cues_by_part=None, reference_part_id=None) -> list:
     if cues_by_part is None:
         cues_by_part = load_cues(session)
     ref = reference_part_id or default_reference(session)
-    if ref is None or session.part_by_id(ref) is None:
+    if ref is None or _part(session, ref) is None:
         return []
     edges = _edges(session, cues_by_part)
 
     # Most-confident path from the reference: path confidence = weakest edge, decayed per hop.
-    ref_off = session.part_by_id(ref).offset or 0.0
+    ref_off = _part(session, ref).offset or 0.0
     result = {ref: (ref_off, 1.0, 0, None)}
     heap = [(-1.0, ref)]
     best = {ref: 1.0}
@@ -219,7 +226,7 @@ def apply_suggested_offsets(session, suggestions, min_confidence=0.5) -> None:
         conf = s.get("confidence") or 0.0
         if conf < min_confidence:
             continue
-        part = session.part_by_id(s.get("part_id"))
+        part = _part(session, s.get("part_id"))
         if part is None or part.offset_source == "manual":
             continue
         part.offset = float(s["offset"])
