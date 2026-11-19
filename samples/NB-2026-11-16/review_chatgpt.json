@@ -1,0 +1,51 @@
+{
+  "reviewer": "ChatGPT",
+  "suggestions": [
+    {
+      "id": "G-01",
+      "title": "Zombie Slide",
+      "start": 394.25,
+      "end": 405.5,
+      "priority": "high",
+      "kind": "clip_now",
+      "what_happens": "The zombie and the cart both slide downhill.",
+      "why": "A setup and surprise payoff fit a short edit.",
+      "hook": "Open on the object about to move.",
+      "structure": "Setup, motion, reaction.",
+      "quotes": [],
+      "povs": [
+        "Cindy",
+        "Andres",
+        "Didi",
+        "Rika"
+      ],
+      "pov_notes": "Compare angles and reactions.",
+      "confirmed_by_transcript": "Players describe the action.",
+      "needs_visual_check": "Check that the object and landing are visible.",
+      "uncertainty": "Camera framing is unknown."
+    },
+    {
+      "id": "G-02",
+      "title": "Four-Cart Race",
+      "start": 450,
+      "end": 460,
+      "priority": "medium",
+      "kind": "needs_filming",
+      "what_happens": "Stage a four-way race down the playground slide.",
+      "why": "A setup and surprise payoff fit a short edit.",
+      "hook": "Open on the object about to move.",
+      "structure": "Setup, motion, reaction.",
+      "quotes": [],
+      "povs": [
+        "Cindy",
+        "Andres",
+        "Didi",
+        "Rika"
+      ],
+      "pov_notes": "Compare angles and reactions.",
+      "confirmed_by_transcript": "Andres proposes staging the race.",
+      "needs_visual_check": "Check that the object and landing are visible.",
+      "uncertainty": "Camera framing is unknown."
+    }
+  ]
+}
