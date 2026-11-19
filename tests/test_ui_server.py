@@ -211,9 +211,7 @@ class TestEndToEnd(ServerTestCase):
         gap = [s for s in g["suggestions"] if s["kind"] == "clip_now" and 315 <= s["start"] and s["end"] <= 329]
         self.assertTrue(gap)
         g0 = gap[0]
-        # padding may touch Andres footage at the gap edges, but nothing inside the suggestion itself
-        self.assertFalse([rg for rg in g0["ranges"] if rg["pov_name"] == "Andres"
-                          and rg["session_end"] > g0["start"] and rg["session_start"] < g0["end"]])
+        self.assertFalse([rg for rg in g0["ranges"] if rg["pov_name"] == "Andres"])
 
         # 7. review decisions ----------------------------------------------
         sids = [s["suggestion_id"] for s in g["suggestions"] if s["kind"] == "clip_now"]
@@ -283,6 +281,38 @@ class TestEndToEnd(ServerTestCase):
         self.assertEqual(after["reviews"][keep]["notes"], "great")
         self.assertEqual(self.parts(r)["andres-p2"]["offset_source"], "manual")
         self.assertEqual(after["game"], "Test game")
+
+
+class TestUntimedSuggestions(ServerTestCase):
+    @unittest.skipUnless(HAS_REVIEWS, "autoclipper.reviews not merged yet")
+    def test_untimed_ideas_are_flagged_and_never_exported(self):
+        self.create_session()
+        for pid, dur in self.durations.items():
+            self.call("/api/parts/update", {"part_id": pid, "duration": dur})
+        self.call("/api/align/chain", {})
+        review = {"reviewer": "Tester", "suggestions": [
+            {"id": "T-1", "title": "Timed clip", "start": "00:01:00", "end": "00:01:10", "kind": "clip_now"},
+            {"id": "T-2", "title": "Idea without time", "kind": "clip_now", "what_happens": "stage a race"},
+            {"id": "T-3", "title": "Filming idea", "kind": "needs_filming"}]}
+        self.call("/api/reviews/import", {"reviewer_name": "Tester", "text": json.dumps(review)})
+        g = self.call("/api/guide")
+        by_title = {s["title"]: s for s in g["suggestions"]}
+        self.assertFalse(by_title["Timed clip"]["untimed"])
+        self.assertTrue(by_title["Timed clip"]["ranges"])
+        for title in ("Idea without time", "Filming idea"):
+            self.assertTrue(by_title[title]["untimed"], title)
+            self.assertEqual(by_title[title]["ranges"], [])
+        ex = self.call("/api/export", {"statuses": ["keep", "maybe", "reject", None]})
+        labels = [lbl for f in ex["files"] for _, _, lbl in
+                  (ln.rsplit(",", 2) for ln in Path(f["csv_path"]).read_text(encoding="utf-8").splitlines() if ln)]
+        self.assertTrue(any("Timed clip" in lbl for lbl in labels))
+        self.assertFalse([lbl for lbl in labels if "Idea without time" in lbl or "Filming idea" in lbl])
+        for f in ex["files"]:
+            for ln in Path(f["csv_path"]).read_text(encoding="utf-8").splitlines():
+                start, end, _ = ln.split(",", 2)
+                self.assertLess(float(start), float(end), ln)
+        names = [n for lst in ex["expected"].values() for n in lst]
+        self.assertFalse([n for n in names if "Idea without time" in n])
 
 
 class TestPartsEditing(ServerTestCase):

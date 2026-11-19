@@ -461,10 +461,11 @@ class App:
                     event_of[sid] = ev.event_id
             for sug in s.suggestions:
                 d = _plain(sug)
+                d["untimed"] = not (sug.end > sug.start)  # e.g. needs_filming ideas without timestamps
                 if not d.get("event_id"):
                     d["event_id"] = event_of.get(sug.suggestion_id)
                 try:
-                    d["ranges"] = ranges(sug.start, sug.end)
+                    d["ranges"] = [] if d["untimed"] else ranges(sug.start, sug.end)
                 except Exception as exc:
                     d["ranges"] = []
                     d["range_error"] = str(exc)

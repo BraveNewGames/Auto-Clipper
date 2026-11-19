@@ -636,19 +636,20 @@ function renderGuideList() {
     byEvent.get(k).push(sg);
   }
   const evInfo = new Map(g.events.map((e) => [e.event_id, e]));
-  const groups = Array.from(byEvent.entries()).sort((a, b) =>
-    Math.min(...a[1].map((x) => x.start)) - Math.min(...b[1].map((x) => x.start)));
+  const firstStart = (sgs) => Math.min(...sgs.map((x) => (x.untimed ? Infinity : x.start)));
+  const groups = Array.from(byEvent.entries()).sort((a, b) => firstStart(a[1]) - firstStart(b[1]));
   if (!groups.length) list.appendChild(h("div", { class: "empty" }, "Nothing matches these filters."));
   for (const [eid, sgs] of groups) {
     const ev = evInfo.get(eid);
     sgs.sort((a, b) => (a.reviewer_name || "").localeCompare(b.reviewer_name || "") || a.start - b.start);
     const allInEvent = ev ? ev.suggestion_ids.length : sgs.length;
     const reviewersInEvent = new Set((ev ? ev.suggestion_ids.map(reviewerOfSid) : sgs.map((x) => x.reviewer)));
-    const lo = Math.min(...sgs.map((x) => x.start)), hi = Math.max(...sgs.map((x) => x.end));
+    const timed = sgs.filter((x) => !x.untimed);
+    const lo = Math.min(...timed.map((x) => x.start)), hi = Math.max(...timed.map((x) => x.end));
     list.appendChild(h("section", { class: "event" },
       h("div", { class: "event-head" },
         h("span", { class: "eid" }, eid), h("span", { class: "etitle" }, ev?.title || sgs[0].title),
-        h("span", { class: "muted mono" }, `${fmt(lo)} – ${fmt(hi)}`),
+        timed.length ? h("span", { class: "muted mono" }, `${fmt(lo)} – ${fmt(hi)}`) : h("span", { class: "badge warn" }, "no timestamp"),
         reviewersInEvent.size > 1 ? h("span", { class: "badge good" }, `found by ${reviewersInEvent.size} reviewers — compare side by side`) : null,
         allInEvent > sgs.length ? h("span", { class: "muted small" }, `${allInEvent - sgs.length} more hidden by filters`) : null),
       h("div", { class: "cards" }, sgs.map(guideCard))));
@@ -678,7 +679,7 @@ function rangesTable(sg, ranges) {
     h("tr", null, h("td", null, r.pov_name), h("td", null, `part ${r.part_index}`),
       h("td", { class: "mono" }, `${fmt(r.local_start)} → ${fmt(r.local_end)}`), h("td", null, rangeNotes(r))));
   for (const p of missing) rows.push(h("tr", null, h("td", { class: "muted" }, p), h("td", null, "—"),
-    h("td", { class: "muted" }, "no coverage"), h("td", null, h("span", { class: "badge bad", title: "No recording part of this POV covers this time (gap or not recording)" }, "no footage"))));
+    h("td", { class: "muted" }, "no coverage of this moment"), h("td", null, h("span", { class: "badge bad", title: "This POV has recordings, but none covers this time (gap or not recording)" }, "no footage"))));
   return h("table", { class: "t ranges" },
     h("thead", null, h("tr", null, ["POV", "Part", "Local range (padded)", "Notes"].map((x) => h("th", null, x)))), h("tbody", null, rows));
 }
@@ -740,10 +741,13 @@ function guideCard(sg) {
       sg.kind === "needs_filming" ? h("span", { class: "badge warn" }, "needs filming") : h("span", { class: "badge" }, "clip now"),
       savedEl),
     h("div", { class: "card-title" }, sg.title || "(untitled)"),
-    h("div", { class: "mono small" }, `Session ${fmt(sg.start)} – ${fmt(sg.end)}`, h("span", { class: "muted" }, ` (${fmtDur(sg.end - sg.start)}; ±${state.guide.pad_before}/${state.guide.pad_after}s padding in imports)`)),
+    sg.untimed
+      ? h("div", { class: "small" }, h("span", { class: "badge warn" }, "Idea – no timestamp"),
+          h("span", { class: "muted" }, " Not tied to a moment in the footage; not exported to LosslessCut."))
+      : h("div", { class: "mono small" }, `Session ${fmt(sg.start)} – ${fmt(sg.end)}`, h("span", { class: "muted" }, ` (${fmtDur(sg.end - sg.start)}; ±${state.guide.pad_before}/${state.guide.pad_after}s padding in imports)`)),
     rev.approved_start != null && rev.approved_end != null ? h("div", { class: "mono small good-text" }, `Approved ${fmt(rev.approved_start)} – ${fmt(rev.approved_end)}`) : null,
     sg.range_error ? h("div", { class: "bad-text small" }, "Mapping failed: " + sg.range_error) : null,
-    sg.kind === "needs_filming" && !(sg.ranges || []).length ? null : rangesTable(sg, sg.ranges || []),
+    sg.untimed || (sg.kind === "needs_filming" && !(sg.ranges || []).length) ? null : rangesTable(sg, sg.ranges || []),
     sec("What happens", sg.what_happens), sec("Why it works", sg.why), sec("Hook", sg.hook), sec("Structure / edit", sg.structure),
     quotes,
     (sg.povs || []).length || sg.pov_notes ? h("div", { class: "sec" }, h("b", null, "POVs"),
