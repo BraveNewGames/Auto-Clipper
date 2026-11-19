@@ -221,3 +221,22 @@ Session "NB-2026-11-16", prefix "NB". Ground-truth offsets (session t=0 = Cindy 
 - Default exports include Keep, Maybe and unreviewed clip suggestions. Filming ideas remain in the editorial guide. The CSVs listed in the current README describe the current export. Filename previews assume the source container and use .mkv for SRT-only parts.
 - LosslessCut's [CSV documentation](https://github.com/mifi/lossless-cut/blob/master/docs/index.md#csv-files) shows one headerless comma-separated row per segment, with start and end in seconds followed by the label.
 - LosslessCut's [filename template documentation](https://github.com/mifi/lossless-cut/blob/master/docs/file-name-template.md) confirms that SEG_LABEL is the segment label in separate-files mode and EXT includes the leading dot. Use the template ${SEG_LABEL}${EXT}.
+
+## Headless sample walkthrough
+
+Run from the repository root in PowerShell.
+
+```powershell
+python -m samples.make_sample samples/NB-2026-11-16 --no-video
+python -m autoclipper.cli scan samples/NB-2026-11-16
+python -m autoclipper.cli chain samples/NB-2026-11-16 --ground-truth samples/NB-2026-11-16/ground_truth.json
+python -m autoclipper.cli map samples/NB-2026-11-16 --pad-before 0 --pad-after 0
+python -m autoclipper.cli export samples/NB-2026-11-16
+```
+
+Use zero padding when verifying the 315–328 s sample gap. The standard 5 s
+padding deliberately reaches footage on both sides of Andres's 312.5–330 s gap.
+Padding options persist for subsequent commands. Use `chain --offset PART_ID=TIME`
+for manual anchors on other recordings. Map and export accept repeatable
+`--review PATH`; a fresh sample session automatically loads its review JSONs.
+Generate the sample without `--no-video` for desktop playback and import.
