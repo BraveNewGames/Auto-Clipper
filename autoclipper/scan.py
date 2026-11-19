@@ -7,7 +7,8 @@ from .media import probe_duration
 from .models import Part, POV, Session
 
 _VIDEO = {".mkv", ".mp4", ".mov", ".flv", ".ts", ".avi", ".webm"}
-_PART = re.compile(r"^(.+?)[ _.-]+part[ _.-]*(\d+)$", re.I)
+# "<name><sep><suffix>": sep is "__", "_", " - ", " ", "-", "."; suffix is N, pN, ptN, partN, "Part N"
+_PART = re.compile(r"^(.+?)[ _.-]+(?:(?:part|pt|p)[ _.-]*)?(\d{1,3})$", re.I)
 _OBS = re.compile(r"^(.+?)[ _.-]+(\d{4}-\d{2}-\d{2}[ _T]\d{2}[-:]\d{2}[-:]\d{2})$", re.I)
 
 
@@ -23,7 +24,10 @@ def scan_folder(folder) -> Session:
         stem = (files.get("video") or files["srt"]).stem
         numbered = _PART.match(stem)
         obs = _OBS.match(stem)
-        name = (numbered or obs).group(1).strip() if numbered or obs else stem
+        if numbered and obs:
+            numbered = None          # "... 20-14-03" is a timestamp, not part 3
+        name = (numbered or obs).group(1).strip(" _.-") if numbered or obs else stem
+        name = name or stem
         index = int(numbered.group(2)) if numbered else None
         stamp = obs.group(2).replace("T", " ").replace("_", " ") if obs else ""
         grouped[name.casefold()].append((name, index, stamp, stem, files))
