@@ -75,16 +75,90 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(len(l.sources), 2)
         self.assertIn("Team (unattributed)", transcript_text(lines))
 
-    def test_team_in_own_file_not_matched_to_own_named(self):
-        # Cindy's own Team channel can't contain Cindy's voice.
+    def test_own_voice_echo_in_own_team_channel_is_a_source_not_a_line(self):
+        # Real data: the owner's voice leaks into their own Team channel at the same moment.
         s = three_povs()
         cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 50.0, 52.0, "named", "Watch this it is so good", "Cindy"),
-                             cue("cindy-p1", "cindy", 2, 50.1, 52.0, "team", "watch this it is so good")],
+                             cue("cindy-p1", "cindy", 2, 50.1, 52.0, "team", "watch this, it is so good!")],
                 "andres-p1": [], "rika-p1": []}
         lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual([x["match"] for x in lines[0].sources], [None, "echo"])
+        self.assertIn("echoed", lines[0].note)
+
+    def test_own_file_team_line_never_given_to_owner(self):
+        # A different sentence in Cindy's Team channel, even right next to her own line, stays
+        # unattributed: file ownership is not evidence.
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 50.0, 52.0, "named", "Watch this it is so good", "Cindy"),
+                             cue("cindy-p1", "cindy", 2, 50.4, 52.0, "team", "the lamp fell on my head again"),
+                             cue("cindy-p1", "cindy", 3, 60.0, 61.0, "team", "Watch this it is so good")],
+                "andres-p1": [], "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(sum(1 for l in lines if l.speaker == "Cindy"), 1)
+        self.assertTrue(all(l.speaker is None for l in lines if l.channel == "team"))
+
+    def test_substring_fragment_attached(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 105.0, "named",
+                                 "okay so we're at the mansion guys okay so here's the game", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 90.2, 92.0, "team", "Okay, so we're at the mansion, guys.")],
+                "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 1)
+        self.assertIn(lines[0].sources[1]["match"], ("rendition", "fragment"))
+
+    def test_split_named_line_two_team_fragments_same_part(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 106.0, "named",
+                                 "bring the rope over here and tie it to the red truck please", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 90.1, 93.0, "team", "Bring the rope over here"),
+                              cue("andres-p1", "andres", 2, 93.0, 96.0, "team", "and tie it to the red truck, please.")],
+                "rika-p1": []}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines[0].sources), 3)
+
+    def test_one_team_cue_spanning_two_named_lines(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 101.5, "named", "Is the generator on?", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 92.0, 94.0, "named", "No, the fuse blew up again.", "Andres")],
+                "rika-p1": [cue("rika-p1", "rika", 1, 105.0, 109.0, "team",
+                                "is the generator on no the fuse blew up again")]}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual([l.speaker for l in lines], ["Cindy", "Andres"])
+        self.assertEqual(sum(len(l.sources) for l in lines), 3)
+
+    def test_wider_tolerance_for_alignment_error(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 102.0, "named", "The whole bridge just collapsed", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 93.6, 95.6, "team", "the whole bridge just collapsed")],
+                "rika-p1": []}      # Andres is 3.6 s off
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 1)
+
+    def test_unique_and_ambiguous_team_lines_kept(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 102.0, "named", "I have a mustache now", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 91.0, 93.0, "team", "I have one dash, should we mute?"),
+                              cue("andres-p1", "andres", 2, 130.0, 132.0, "team", "Who parked the ambulance in the pool?")],
+                "rika-p1": [cue("rika-p1", "rika", 1, 145.2, 147.0, "team", "Who parked the ambulance in the pool")]}
+        lines = build_session_transcript(s, cues)
+        self.assertEqual(len(lines), 3)
+        team = [l for l in lines if l.channel == "team"]
+        self.assertEqual(len(team), 2)
+        self.assertTrue(all(l.speaker is None for l in team))
+        self.assertEqual(sorted(len(l.sources) for l in team), [1, 2])
+
+    def test_generic_three_word_piece_not_absorbed_far_away(self):
+        s = three_povs()
+        cues = {"cindy-p1": [cue("cindy-p1", "cindy", 1, 100.0, 108.0, "named",
+                                 "oh my god the cart is on the roof and nobody saw it happen", "Cindy")],
+                "andres-p1": [cue("andres-p1", "andres", 1, 100.0, 101.0, "team", "Oh my god!")],
+                "rika-p1": []}  # session 110 s: after Cindy's line ended
+        lines = build_session_transcript(s, cues)
         self.assertEqual(len(lines), 2)
-        team = [l for l in lines if l.channel == "team"][0]
-        self.assertIsNone(team.speaker)
 
     def test_disagreeing_team_renditions_flagged(self):
         s = three_povs()

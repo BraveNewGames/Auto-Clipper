@@ -21,6 +21,7 @@ conversation:
 """
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
 import unicodedata
@@ -31,13 +32,18 @@ from statistics import median
 from .models import fmt_ts
 
 # Matching parameters (seconds / similarity 0..1).
-TIME_WINDOW = 2.5           # max |dt| between renditions of one utterance (after offsets)
+TIME_WINDOW = 4.0           # max |dt| between renditions of one utterance (tolerates alignment error)
 MATCH_THRESHOLD = 0.6       # min similarity for a normal-length line
 SHORT_THRESHOLD = 0.85      # min similarity when either side has <= SHORT_TOKENS tokens
 SHORT_TOKENS = 2
 SHORT_WINDOW = 1.2          # short lines ("yeah", "oh no") need tighter timing
 SAME_SPEAKER_DUP = 0.8      # merge a speaker's duplicate named cue from overlapping parts
 AGREE_THRESHOLD = 0.75      # Team renditions with mean similarity below this "disagree"
+FRAGMENT_CONTAIN = 0.8      # share of a Team fragment's words found (in order) inside a named line
+ECHO_WINDOW = 1.5           # owner's voice leaking into their own Team channel: same clock, tight timing
+ECHO_SIM = 0.8
+CHAR_CONTAIN = 0.9          # character-level fallback for the two containment checks above
+COVER_CONTAIN = 0.8         # leftover Team line whose words are covered by nearby named lines
 
 UNATTRIBUTED = "Team (unattributed)"
 
@@ -175,7 +181,88 @@ def _match_score(a: _Item, b: _Item):
     return sim - 0.04 * dt, sim
 
 
-def _source(it: _Item, sim) -> dict:
+def _gap(a: _Item, b: _Item) -> float:
+    """Distance between the two time intervals (0 when they overlap)."""
+    return max(0.0, max(a.start, b.start) - min(a.end, b.end))
+
+
+def contain(a, b) -> float:
+    """Share of a's tokens that appear, in order, inside b (0..1)."""
+    ta = a if isinstance(a, list) else tokens(a)
+    tb = b if isinstance(b, list) else tokens(b)
+    if not ta or not tb:
+        return 0.0
+    m = difflib.SequenceMatcher(None, ta, tb, autojunk=False)
+    return sum(bl.size for bl in m.get_matching_blocks()) / len(ta)
+
+
+def contain_chars(a, b) -> float:
+    """Like contain() but on characters with spaces removed ("alright" ~ "all right")."""
+    ta = "".join(a if isinstance(a, list) else tokens(a))
+    tb = "".join(b if isinstance(b, list) else tokens(b))
+    if not ta or not tb:
+        return 0.0
+    m = difflib.SequenceMatcher(None, ta, tb, autojunk=False)
+    return sum(bl.size for bl in m.get_matching_blocks() if bl.size >= 3) / len(ta)
+
+
+def _contained(a_toks, b_toks, word_thr):
+    """a's words inside b: word-level >= word_thr, or character-level >= CHAR_CONTAIN."""
+    c = contain(a_toks, b_toks)
+    if c >= word_thr:
+        return c
+    cc = contain_chars(a_toks, b_toks)
+    return cc if cc >= CHAR_CONTAIN and c >= 0.5 else 0.0
+
+
+def _fragment_ok(n_tokens, c):
+    return n_tokens >= 3 and c >= (1.0 if n_tokens == 3 else FRAGMENT_CONTAIN)
+
+
+def _team_vs_named(a: _Item, t: _Item):
+    """Score Team/unlabeled cue t as a rendition of named anchor a -> (score, sim, kind) or None.
+
+    kind: "rendition" (same utterance heard elsewhere), "fragment" (a phrase-split piece of it),
+    "echo" (owner's own voice leaking into the Team channel of the SAME recording part)."""
+    if t.pov.pov_id == a.pov.pov_id:
+        if t.part.part_id != a.part.part_id:
+            return None
+        # Same file, same clock: only near-verbatim, near-simultaneous repeats count.
+        dt = _dt(a, t)
+        if min(len(a.toks), len(t.toks)) <= SHORT_TOKENS:
+            if a.toks == t.toks and dt <= 0.8:
+                return 1.0 - 0.04 * dt, 1.0, "echo"
+            return None
+        if dt > ECHO_WINDOW and _gap(a, t) > 0.3:
+            return None
+        sim = similarity(a.toks, t.toks)
+        if sim >= ECHO_SIM or (len(t.toks) >= 4 and contain(t.toks, a.toks) >= 0.9):
+            return max(sim, 0.85) - 0.04 * dt, sim, "echo"
+        return None
+    dt = _dt(a, t)
+    short = min(len(a.toks), len(t.toks)) <= SHORT_TOKENS
+    if short:
+        if dt > SHORT_WINDOW:
+            return None
+        sim = similarity(a.toks, t.toks)
+        return (sim - 0.04 * dt, sim, "rendition") if sim >= SHORT_THRESHOLD else None
+    if dt <= TIME_WINDOW:
+        sim = similarity(a.toks, t.toks)
+        if sim >= MATCH_THRESHOLD:
+            return sim - 0.04 * dt, sim, "rendition"
+    gap = _gap(a, t)
+    if gap <= TIME_WINDOW and len(t.toks) < len(a.toks):
+        if len(t.toks) == 3:
+            # 3-word pieces ("oh my god") are generic: verbatim and close in time only
+            c = contain(t.toks, a.toks) if gap <= SHORT_WINDOW else 0.0
+        else:
+            c = _contained(t.toks, a.toks, FRAGMENT_CONTAIN)
+        if _fragment_ok(len(t.toks), c):
+            return 0.9 * c - 0.04 * gap - 0.05, similarity(a.toks, t.toks), "fragment"
+    return None
+
+
+def _source(it: _Item, sim, kind=None) -> dict:
     c = it.cue
     return {
         "part_id": it.part.part_id,
@@ -187,11 +274,13 @@ def _source(it: _Item, sim) -> dict:
         "label": c.label,
         "text": c.text,
         "similarity": None if sim is None else round(sim, 3),
+        "match": kind,
     }
 
 
-def _windowed_pairs(left, right, accept):
-    """All scored (score, sim, l, r) pairs between two start-sorted lists within the window."""
+def _windowed_pairs(left, right, accept, scorer=None):
+    """All scored (score, sim, l, r[, kind]) pairs between two start-sorted lists within the window."""
+    scorer = scorer or _match_score
     pairs = []
     j0 = 0
     for l in left:
@@ -203,9 +292,9 @@ def _windowed_pairs(left, right, accept):
             j += 1
             if r is l or not accept(l, r):
                 continue
-            m = _match_score(l, r)
+            m = scorer(l, r)
             if m:
-                pairs.append((m[0], m[1], l, r))
+                pairs.append((m[0], m[1], l, r) + tuple(m[2:]))
     pairs.sort(key=lambda p: (-p[0], p[2].key, p[3].key))
     return pairs
 
@@ -229,7 +318,7 @@ def build_session_transcript(session, cues_by_part=None) -> list:
             continue
         ca, cb = by_key.get(a.key), by_key.get(b.key)
         if ca is None and cb is None:
-            c = {"anchor": a, "extra_named": [(b, sim)], "team": {}}
+            c = {"anchor": a, "extra_named": [(b, sim)], "team": []}
             clusters.append(c)
             by_key[a.key] = by_key[b.key] = c
         else:
@@ -242,31 +331,30 @@ def build_session_transcript(session, cues_by_part=None) -> list:
             by_key[new.key] = c
     for it in named:
         if it.key not in by_key:
-            c = {"anchor": it, "extra_named": [], "team": {}}
+            c = {"anchor": it, "extra_named": [], "team": []}
             clusters.append(c)
             by_key[it.key] = c
     for c in clusters:
         for it in [c["anchor"]] + [x for x, _ in c["extra_named"]]:
             it.used = True
 
-    # 2. attach Team/unlabeled renditions from OTHER POVs to named anchors (best score first).
+    # 2. attach Team/unlabeled renditions to named anchors (best score first): renditions from other
+    #    POVs, phrase-split fragments, and the owner's own voice echoed in their Team channel. This
+    #    is content+time matching, never ownership: an unmatched Team line stays unattributed.
     anchors = sorted({id(c): c for c in clusters}.values(), key=lambda c: c["anchor"].start)
     anchor_items = [c["anchor"] for c in anchors]
     anchor_of = {c["anchor"].key: c for c in anchors}
-    for score, sim, a, t in _windowed_pairs(
-            anchor_items, other,
-            lambda a, t: t.pov.pov_id != a.pov.pov_id):
+    for score, sim, a, t, kind in _windowed_pairs(anchor_items, other, lambda a, t: True,
+                                                  scorer=_team_vs_named):
         if t.used:
             continue
         c = anchor_of[a.key]
-        if t.part.part_id in c["team"]:
+        # several pieces from one part are fine only if they are different stretches of audio
+        if any(x.part.part_id == t.part.part_id
+               and min(x.end, t.end) - max(x.start, t.start) > 0.5 for x, _, _ in c["team"]):
             continue
-        c["team"][t.part.part_id] = (t, sim)
+        c["team"].append((t, sim, kind))
         t.used = True
-
-    lines = []
-    for c in anchors:
-        lines.append(_named_line(c))
 
     # 3. cluster remaining Team/unlabeled cues among themselves.
     rest = [it for it in other if not it.used]
@@ -292,7 +380,21 @@ def build_session_transcript(session, cues_by_part=None) -> list:
         for x in B:
             gid[x.key] = ga
         del groups[gb]
+    # 4. a leftover Team line whose words are (almost) all said in nearby named lines - e.g. one
+    #    Team cue spanning two or three speakers' lines - is a duplicate: keep it as a source of the
+    #    named line it overlaps most instead of a standalone line.
+    starts = [c["anchor"].start for c in anchors]
+    leftovers = []
     for g in groups.values():
+        target = _covering_anchor(g, anchors, starts)
+        if target is None:
+            leftovers.append(g)
+            continue
+        for x in g:
+            target["team"].append((x, similarity(target["anchor"].toks, x.toks), "covered"))
+
+    lines = [_named_line(c) for c in anchors]
+    for g in leftovers:
         lines.append(_team_line(g))
 
     lines.sort(key=lambda l: (l.session_start, l.line_id))
@@ -300,24 +402,51 @@ def build_session_transcript(session, cues_by_part=None) -> list:
     return lines
 
 
+def _covering_anchor(group, anchors, starts):
+    longest = max(group, key=lambda x: (len(x.toks), x.key))
+    if len(longest.toks) < 4:
+        return None
+    lo = min(x.start for x in group)
+    hi = max(x.end for x in group)
+    i = bisect.bisect_left(starts, lo - TIME_WINDOW - 30)
+    near = []
+    while i < len(anchors) and anchors[i]["anchor"].start <= hi + TIME_WINDOW:
+        a = anchors[i]["anchor"]
+        if max(0.0, max(lo, a.start) - min(hi, a.end)) <= TIME_WINDOW:
+            near.append(anchors[i])
+        i += 1
+    if not near:
+        return None
+    joined = [t for c in near for t in c["anchor"].toks]
+    if not _contained(longest.toks, joined, COVER_CONTAIN):
+        return None
+    return max(near, key=lambda c: (contain(longest.toks, c["anchor"].toks), -abs(c["anchor"].start - lo)))
+
+
 def _named_line(c) -> SessionLine:
     a = c["anchor"]
     srcs = [_source(a, None)]
     for it, sim in c["extra_named"]:
         srcs.append(_source(it, sim))
-    team = sorted(c["team"].values(), key=lambda p: p[0].start)
-    for it, sim in team:
-        srcs.append(_source(it, sim))
+    team = sorted(c["team"], key=lambda p: (p[0].start, p[0].key))
+    for it, sim, kind in team:
+        srcs.append(_source(it, sim, kind))
     notes = []
     if c["extra_named"]:
         notes.append("also captured by an overlapping part of the same recording")
-    if team:
-        notes.append(f"heard as Team in {len(team)} other recording(s)")
-        low = [s for _, s in team if s < AGREE_THRESHOLD]
+    heard = [x for x in team if x[2] != "echo"]
+    echoes = [x for x in team if x[2] == "echo"]
+    if heard:
+        notes.append(f"heard as Team in {len({x[0].pov.pov_id for x in heard})} other recording(s)")
+        low = [sim for _, sim, k in heard if k == "rendition" and sim < AGREE_THRESHOLD]
         if low:
             notes.append(f"{len(low)} Team rendition(s) differ noticeably from the named mic")
+        if any(k != "rendition" for _, _, k in heard):
+            notes.append("some Team pieces split or merged differently")
     else:
         notes.append("own mic only (no Team corroboration)")
+    if echoes:
+        notes.append("own voice also echoed in this recording's Team channel")
     return SessionLine(
         line_id=a.key,
         session_start=round(a.start, 3),
