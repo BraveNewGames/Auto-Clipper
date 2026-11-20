@@ -45,7 +45,7 @@ class ResolvePlacementTests(unittest.TestCase):
         ])
         part.duration = 1.06
         self.assertEqual(plan_placements(session, 0, 1.06, 10), [
-            Placement("a", "a1", 0, 11, 0, 11),
+            Placement("a", "a1", 0, 10, 0, 10),
         ])
         part.duration = None
         with self.assertRaisesRegex(ValueError, "Unknown media duration for a1"):

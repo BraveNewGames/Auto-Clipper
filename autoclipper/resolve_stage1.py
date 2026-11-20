@@ -23,7 +23,11 @@ class Placement:
 
 
 def plan_placements(session, start, end, fps):
-    """Use one common source and timeline rate and round ties toward +infinity."""
+    """Round to the nearest frame, with ties toward +infinity.
+
+    Floor the source duration. A part-boundary clamp can shift the last
+    piece back by up to one frame, or shorten it by one frame when needed.
+    """
     rate = Fraction(str(fps))
     if rate <= 0 or Fraction(str(end)) <= Fraction(str(start)):
         raise ValueError("Expected a positive frame rate and a nonempty event")
@@ -50,8 +54,9 @@ def plan_placements(session, start, end, fps):
         source_in = floor((first - Fraction(str(part.offset))) * rate + Fraction(1, 2))
         # Use the destination length so adjoining pieces share a boundary and
         # both angles have the same length despite different source frame phases.
-        length = record_out - record_in
-        source_limit = floor(Fraction(str(part.duration)) * rate + Fraction(1, 2))
+        source_limit = floor(Fraction(str(part.duration)) * rate)
+        length = min(record_out - record_in, source_limit)
+        record_out = record_in + length
         # At a fractional boundary, preserve the record length by moving the
         # source In back if independent rounding would overrun the source.
         source_in = min(source_in, source_limit - length)
@@ -309,10 +314,10 @@ def main(argv=None):
             for pov in session.povs
         ])
         placements = plan_placements(session, args.start, args.end, args.fps)
-        length = floor((Fraction(str(args.end)) - Fraction(str(args.start))) * args.fps + Fraction(1, 2))
         if (len(placements) != 2 or len({p.pov_id for p in placements}) != 2
-                or any(p.record_in != 0 or p.record_out != length for p in placements)):
-            raise ValueError("Stage 1 requires one fully covering part per POV")
+                or any(p.record_in != 0 for p in placements)
+                or placements[0].record_out != placements[1].record_out):
+            raise ValueError("Stage 1 requires one fully covering part per POV with matching frame lengths")
         for placement in placements:
             part = session.part_by_id(placement.part_id)
             if not part.offset <= args.start < args.end <= part.offset + part.duration:
