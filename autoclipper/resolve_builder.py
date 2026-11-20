@@ -366,10 +366,18 @@ def main(argv=None):
     mode.add_argument("--dry-run", action="store_true", help="Print the plan without contacting Resolve")
     mode.add_argument("--execute", action="store_true",
                       help="Approved Resolve window only. Save and close the active owner project first.")
+    parser.add_argument("--result-file", type=Path,
+                        help="Also write the JSON result to this new file (for callers such as the UI)")
     args = parser.parse_args(argv)
     try:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        print(json.dumps(build_export(manifest, dry_run=args.dry_run, project_name=args.project), indent=2))
+        if args.result_file is not None and args.result_file.exists():
+            raise ValueError(f"Result file already exists: {args.result_file}")
+        result = build_export(manifest, dry_run=args.dry_run, project_name=args.project)
+        if args.result_file is not None:
+            from .store import _write_json
+            _write_json(args.result_file, result)
+        print(json.dumps(result, indent=2))
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(1, describe_failure(exc))
 

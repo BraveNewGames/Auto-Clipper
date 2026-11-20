@@ -248,6 +248,26 @@ class ResolveBuilderTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Missing confirmed mic"):
                     build_export(manifest)
 
+    def test_result_file_holds_only_the_json_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            path = root / "manifest.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = root / "readback.json"
+            with patch.dict(sys.modules, {"DaVinciResolveScript": None}), redirect_stdout(io.StringIO()):
+                main([str(path), "--dry-run", "--result-file", str(result)])
+                self.assertEqual(json.loads(result.read_text(encoding="utf-8"))["manifest"], manifest)
+                with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO) as err:
+                    main([str(path), "--dry-run", "--result-file", str(result)])
+                self.assertIn("Result file already exists", err.getvalue())
+                manifest["blockers"] = [{"code": "mic_unmapped", "message": "Missing confirmed mic"}]
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                failed = root / "failed.json"
+                with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
+                    main([str(path), "--dry-run", "--result-file", str(failed)])
+                self.assertFalse(failed.exists())
+
     def test_multicam_compilation_saves_and_verifies_after_reopen(self):
         sdk, manager, state, project, reopened = fake_resolve()
         with tempfile.TemporaryDirectory() as folder:
