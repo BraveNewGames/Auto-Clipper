@@ -86,6 +86,12 @@ an independent microphone POV. An undecided choice keeps the verified multicam
 angles and existing Source-mode audio. Entries can carry candidate and note IDs.
 Placeholder entries supply a title and provisional output frames.
 
+`compile_fkb_edit_plan(session, knowledge_base, plan_id, revision_id=...)`
+reads the FKB session and the existing `EditPlan` entity. Source entries use
+`frames: {"start": In, "end": exclusiveOut}`, the FKB frame-range convention.
+Draft revisions take a caller-supplied revision ID and retain the FKB plan's
+revision history. The existing timeline ID is never used as a write target.
+
 The compiler splits entries at verified coverage changes and preserves edit
 order and evidence IDs. Where requested footage or the chosen mic has no
 coverage, it emits a labeled slate with no source coordinates. The existing

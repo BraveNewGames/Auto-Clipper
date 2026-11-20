@@ -646,6 +646,36 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None):
     return manifest
 
 
+def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
+                          transcripts_dir=None, confirmations=None):
+    """Project one current FKB EditPlan into the offline assembler.
+
+    FKB entries use `frames: {"start": ..., "end": ...}` for source ranges.
+    A placeholder leaves `frames` absent and supplies `provisional_frames`.
+    """
+    if knowledge_base.mapping_stale:
+        raise ValueError("Refresh stale FKB source mapping before compiling an edit")
+    plans = [plan for plan in knowledge_base.edit_plans if plan.plan_id == plan_id]
+    if len(plans) != 1:
+        raise ValueError("Expected one FKB edit plan with the requested ID")
+    plan, = plans
+    entries = []
+    for entry in plan.entries:
+        if any(key in entry for key in ("session_in", "session_out_exclusive")):
+            raise ValueError("FKB entries use frames.start and frames.end")
+        projected = dict(entry)
+        frames = projected.pop("frames", None)
+        if frames is not None:
+            projected["session_in"], projected["session_out_exclusive"] = frames["start"], frames["end"]
+        entries.append(projected)
+    projection = {
+        "plan_id": plan.plan_id, "session_id": knowledge_base.session.session_id,
+        "fps": knowledge_base.session.fps, "revision_id": revision_id,
+        "revision_history": plan.revisions, "entries": entries,
+    }
+    return compile_edit_plan(session, projection, transcripts_dir, confirmations)
+
+
 def render_report(manifest) -> str:
     def cell(value):
         return str(value).replace("|", r"\|").replace("\r", " ").replace("\n", " ")

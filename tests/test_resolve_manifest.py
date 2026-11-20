@@ -4,12 +4,14 @@ import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
 from autoclipper.resolve_manifest import (
-    _video_frames, build_manifest, build_review_manifest, compile_edit_plan, main, render_report,
+    _video_frames, build_manifest, build_review_manifest, compile_edit_plan, compile_fkb_edit_plan, main,
+    render_report,
 )
 from autoclipper.store import save_session
 
@@ -199,6 +201,23 @@ class ResolveManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no source range"):
             compile_edit_plan(self.session, plan)
         self.probe.assert_not_called()
+
+    def test_fkb_adapter_uses_session_clock_and_existing_revision_history(self):
+        self.add_part("Alpha")
+        plan = SimpleNamespace(plan_id="plan", timeline_id="prior-timeline", revisions=[{"revision_id": "r1"}],
+                               entries=[{"entry_id": "cut", "kind": "source", "title": "Grounded cut",
+                                         "frames": {"start": 9, "end": 19}, "pov_id": "alpha"}])
+        knowledge = SimpleNamespace(mapping_stale=False, edit_plans=[plan],
+                                    session=SimpleNamespace(session_id=self.session.session_id, fps=60))
+        manifest = compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
+        segment, = manifest["segments"]
+        self.assertEqual((segment["session_start_frame"], segment["session_end_frame"]), (9, 19))
+        self.assertEqual(manifest["edit_plan"], {"plan_id": "plan", "revision_id": "r2",
+                                                "revision_history": [{"revision_id": "r1"}]})
+        self.assertEqual(plan.entries[0]["frames"], {"start": 9, "end": 19})
+        knowledge.mapping_stale = True
+        with self.assertRaisesRegex(ValueError, "stale FKB source mapping"):
+            compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
 
     def test_selection_ranges_order_warnings_and_report(self):
         self.add_part("Alpha")
