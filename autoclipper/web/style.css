@@ -152,3 +152,14 @@ pre.setup { white-space: pre-wrap; background: #12141a; border: 1px solid var(--
   border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
 .import-warnings { margin-top: 8px; padding: 8px 10px; border: 1px solid #6e5726; border-radius: 4px; background: rgba(240,181,69,.08); }
 .import-warnings ul { margin: 4px 0 6px 18px; padding: 0; }
+
+/* export to resolve */
+ul.issues { margin: 4px 0 0 18px; padding: 0; }
+ul.issues li { margin: 2px 0; }
+.resolve-blockers { margin: 8px 0; padding: 8px 10px; border: 1px solid #6b2d2d; border-radius: 4px; background: rgba(239,93,93,.08); color: var(--bad); }
+.resolve-segs .badge { margin: 0 3px 3px 0; }
+.resolve-go { margin-top: 12px; }
+.resolve-job { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 4px; background: var(--panel2); }
+.resolve-job.ok { border-left-color: var(--good); }
+.resolve-job.bad { border-left-color: var(--bad); }
+.resolve-job .row { margin-top: 6px; }

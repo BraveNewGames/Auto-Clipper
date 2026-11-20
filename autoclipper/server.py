@@ -12,8 +12,11 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import threading
 import traceback
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -97,6 +100,9 @@ class App:
         self.lock = threading.RLock()
         self._transcript = None  # cached list of SessionLine dicts
         self._est_cache = {}
+        self._resolve_lock = threading.Lock()
+        self._resolve_job = {"state": "idle"}
+        self.builder_timeout = 1800  # seconds; a Resolve export of many segments can be slow
 
     # ------------------------------------------------------------ helpers
     def require(self):
@@ -589,6 +595,154 @@ class App:
             return {"expected": expected, "setup": lc.LOSSLESSCUT_SETUP,
                     "out_dir": str(self.folder() / "autoclipper_exports")}
 
+    # ------------------------------------------------------------ Resolve export
+    def _resolve_manifest(self, s):
+        rm = _mod("resolve_manifest")
+        manifest = rm.build_manifest(s)
+        return manifest, rm.render_report(manifest)
+
+    def _mic_rows(self, s, manifest):
+        """One row per part that appears in the plan: verified mics and blocked ones."""
+        rm = _mod("resolve_manifest")
+        rows = {}
+        for segment in manifest["segments"]:
+            for angle in segment["angles"]:
+                mic = angle["mic"]
+                rows.setdefault(angle["part_id"], {
+                    "part_id": angle["part_id"], "pov_name": angle["pov_name"],
+                    "part_index": angle["part_index"], "status": mic["status"],
+                    "transcriber_track": mic["transcriber_track"], "speaker": mic["speaker"],
+                    "mp4_audio_title": mic.get("mp4_audio_title"),
+                    "resolve_channels": mic.get("resolve_channels"), "evidence": mic.get("evidence"),
+                })
+        folder = Path(s.folder).resolve()
+        roots = [folder / "_Transcripts", folder.parent / "_Transcripts"]
+        for blocker in manifest["blockers"]:
+            part = _part(s, blocker.get("part_id"))
+            if part is None or not str(blocker.get("code", "")).startswith("mic_") or part.part_id in rows:
+                continue
+            pov = next((p for p in s.povs if any(x is part for x in p.parts)), None)
+            stems = [Path(x).stem for x in (part.video_path, part.srt_path) if x]
+            metadata = rm._metadata(roots, stems)
+            tracks = [{"track": t["track"], "speaker": t.get("speaker"), "title": t.get("title")}
+                      for t in rm._tracks(metadata)]
+            history = metadata.get("relabel_history")
+            provenance = sorted({str(h.get("provenance")) for h in history
+                                 if isinstance(h, dict) and h.get("provenance")}) \
+                if isinstance(history, list) else []
+            name = pov.name if pov else ""
+            matching = [t["track"] for t in tracks if rm._normalized(t["speaker"]) == rm._normalized(name)]
+            rows[part.part_id] = {
+                "part_id": part.part_id, "pov_name": name, "part_index": part.index,
+                "status": "unverified" if blocker["code"] == "mic_unverified" else "unmapped",
+                "blocker": blocker["code"], "message": blocker["message"],
+                "metadata_found": bool(metadata), "metadata_tracks": tracks,
+                "relabel_provenance": provenance,
+                "suggested_track": matching[0] if len(matching) == 1 else None,
+            }
+        return sorted(rows.values(), key=lambda r: (r["pov_name"].casefold(), r["part_index"] or 0))
+
+    def resolve_preview(self, _q=None):
+        with self.lock:
+            s = self.require()
+            manifest, report = self._resolve_manifest(s)
+            return {"manifest": manifest, "report": report, "mics": self._mic_rows(s, manifest),
+                    "can_export": not manifest["blockers"], "job": self.resolve_status()}
+
+    def resolve_confirm_mic(self, body):
+        part_id = (body.get("part_id") or "").strip()
+        track = body.get("transcriber_track")
+        if isinstance(track, str) and track.strip().isdigit():
+            track = int(track)
+        if type(track) is not int or track < 1:
+            raise ApiError("transcriber_track must be a positive integer")
+        with self.lock:
+            s = self.require()
+            part = _part(s, part_id)
+            pov = next((p for p in s.povs if any(x is part for x in p.parts)), None)
+            if pov is None:
+                raise ApiError(f"Unknown part: {part_id!r}", 404)
+            speaker = (body.get("speaker") or pov.name).strip()
+            if speaker.casefold() != pov.name.strip().casefold():
+                raise ApiError(f"Speaker must be the recording owner ({pov.name}) for part {part_id}")
+            rm = _mod("resolve_manifest")
+            path = self.folder() / ".autoclipper" / "mic_confirmations.json"
+            data = rm._load_confirmations(path)
+            rows = data.setdefault("confirmations", [])
+            # The owner names the one mic track for this part; replace earlier choices for it.
+            rows[:] = [row for row in rows if not (isinstance(row, dict) and row.get("part_id") == part.part_id)]
+            row = {"part_id": part.part_id, "transcriber_track": track, "speaker": pov.name,
+                   "confirmed_by": "owner", "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                   "note": "listened (Auto-Clipper UI)"}
+            rows.append(row)
+            _mod("store")._write_json(path, data)
+            return {"ok": True, "path": str(path), "confirmation": row}
+
+    def resolve_status(self, _q=None):
+        with self._resolve_lock:
+            return dict(self._resolve_job)
+
+    def resolve_export(self, body):
+        with self.lock:
+            s = self.require()
+            with self._resolve_lock:
+                if self._resolve_job.get("state") == "running":
+                    raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+                manifest, report = self._resolve_manifest(s)
+                if manifest["blockers"]:
+                    raise ApiError("Export blocked: " + "; ".join(b["message"] for b in manifest["blockers"]),
+                                   409, blockers=manifest["blockers"])
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                out = self.folder() / "autoclipper_exports" / "resolve" / stamp
+                if out.exists():
+                    raise ApiError(f"Export folder already exists: {out}. Try again in a second.", 409)
+                out.mkdir(parents=True)
+                store = _mod("store")
+                store._write_json(out / "manifest.json", manifest)
+                (out / "report.md").write_text(report, encoding="utf-8")
+                project = f"AutoClipper Export {manifest['session_id']} {stamp}"
+                self._resolve_job = {
+                    "state": "running", "project": project, "out_dir": str(out),
+                    "manifest_path": str(out / "manifest.json"), "report_path": str(out / "report.md"),
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
+                job = dict(self._resolve_job)
+        threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
+        return job
+
+    def _run_resolve_job(self, job):
+        result = {"state": "failed"}
+        try:
+            code, stdout, stderr = self.run_builder(Path(job["manifest_path"]), job["project"])
+            if code == 0:
+                readback = json.loads(stdout)
+                path = Path(job["out_dir"]) / "readback.json"
+                _mod("store")._write_json(path, readback)
+                result = {"state": "done", "readback": readback, "readback_path": str(path)}
+            else:
+                result["error"] = (stderr or stdout).strip() or f"Resolve builder exited with code {code}"
+        except subprocess.TimeoutExpired:
+            result["error"] = (f"Resolve export timed out after {self.builder_timeout} s. "
+                               "Check Resolve before trying again.")
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        with self._resolve_lock:
+            self._resolve_job = {**job, **result, "finished_at": datetime.now(timezone.utc).isoformat()}
+
+    def run_builder(self, manifest_path: Path, project: str):
+        """Run the builder in a separate process so a Resolve hang cannot wedge the UI."""
+        env = dict(os.environ)
+        modules = Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / \
+            "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules"
+        if modules.is_dir():
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH"), str(modules)]))
+        proc = subprocess.run(
+            [sys.executable, "-m", "autoclipper.resolve_builder", str(manifest_path),
+             "--execute", "--project", project],
+            cwd=str(Path(__file__).resolve().parent.parent), env=env, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=self.builder_timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+
     # ------------------------------------------------------------ OS helpers
     def open_path(self, body):
         raw = (body.get("path") or "").strip()
@@ -649,6 +803,8 @@ GET_ROUTES = {
     "/api/transcript": "transcript",
     "/api/guide": "guide",
     "/api/export/info": "export_info",
+    "/api/resolve/preview": "resolve_preview",
+    "/api/resolve/status": "resolve_status",
 }
 POST_ROUTES = {
     "/api/session/open": "open",
@@ -666,6 +822,8 @@ POST_ROUTES = {
     "/api/events/reassign": "reassign",
     "/api/export": "export",
     "/api/open-path": "open_path",
+    "/api/resolve/confirm-mic": "resolve_confirm_mic",
+    "/api/resolve/export": "resolve_export",
 }
 
 

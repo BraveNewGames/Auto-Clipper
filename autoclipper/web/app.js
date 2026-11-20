@@ -91,12 +91,14 @@ const state = {
   filters: { q: "", reviewer: "", status: "", pov: "", event: "", priority: "", kind: "" },
   focusIdx: -1,
   exportResult: null, exportInfo: null, exportMode: "exclude_rejected",
+  resolve: null,
 };
 
 function applyPayload(p) {
   if (p && p.session) {
     if (!state.session || state.session.folder !== p.session.folder) {
       state.exportResult = null; state.alignSuggestions = null; state.transcriptQ = "";
+      state.resolve = null;
     }
     state.exportInfo = null;
     state.session = p.session; state.coverage = p.coverage; state.reviewers = p.reviewers || [];
@@ -818,8 +820,161 @@ const EXPORT_MODES = {
   keep: { label: "Keep only", statuses: ["keep"] },
 };
 
+// ---------------------------------------------------------------- Export to Resolve
+const RESOLVE_REASONS = {
+  no_coverage: "not recording", recording_gap: "gap between parts", mp4_missing: "MP4 missing",
+  mic_blocked: "mic not confirmed", fps_mismatch: "frame rate", duration_unverified: "duration unknown",
+  source_frame_range: "source too short", mic_unverified: "mic not confirmed", mic_unmapped: "mic stream not found",
+};
+let resolvePoll = null;
+
+function openBtn(label, path) {
+  return path ? h("button", { class: "btn small", onclick: action(() => api("/api/open-path", { path })) }, label) : null;
+}
+
+function issueList(items, cls) {
+  return h("ul", { class: "issues " + cls }, items.map((b) => h("li", null,
+    [b.event_id, b.pov_name, b.part_id].filter(Boolean).length
+      ? h("b", null, [b.event_id, b.pov_name, b.part_id].filter(Boolean).join(" / ") + ": ") : null,
+    b.message, " ", h("span", { class: "mono small muted" }, b.code))));
+}
+
+function resolveMicRow(m, box) {
+  const verified = m.status === "verified" || m.status === "owner_confirmed";
+  let control = null;
+  if (m.status === "unverified") {
+    const tracks = m.metadata_tracks || [];
+    const pick = tracks.length
+      ? h("select", null, tracks.map((t) => h("option", { value: t.track, selected: t.track === m.suggested_track ? true : null },
+          `Track ${t.track}${t.speaker ? " · " + t.speaker : ""}`)))
+      : h("input", { type: "number", min: 1, class: "num", value: m.suggested_track || "" });
+    control = h("div", { class: "row" }, pick,
+      h("button", { class: "btn small primary", onclick: action(async () => {
+        const track = parseInt(pick.value, 10);
+        if (!(track > 0)) throw new Error("Choose the mic track first");
+        if (!confirm(`Confirm that transcriber track ${track} of ${m.part_id} is ${m.pov_name}'s own microphone?\n\nOnly confirm after listening to it.`)) return;
+        await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
+        toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}`, "ok");
+        await loadResolvePreview(box);
+      }) }, "Confirm mic (I listened)"));
+  }
+  const says = verified
+    ? `Track ${m.transcriber_track} · ${m.speaker}${m.mp4_audio_title ? " · MP4 “" + m.mp4_audio_title + "”" : ""}` +
+      (m.resolve_channels ? ` → Resolve ch ${m.resolve_channels.join("-")}` : "")
+    : (m.metadata_found
+      ? ((m.metadata_tracks || []).map((t) => `track ${t.track} = ${t.speaker || "?"}${t.title ? " (" + t.title + ")" : ""}`).join("; ") || "no speaker tracks") +
+        ((m.relabel_provenance || []).length ? ` · labels ${m.relabel_provenance.join(", ")}` : "")
+      : "no transcriber JSON found");
+  return h("tr", null,
+    h("td", null, m.pov_name), h("td", null, m.part_index ?? m.part_id),
+    h("td", null, h("span", { class: "badge " + (verified ? "good" : "bad") }, m.status.replace("_", " "))),
+    h("td", { class: "small" }, says, verified ? h("div", { class: "muted small" }, m.evidence || "") : h("div", { class: "bad-text small" }, m.message || "")),
+    h("td", null, control));
+}
+
+function resolveSegmentsTable(man) {
+  const warn = {};
+  for (const w of man.warnings) if (w.event_id) (warn[w.event_id] = warn[w.event_id] || []).push(w);
+  return h("table", { class: "t resolve-segs" },
+    h("thead", null, h("tr", null, ["#", "Event", "Title", "Session range", "Angles", "Unavailable", "Notes"].map((x) => h("th", null, x)))),
+    h("tbody", null, man.segments.map((sg, i) => {
+      const notes = [];
+      if (sg.pieces > 1) notes.push(h("span", { class: "badge warn" }, `piece ${sg.piece}/${sg.pieces}`));
+      if (sg.duration_frames < man.fps) notes.push(h("span", { class: "badge warn" }, `short: ${sg.duration_frames} frames`));
+      for (const w of (sg.piece === 1 ? warn[sg.event_id] || [] : [])) notes.push(h("div", { class: "warn-text small" }, w.message));
+      return h("tr", null,
+        h("td", { class: "muted" }, i + 1),
+        h("td", { class: "mono" }, sg.event_id),
+        h("td", null, sg.title, " ", h("span", { class: "muted small" }, `(${sg.range_source})`)),
+        h("td", { class: "mono small" }, `${fmt(sg.session_start)} – ${fmt(sg.session_end)}`, h("div", { class: "muted" }, fmtDur(sg.session_end - sg.session_start))),
+        h("td", null, sg.angles.length ? sg.angles.map((a) => h("span", { class: "badge good" }, `${a.pov_name} P${a.part_index}`)) : h("span", { class: "bad-text" }, "none")),
+        h("td", null, sg.unavailable.map((u) => h("span", { class: "badge bad", title: u.reason }, `${u.pov_name}: ${RESOLVE_REASONS[u.reason] || u.reason}`))),
+        h("td", null, notes));
+    })));
+}
+
+function resolveJobBox(job, box) {
+  if (!job || job.state === "idle") return null;
+  const links = h("div", { class: "row" }, openBtn("Open report.md", job.report_path), openBtn("Open export folder", job.out_dir),
+    job.readback_path ? openBtn("Open readback.json", job.readback_path) : null);
+  if (job.state === "running") {
+    return h("div", { class: "resolve-job" }, h("b", null, "Exporting to Resolve… "),
+      `creating project “${job.project}”. Do not touch Resolve until this finishes.`, links);
+  }
+  if (job.state === "done") {
+    const rb = job.readback || {};
+    return h("div", { class: "resolve-job ok" },
+      h("b", { class: "good-text" }, "Export complete. "),
+      `Project “${rb.project || job.project}”, timeline “${rb.timeline || ""}”, ${(rb.segments || []).length} multicam segment(s), ` +
+      `${(rb.sources || []).length} source MP4(s)${rb.reopened ? ", verified after save and reopen" : ""}.`,
+      (rb.limitations || []).length ? h("ul", { class: "small muted" }, rb.limitations.map((l) => h("li", null, l))) : null,
+      links);
+  }
+  return h("div", { class: "resolve-job bad" }, h("b", { class: "bad-text" }, "Resolve export stopped."),
+    h("pre", { class: "setup bad-text" }, job.error || "Unknown error"), links);
+}
+
+function pollResolve(box) {
+  if (resolvePoll) return;
+  resolvePoll = setInterval(async () => {
+    try {
+      const job = await api("/api/resolve/status");
+      if (job.state !== "running") { clearInterval(resolvePoll); resolvePoll = null; }
+      if (state.resolve) state.resolve.job = job;
+      if (box.isConnected) fillResolve(box);
+      if (job.state === "done") toast("Resolve export complete", "ok");
+      if (job.state === "failed") toast("Resolve export stopped — see the Export tab", "error");
+    } catch (e) { clearInterval(resolvePoll); resolvePoll = null; toast(e.message, "error"); }
+  }, 1500);
+}
+
+async function loadResolvePreview(box) {
+  state.resolve = await api("/api/resolve/preview");
+  fillResolve(box);
+}
+
+function fillResolve(box) {
+  while (box.childNodes.length > 2) box.lastChild.remove();
+  const r = state.resolve;
+  if (!r) return;
+  const man = r.manifest;
+  const running = r.job && r.job.state === "running";
+  if (running) pollResolve(box);
+  const selections = new Set(man.segments.map((s) => s.suggestion_id)).size;
+  appendAll(box,
+    h("div", { class: "muted small" }, `${selections} Keep selection(s) → ${man.segments.length} multicam segment(s) at ${man.fps} fps, in session order. `,
+      "Multicam audio uses Resolve Source mode with each player's own mic."),
+    man.blockers.length ? h("div", { class: "resolve-blockers" }, h("b", null, `Blocked (${man.blockers.length}) — fix these before exporting:`), issueList(man.blockers, "bad-text")) : null,
+    r.mics.length ? h("div", null, h("h3", null, "Microphones"),
+      h("table", { class: "t" }, h("thead", null, h("tr", null, ["Player", "Part", "Status", "Metadata says", ""].map((x) => h("th", null, x)))),
+        h("tbody", null, r.mics.map((m) => resolveMicRow(m, box))))) : null,
+    man.segments.length ? h("div", null, h("h3", null, "Segments"), resolveSegmentsTable(man)) : null,
+    man.warnings.filter((w) => !w.event_id).length ? h("div", null, h("h3", null, "Warnings"), issueList(man.warnings.filter((w) => !w.event_id), "warn-text")) : null,
+    h("div", { class: "row resolve-go" },
+      h("button", { class: "btn primary", disabled: man.blockers.length || running ? true : null, onclick: action(async () => {
+        const job = await api("/api/resolve/export", {});
+        state.resolve.job = job; fillResolve(box);
+      }) }, "Export to Resolve"),
+      h("span", { class: "muted small" }, "Before exporting: save and close your Resolve project, leave the Project Manager open, and set Preferences → General → External scripting using = Local.")),
+    resolveJobBox(r.job, box));
+}
+
+function resolvePanel() {
+  const box = h("div", { class: "panel" },
+    h("h2", null, "Export to Resolve"),
+    h("div", { class: "row" },
+      h("button", { class: "btn", onclick: action(() => loadResolvePreview(box)) }, state.resolve ? "Refresh preview" : "Preview"),
+      h("span", { class: "muted small" }, "Builds one new DaVinci Resolve project with a multicam clip per Keep selection. Nothing is written until you export.")));
+  if (state.resolve) fillResolve(box);
+  else api("/api/resolve/status").then((job) => {
+    if (job.state !== "idle") { state.resolve = null; loadResolvePreview(box).catch((e) => toast(e.message, "error")); }
+  }).catch(() => {});
+  return box;
+}
+
 function renderExport(main) {
   const s = state.session;
+  main.appendChild(resolvePanel());
   const modes = h("div", { class: "row" }, Object.entries(EXPORT_MODES).map(([k, m]) =>
     h("label", null, h("input", { type: "radio", name: "xmode", value: k, checked: state.exportMode === k,
       onchange: () => { state.exportMode = k; } }), " ", m.label)));

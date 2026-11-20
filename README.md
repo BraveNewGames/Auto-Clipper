@@ -51,11 +51,48 @@ Options: `python -m autoclipper [session_folder] [--port N] [--no-browser]`.
 
 The Export tab shows the same instructions.
 
+## Export to Resolve
+
+The Export tab can build a DaVinci Resolve Studio project directly from your **Keep** selections:
+one new timeline with one native multicam clip per selection (every available POV is an angle),
+in session order, with timeline markers carrying the event ID, suggestion ID and title.
+
+**Prerequisites**
+
+- OBS-remuxed `.mp4` recordings next to the SRTs (same stem as the session's `.mkv`, if the
+  session was scanned from MKVs). MKVs are never imported or substituted.
+- Transcriber JSON in `_Transcripts\<stem>\<stem>.json`, in the session folder or next to it.
+  It tells Auto-Clipper which audio track is each player's own microphone.
+- DaVinci Resolve **Studio** running, with Preferences → General → *External scripting using* =
+  **Local**. Resolve's standard scripting `Modules` folder is added to the builder's
+  `PYTHONPATH` automatically if it is installed in the default location.
+- Before exporting: save and close your own project and leave the **Project Manager** open.
+  The export refuses to run if another project is open.
+
+**Steps**
+
+1. *Preview* lists the segments (an event that crosses a recording-part boundary is split into
+   consecutive segments), the angles per segment, POVs that are unavailable and why, and the
+   microphone status of each part. Nothing is written.
+2. Blockers are shown in red. A microphone whose label the transcriber *inferred* must be checked:
+   listen to that track, then choose it and click **Confirm mic (I listened)**. This writes only
+   `<session folder>\.autoclipper\mic_confirmations.json`.
+3. **Export to Resolve** (enabled only with no blockers) writes `manifest.json` and `report.md`
+   to `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\`, then creates the new
+   project **AutoClipper Export `<session id>` `<timestamp>`**, saves it, reopens it to verify it,
+   and writes `readback.json` next to the report. Errors from Resolve are shown as-is.
+
+Audio uses Resolve multicam *Source* mode: each angle carries its owner's mic (one switchable
+pair). Game audio is reported as not identified unless the transcriber metadata names it.
+Source MP4s are imported by reference and never modified.
+
 ## Where files go
 
 | What | Where |
 |---|---|
 | Session project (offsets, reviews, decisions) | `<session folder>\.autoclipper\session.json` |
+| Resolve export manifest, report and readback | `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\` |
+| Owner mic confirmations | `<session folder>\.autoclipper\mic_confirmations.json` |
 | LosslessCut CSVs + README per reviewer | `<session folder>\autoclipper_exports\<reviewer>\<POV>_part<N>_pass<K>.csv` |
 | Recent sessions list | `%APPDATA%\AutoClipper\recent.json` |
 
