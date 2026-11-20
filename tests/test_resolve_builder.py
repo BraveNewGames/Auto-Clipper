@@ -186,7 +186,12 @@ class ResolveBuilderTests(unittest.TestCase):
                 dest = transcripts / part
                 dest.mkdir(parents=True)
                 (dest / f"{part}.json").write_text(
-                    json.dumps({"speaker_tracks": {"audio_track_2": name}}), encoding="utf-8",
+                    json.dumps({
+                        "speaker_tracks": [{"track": 2, "speaker": name, "speaker_template": "{Recorder}",
+                                            "index": 7, "title": "Track2"}],
+                        "recorder": {"name": name, "source": "filename", "tracks": [2]},
+                    }),
+                    encoding="utf-8",
                 )
             for sid, first, last in (("later", 4, 5), ("split", 1, 3), ("early", 0.25, 0.75)):
                 session.suggestions.append(Suggestion(sid, "synthetic", event_id=f"ev-{sid}",
@@ -199,7 +204,11 @@ class ResolveBuilderTests(unittest.TestCase):
             ]
             path = root / "manifest.json"
             output = io.StringIO()
-            with (patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory),
+            def probe(path):
+                duration = "5" if path.stem == "a2" else "2"
+                return [{**inventory[0], "duration": duration}, *inventory[1:]]
+
+            with (patch("autoclipper.resolve_manifest.probe_streams", side_effect=probe),
                   patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), redirect_stdout(output)):
                 manifest = build_manifest(session)
                 self.assertEqual(manifest["blockers"], [])
