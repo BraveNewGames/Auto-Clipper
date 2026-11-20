@@ -10,7 +10,11 @@ The canonical session clock uses integer frames at the Phase A timeline's
 integer non-drop rate. Frame zero is Auto-Clipper session time zero.
 Pre-roll evidence may have negative frames. Every interval includes In and
 excludes Out. Resolve timeline start is a separate absolute frame origin.
-Captured marks are converted by the Phase A manifest clock. Imported
+Captured marks are converted by the Phase A manifest clock.
+The persistent catalog independently checks both endpoints against a
+full-session binding: Resolve's timeline start is session frame zero.
+Trimmed, padded or shifted review timelines need a separately verified
+mapping before they can supply persistent captures. Imported
 transcript ranges round outward, while media coverage includes full frames
 only. Unknown-duration and offline parts supply no confirmed coverage.
 Separate part intervals retain gaps and overlaps. Assembler microphone
