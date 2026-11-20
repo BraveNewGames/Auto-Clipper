@@ -52,6 +52,8 @@ class NotesTests(unittest.TestCase):
         pending = self.catalog.preview_range(note.note_id, retake, playback="paused")
         self.assertEqual((pending.old.start, pending.new.start), (10, 12))
         self.assertEqual(self.catalog.search()[0].frames, note.frames)
+        with self.assertRaisesRegex(ValueError, "disagrees with the preview"):
+            self.catalog.apply_range(replace(pending, new=pending.old))
         self.catalog.apply_range(pending)
         self.assertEqual(review_payload(self.catalog.search()[0])["session_in"], 12)
         with self.assertRaises(ValueError):
@@ -66,6 +68,19 @@ class NotesTests(unittest.TestCase):
             self.catalog.create(replace(self.capture, timeline_id="wrong"), "Note", playback="paused")
         self.assertFalse(self.catalog.search())
         self.assertFalse(self.create("Good").capture["playback_api_verified"])
+
+    def test_rejects_consistently_shifted_session_ranges(self):
+        note = self.create("Original")
+        before = self.store.path.read_bytes()
+        for shift in (-5, 5, 600):
+            shifted = replace(self.capture, session_in=self.capture.session_in + shift,
+                              session_out_exclusive=self.capture.session_out_exclusive + shift)
+            with self.subTest(shift=shift):
+                with self.assertRaisesRegex(ValueError, "bound session frame origin"):
+                    self.catalog.create(shifted, "Shifted", playback="paused")
+                with self.assertRaisesRegex(ValueError, "bound session frame origin"):
+                    self.catalog.preview_range(note.note_id, shifted, playback="paused")
+        self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_generation_failure_and_user_customization(self):
         provider = Mock(name="fixture-provider")

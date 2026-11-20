@@ -5,7 +5,7 @@ import re
 from typing import Protocol
 from uuid import uuid4
 
-from .director_poc.core import tc_frame
+from .director_poc.core import Capture, tc_frame
 from .fkb import DirectorNote, FrameRange
 
 
@@ -62,6 +62,10 @@ class NotesCatalog:
                 or tc_frame(capture.out_timecode_exclusive, session.fps)
                 != session.timeline_start_frame + timeline.end):
             raise ValueError("Capture timecodes disagree with the session timeline origin")
+        # A persistent catalog is bound to a full-session timeline. Its Resolve
+        # start frame represents session frame zero, regardless of the manifest.
+        if frames != timeline:
+            raise ValueError("Capture session range disagrees with the bound session frame origin")
         return frames, {**asdict(capture), "playback": "operator_confirmed_paused",
                         "playback_api_verified": False, "delayed": False}
 
@@ -160,8 +164,14 @@ class NotesCatalog:
             if (note.revision != adjustment.revision or note.frames != adjustment.old.to_dict()
                     or data.mapping_stale):
                 raise ValueError("Note or mapping changed. Capture and preview the range again.")
-            frames = adjustment.new
-            return self._revise(note, frames=frames.to_dict(), capture=adjustment.capture,
+            capture = Capture(**{key: adjustment.capture[key] for key in Capture.__dataclass_fields__})
+            frames, evidence = self._capture(
+                data, capture,
+                "paused" if adjustment.capture.get("playback") == "operator_confirmed_paused" else None,
+                adjustment.capture.get("delayed", True))
+            if frames != adjustment.new:
+                raise ValueError("Capture range disagrees with the preview")
+            return self._revise(note, frames=frames.to_dict(), capture=evidence,
                                 pov_ids=sorted({part.pov_id for part in data.coverage(frames)}))
 
         return self.store.update(apply)

@@ -137,6 +137,21 @@ class DirectorCaptureTests(unittest.TestCase):
             self.timeline.AddMarker.assert_called_once_with(
                 10, "Blue", "DirectorA note", "", 30, note.note_id)
 
+    def test_persistent_catalog_rejects_shifted_manifest_capture(self):
+        from autoclipper.director_notes import NotesCatalog
+        from autoclipper.fkb import FKBStore, FootageKnowledgeBase, Session
+
+        shifted_manifest = manifest(segment(0, 5, 120, "one"))
+        shifted = Review(self.api, IDENTITY, shifted_manifest).capture()
+        self.assertEqual((shifted.timeline_in, shifted.session_in), (10, 310))
+        with TemporaryDirectory() as folder:
+            store = FKBStore(folder)
+            store.initialize(FootageKnowledgeBase(Session("test", 60, 216000, "p1", "t1")))
+            catalog = NotesCatalog(store)
+            with self.assertRaisesRegex(ValueError, "bound session frame origin"):
+                catalog.create(shifted, "Shifted marks", playback="paused")
+            self.assertEqual(catalog.search(), [])
+
     def test_wrong_identity_and_lost_connection(self):
         self.timeline.GetUniqueId.return_value = "other"
         with self.assertRaisesRegex(RuntimeError, "review timeline"):
