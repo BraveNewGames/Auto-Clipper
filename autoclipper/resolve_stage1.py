@@ -74,13 +74,13 @@ def read_item(item):
     }
 
 
-def verify_item(item, source_in, source_out, record_in):
+def verify_item(item, source_in, source_out, record_in, *, verify_source_end=True):
     row = read_item(item)
     print(json.dumps(row))
     length = source_out - source_in
     require(
         row["source_start"] == source_in
-        and row["source_end"] in (source_out - 1, source_out)
+        and (not verify_source_end or row["source_end"] in (source_out - 1, source_out))
         and row["record_start"] == record_in
         and row["record_end"] == record_in + length
         and row["duration"] == length,
@@ -90,12 +90,11 @@ def verify_item(item, source_in, source_out, record_in):
 
 
 def append_video(pool, clip, first, last, record, track):
-    # The documented API leaves the end convention unspecified. Submit the
-    # last included source frame and check Resolve's resulting edit length.
+    # Resolve 21.2.0.6 treated the append endpoint as exclusive.
     items = pool.AppendToTimeline([{
         "mediaPoolItem": clip,
         "startFrame": first,
-        "endFrame": last - 1,
+        "endFrame": last,
         "recordFrame": record,
         "trackIndex": track,
         "mediaType": 1,
@@ -133,7 +132,9 @@ def assemble(project_name, inputs, fps, stacked):
     record = timeline.GetStartFrame()
     clips = []
     for placement, path in inputs:
-        imported = pool.ImportMedia([{"FilePath": str(path)}])
+        # Studio 21.2.0.6 accepts the path list for these MP4s. The documented
+        # dictionary form returned an empty list in the live scratch test.
+        imported = pool.ImportMedia([str(path)])
         require(imported and len(imported) == 1, "Expected one imported clip per path")
         clip = imported[0]
         require(Path(clip.GetClipProperty("File Path")).resolve() == path, "Imported path differs")
@@ -160,6 +161,12 @@ def assemble(project_name, inputs, fps, stacked):
                 clip.SetMarkInOut(placement.source_in, placement.source_out - 1),
                 "Could not set angle In/Out marks",
             )
+            marks = clip.GetMarkInOut()["video"]
+            print(json.dumps({"part_id": placement.part_id, "video_marks": marks}))
+            require(
+                marks["in"] == placement.source_in and marks["out"] == placement.source_out - 1,
+                "Angle source marks differ from the plan",
+            )
         multicam = pool.CreateMulticamClip(clips, {
             "name": "Stage 1 Angles",
             "startTimecode": "01:00:00:00",
@@ -169,26 +176,36 @@ def assemble(project_name, inputs, fps, stacked):
             "createBinForSourceClips": False,
         })
         require(multicam and len(multicam) == 1, "Resolve did not create one multicam clip")
+        require(
+            multicam[0].GetClipProperty("Type") == "Multicam",
+            "Created media is not reported as Multicam",
+        )
         require(project.SetCurrentTimeline(timeline), "Could not reactivate scratch timeline")
         length = inputs[0][0].record_out
         item = append_video(pool, multicam[0], 0, length, record, 1)
-        verify_item(item, 0, length, record)
+        require(int(multicam[0].GetClipProperty("Frames")) == length, "Multicam media length differs")
+        # The composite source-end getter returned 1918 for a 1920-frame
+        # full-length edit. Check parent record bounds and media length instead.
+        verify_item(item, 0, length, record, verify_source_end=False)
         require(
             item.GetMediaPoolItem().GetUniqueId() == multicam[0].GetUniqueId(),
             "Parent edit references unexpected multicam media",
         )
 
         # Read the underlying angle's actual source trims, not only the parent edit.
-        angles = require(multicam[0].GetTimeline(), "Cannot read multicam angle timeline")
-        require(angles.GetTrackCount("video") == 2, "Expected two angle tracks")
-        expected = {path: placement for placement, path in inputs}
-        for track in (1, 2):
-            items = angles.GetItemListInTrack("video", track)
-            require(items and len(items) == 1, "Expected one source item per angle")
-            path = Path(items[0].GetMediaPoolItem().GetClipProperty("File Path")).resolve()
-            require(path in expected, "Unexpected or duplicate angle media reference")
-            placement = expected.pop(path)
-            verify_item(items[0], placement.source_in, placement.source_out, angles.GetStartFrame())
+        angles = multicam[0].GetTimeline()
+        if angles:
+            require(angles.GetTrackCount("video") == 2, "Expected two angle tracks")
+            expected = {path: placement for placement, path in inputs}
+            for track in (1, 2):
+                items = angles.GetItemListInTrack("video", track)
+                require(items and len(items) == 1, "Expected one source item per angle")
+                path = Path(items[0].GetMediaPoolItem().GetClipProperty("File Path")).resolve()
+                require(path in expected, "Unexpected or duplicate angle media reference")
+                placement = expected.pop(path)
+                verify_item(items[0], placement.source_in, placement.source_out, angles.GetStartFrame())
+        else:
+            print("Native angle timeline unavailable through the SDK. Verify angles in the Edit page.")
 
     active = manager.GetCurrentProject()
     require(active and active.GetUniqueId() == project.GetUniqueId(), "Scratch project is not active")

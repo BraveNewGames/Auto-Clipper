@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Session
-from autoclipper.resolve_stage1 import Placement, assemble, main, plan_placements
+from autoclipper.resolve_stage1 import Placement, append_video, assemble, main, plan_placements
 
 
 class ResolvePlacementTests(unittest.TestCase):
@@ -72,3 +72,16 @@ class ResolvePlacementTests(unittest.TestCase):
                 assemble("AutoClipper Stage1 test", [], 60, False)
         manager.CreateProject.assert_not_called()
         manager.SaveProject.assert_not_called()
+
+    def test_append_passes_the_exclusive_source_end(self):
+        pool, clip, item = Mock(), Mock(), Mock()
+        pool.AppendToTimeline.return_value = [item]
+        self.assertIs(append_video(pool, clip, 100, 120, 500, 2), item)
+        pool.AppendToTimeline.assert_called_once_with([{
+            "mediaPoolItem": clip,
+            "startFrame": 100,
+            "endFrame": 120,
+            "recordFrame": 500,
+            "trackIndex": 2,
+            "mediaType": 1,
+        }])
