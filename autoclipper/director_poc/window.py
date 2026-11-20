@@ -8,6 +8,9 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from time import perf_counter
 import tkinter as tk
+from tkinter import messagebox, simpledialog
+
+from ..director_notes import review_payload
 
 from .core import now
 
@@ -73,7 +76,7 @@ def resolve_worker(connect, note_path, jobs, results):
             results.put((None, str(exc), perf_counter()))
 
 
-def run_window(connect, store, log_path, hz, key):
+def run_window(connect, store, log_path, hz, key, *, persistent=None):
     root = tk.Tk()
     root.title(f"DirectorA POC | Ctrl+Alt+Shift+F{key}")
     status = tk.StringVar(value="Connecting to the scratch project")
@@ -83,8 +86,20 @@ def run_window(connect, store, log_path, hz, key):
     tk.Label(root, textvariable=playhead).pack(fill="x")
     tk.Label(root, textvariable=details).pack(fill="x")
     tk.Label(root, textvariable=status, wraplength=580).pack(fill="x")
-    tk.OptionMenu(root, mode, "Guarded playhead", "GetCurrentTimecode",
-                  "GetMarkInOut", "GetCurrentVideoItem", "Off").pack()
+    if persistent is None:
+        tk.OptionMenu(root, mode, "Guarded playhead", "GetCurrentTimecode",
+                      "GetMarkInOut", "GetCurrentVideoItem", "Off").pack()
+    query = tk.StringVar()
+    trash = tk.BooleanVar()
+    paused = tk.BooleanVar()
+    metadata_results = Queue()
+    adjustment = None
+    edit_id = None
+    append_text = True
+    if persistent:
+        tk.Checkbutton(root, text="Confirm Resolve is paused for the next capture", variable=paused).pack()
+        tk.Entry(root, textvariable=query).pack(fill="x")
+        tk.Checkbutton(root, text="Show deleted notes", variable=trash).pack()
     entry = tk.Text(root, width=70, height=4)
     entry.pack(fill="x")
     catalog = tk.Listbox(root, width=70, exportselection=False)
@@ -99,11 +114,32 @@ def run_window(connect, store, log_path, hz, key):
     connected = False
 
     def refresh():
-        notes[:] = store.list()
+        selected = selected_note()
+        notes[:] = (persistent.search(query.get(), deleted=trash.get()) if persistent
+                    else store.list())
         catalog.delete(0, "end")
-        for note in notes:
+        for index, note in enumerate(notes):
+            if persistent:
+                title = note.title or note.text.splitlines()[0][:54]
+                catalog.insert("end", f"{note.frames['start']} to {note.frames['end']}  {title}")
+                if selected and selected.note_id == note.note_id:
+                    catalog.selection_set(index)
+                continue
             title = note["text"].splitlines()[0][:54]
             catalog.insert("end", f"{note['in_timecode']}  {title}")
+
+    def selected_note():
+        indexes = catalog.curselection()
+        return notes[indexes[0]] if indexes else None
+
+    def metadata(note):
+        def generate():
+            try:
+                persistent.refresh_metadata(note.note_id)
+                metadata_results.put(True)
+            except Exception:
+                metadata_results.put(False)
+        Thread(target=generate, daemon=True).start()
 
     def submit(name, args=(), complete=None):
         nonlocal inflight
@@ -128,30 +164,100 @@ def run_window(connect, store, log_path, hz, key):
         else:
             status.set("Captured. Type note text and save.")
 
+    def begin_edit(selected, *, append):
+        nonlocal edit_id, append_text
+        if selected.deleted:
+            status.set("Recover the note before editing.")
+            return
+        if pending is not None or adjustment is not None or edit_id is not None or inflight:
+            status.set("Finish the current operation first.")
+            return
+        edit_id = selected.note_id
+        append_text = append
+        entry.delete("1.0", "end")
+        if not append:
+            entry.insert("1.0", selected.text)
+        details.set(f"{'Append to' if append else 'Edit'} {selected.title or selected.note_id}")
+        save_button.configure(state="normal")
+        root.deiconify()
+        root.lift()
+        entry.focus_force()
+
     def capture():
-        if pending is not None:
+        selected = selected_note()
+        if persistent and selected and not selected.deleted:
+            begin_edit(selected, append=True)
+        else:
+            request_capture()
+
+    def request_capture(target=None):
+        if pending is not None or adjustment is not None or edit_id is not None:
             status.set("Save or discard the pending capture first")
             return
         if inflight is not None or not connected:
             status.set("Resolve is busy or disconnected. Retry when the current request returns.")
             return
-        submit("Capture", complete=show_capture)
+        if persistent:
+            if not paused.get():
+                status.set("Pause Resolve and confirm playback is paused before capture.")
+                return
+            paused.set(False)
+
+            def complete(value, elapsed):
+                nonlocal adjustment
+                if elapsed > timeout:
+                    details.set("")
+                    status.set("Delayed range discarded. Capture again with playback paused.")
+                    return
+                try:
+                    if target:
+                        adjustment = persistent.preview_range(target.note_id, value, playback="paused")
+                        details.set(f"Old [{adjustment.old.start}, {adjustment.old.end}) to "
+                                    f"New [{adjustment.new.start}, {adjustment.new.end})")
+                        status.set("Review the range change, then save or discard.")
+                        save_button.configure(state="normal")
+                    else:
+                        show_capture(value, elapsed)
+                        status.set("Range captured with operator-confirmed pause. Check the marks and save.")
+                except (ValueError, KeyError, OSError) as exc:
+                    status.set(str(exc))
+            submit("Capture", complete=complete)
+        else:
+            submit("Capture", complete=show_capture)
         details.set("Range: waiting for Resolve (playback may be active)...")
         root.deiconify()
         root.lift()
         entry.focus_force()
 
     def discard():
-        nonlocal pending
+        nonlocal pending, adjustment, edit_id
         if inflight is not None and inflight[0] in ("Capture", "Save note"):
             status.set("Wait for the pending Resolve request.")
             return
-        pending = None
+        pending = adjustment = edit_id = None
         save_button.configure(state="disabled")
         details.set("")
         entry.delete("1.0", "end")
 
     def save():
+        if persistent:
+            text = entry.get("1.0", "end-1c")
+            try:
+                if adjustment is not None:
+                    persistent.apply_range(adjustment)
+                elif edit_id:
+                    metadata(persistent.edit_text(edit_id, text, append=append_text))
+                elif pending:
+                    metadata(persistent.create(pending, text, playback="paused"))
+                else:
+                    return
+            except (ValueError, KeyError, OSError) as exc:
+                status.set(str(exc))
+                return
+            discard()
+            refresh()
+            status.set("Note saved")
+            return
         if pending is None:
             status.set("Capture a range first")
             return
@@ -170,6 +276,11 @@ def run_window(connect, store, log_path, hz, key):
             status.set("Select a saved note")
             return
         note = notes[indexes[0]]
+        if persistent:
+            if persistent.store.load().mapping_stale or (note.deleted and name != "Delete marker"):
+                status.set("Navigation requires an active note and current mapping.")
+                return
+            note = review_payload(note)
         submit(name, (note,), lambda value: status.set(str(value)))
 
     row = tk.Frame(root)
@@ -183,6 +294,53 @@ def run_window(connect, store, log_path, hz, key):
             ("Read marker", lambda: selected_action("Read marker")),
             ("Delete marker", lambda: selected_action("Delete marker"))):
         tk.Button(row, text=label, command=callback).pack(side="left")
+
+    if persistent:
+        def catalog_action(action):
+            note = selected_note()
+            if not note:
+                status.set("Select a saved note.")
+                return
+            try:
+                if action == "Adjust range":
+                    request_capture(note)
+                elif action == "Edit full text":
+                    begin_edit(note, append=False)
+                elif action == "Edit title/tags":
+                    title = simpledialog.askstring(action, "Title", initialvalue=note.title)
+                    if title is None:
+                        return
+                    tags = simpledialog.askstring(action, "Comma-separated tags",
+                                                  initialvalue=", ".join(note.tags))
+                    if tags is not None:
+                        changes = {}
+                        if title != note.title:
+                            changes["title"] = title
+                        if tags != ", ".join(note.tags):
+                            changes["tags"] = [tag.strip() for tag in tags.split(",") if tag.strip()]
+                        persistent.edit_metadata(note.note_id, **changes)
+                elif action == "Restore revision":
+                    value = simpledialog.askinteger(action, f"Revision number (0 to {note.revision - 1})")
+                    if value is not None:
+                        persistent.restore_revision(note.note_id, value)
+                elif note.deleted:
+                    persistent.recover(note.note_id)
+                    status.set("Note recovered.")
+                elif messagebox.askyesno(action, "Delete this note? You can recover it from deleted notes."):
+                    persistent.delete(note.note_id)
+                    status.set("Note deleted.")
+                refresh()
+            except (ValueError, KeyError, OSError) as exc:
+                status.set(str(exc))
+
+        controls = tk.Frame(root)
+        controls.pack(fill="x")
+        for action in ("Adjust range", "Edit full text", "Edit title/tags", "Restore revision",
+                       "Delete/recover"):
+            tk.Button(controls, text=action, command=lambda item=action: catalog_action(item)).pack(side="left")
+        tk.Button(controls, text="New capture", command=request_capture).pack(side="left")
+        query.trace_add("write", lambda *_: refresh())
+        trash.trace_add("write", lambda *_: refresh())
 
     refresh()
     Thread(target=listen_for_hotkey, args=(key, stopped, ready, presses), daemon=True).start()
@@ -254,6 +412,16 @@ def run_window(connect, store, log_path, hz, key):
                     capture()
                 if connected and not inflight and current >= next_poll and mode.get() != "Off":
                     submit(mode.get())
+                if persistent:
+                    try:
+                        indexed = metadata_results.get_nowait()
+                    except Empty:
+                        pass
+                    else:
+                        if indexed:
+                            refresh()
+                        else:
+                            status.set("Note saved. Metadata generation did not finish.")
                 root.after(10, tick)
 
             submit("Connect")

@@ -111,6 +111,32 @@ class DirectorCaptureTests(unittest.TestCase):
         self.assertEqual(persisted[1]["session_out_exclusive"], 45)
         self.assertEqual(persisted[1]["revisions"][0]["text"], " Second ")
 
+    def test_persistent_catalog_with_mock_resolve(self):
+        from autoclipper.director_notes import NotesCatalog, review_payload
+        from autoclipper.director_poc.__main__ import initialize_fkb
+        from autoclipper.fkb import FKBStore
+        from autoclipper.models import Part, POV, Session
+
+        capture = self.review.capture()
+        self.marks.update({"in": 20, "out": 59})
+        self.manifest["segments"][0]["angles"][0]["mic"] = {"transcriber_track": 2}
+        with TemporaryDirectory() as folder:
+            source = Session(session_id="synthetic", folder=folder,
+                             povs=[POV("pov", "Player", [Part("one", duration=2)])])
+            initialize_fkb(folder, source, self.manifest, IDENTITY)
+            store = FKBStore(folder)
+            catalog = NotesCatalog(store)
+            note = catalog.create(capture, "Observation", playback="paused")
+            self.assertEqual(note.frames, {"start": 10, "end": 40})
+            self.assertEqual(store.load().recording_parts[0].audio_stream_mapping,
+                             {"transcriber_track": 2})
+            self.timeline.AddMarker.assert_not_called()
+            self.timeline.SetCurrentTimecode.assert_not_called()
+            self.timeline.GetMarkers.return_value = {}
+            self.review.marker(review_payload(note), "add")
+            self.timeline.AddMarker.assert_called_once_with(
+                10, "Blue", "DirectorA note", "", 30, note.note_id)
+
     def test_wrong_identity_and_lost_connection(self):
         self.timeline.GetUniqueId.return_value = "other"
         with self.assertRaisesRegex(RuntimeError, "review timeline"):
