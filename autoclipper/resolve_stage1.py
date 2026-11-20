@@ -28,6 +28,10 @@ def plan_placements(session, start, end, fps):
     if rate <= 0 or Fraction(str(end)) <= Fraction(str(start)):
         raise ValueError("Expected a positive frame rate and a nonempty event")
 
+    for _, part in session.all_parts():
+        if part.duration is None and part.offset < end:
+            raise ValueError(f"Unknown media duration for {part.part_id}")
+
     # Disable map_range's SRT fallback, keeping this conversion independent of files.
     session = replace(session, povs=[
         replace(pov, parts=[replace(part, srt_path=None) for part in pov.parts])
@@ -46,8 +50,13 @@ def plan_placements(session, start, end, fps):
         source_in = floor((first - Fraction(str(part.offset))) * rate + Fraction(1, 2))
         # Use the destination length so adjoining pieces share a boundary and
         # both angles have the same length despite different source frame phases.
-        source_out = source_in + record_out - record_in
-        if not 0 <= source_in < source_out <= floor(Fraction(str(part.duration)) * rate):
+        length = record_out - record_in
+        source_limit = floor(Fraction(str(part.duration)) * rate + Fraction(1, 2))
+        # At a fractional boundary, preserve the record length by moving the
+        # source In back if independent rounding would overrun the source.
+        source_in = min(source_in, source_limit - length)
+        source_out = source_in + length
+        if not 0 <= source_in < source_out <= source_limit:
             raise ValueError(f"Empty or out-of-bounds frame range for {piece.part_id}")
         placements.append(Placement(
             piece.pov_id, piece.part_id, source_in, source_out, record_in, record_out,
@@ -118,15 +127,31 @@ def isolate_mic(clip, track, channels):
 
 
 def assemble(project_name, inputs, fps, stacked, mics=None):
+    prefix = "AutoClipper Stage1 "
+    require(project_name and project_name.startswith(prefix) and project_name[len(prefix):].strip(),
+            f"Use a fresh --project name beginning with {prefix!r}")
     # This module is only imported after CLI preflight and outside dry-run.
     import DaVinciResolveScript
 
     resolve = require(DaVinciResolveScript.scriptapp("Resolve"), "Resolve is unavailable")
     manager = require(resolve.GetProjectManager(), "Resolve project manager is unavailable")
     current = manager.GetCurrentProject()
+    current_name = current.GetName() if current else None
+    require(
+        not current or current_name == "Untitled Project"
+        or (isinstance(current_name, str) and current_name.startswith(prefix)
+            and current_name[len(prefix):].strip()),
+        "Close the active owner project before executing. Use Project Manager, "
+        "the default Untitled Project, or an AutoClipper Stage1 scratch project.",
+    )
+    if current_name == "Untitled Project":
+        root = current.GetMediaPool().GetRootFolder()
+        require(current.GetTimelineCount() == 0 and root.GetClipList() == []
+                and root.GetSubFolderList() == [],
+                "The active Untitled Project contains work. Save and close it before executing.")
     names = manager.GetProjectListInCurrentFolder()
     require(names is not None, "Could not enumerate projects in the current folder")
-    existing = list(names) + ([current.GetName()] if current else [])
+    existing = list(names) + ([current_name] if current_name else [])
     require(
         project_name.casefold() not in {name.casefold() for name in existing},
         "Scratch project name already exists",
@@ -259,7 +284,9 @@ def main(argv=None):
     parser.add_argument("--project", help="Unused project name beginning with AutoClipper Stage1 ")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan without opening Resolve")
-    mode.add_argument("--execute", action="store_true", help="Use only during the approved Resolve window")
+    mode.add_argument("--execute", action="store_true",
+                      help="Approved Resolve window only. Save and close owner projects first. "
+                           "Use Project Manager, an empty default Untitled Project, or a Stage 1 scratch project.")
     parser.add_argument("--stacked", action="store_true", help="Use the stacked-video timing fallback")
     args = parser.parse_args(argv)
     try:
@@ -315,9 +342,6 @@ def main(argv=None):
             ],
         }, indent=2))
         if args.execute:
-            prefix = "AutoClipper Stage1 "
-            if not args.project or not args.project.startswith(prefix) or not args.project[len(prefix):].strip():
-                raise ValueError(f"Use a fresh --project name beginning with {prefix!r}")
             assemble(args.project, inputs, args.fps, args.stacked, mics)
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(1, f"Stage 1 stopped: {exc}\n")

@@ -40,8 +40,17 @@ class ResolvePlacementTests(unittest.TestCase):
         self.assertEqual(plan_placements(session, -1, 2, 10), [
             Placement("a", "a1", 0, 10, 10, 20),
         ])
-        with self.assertRaisesRegex(ValueError, "out-of-bounds"):
-            plan_placements(session, 0.55, 1.02, 10)
+        self.assertEqual(plan_placements(session, 0.55, 1.02, 10), [
+            Placement("a", "a1", 5, 10, 0, 5),
+        ])
+        part.duration = 1.06
+        self.assertEqual(plan_placements(session, 0, 1.06, 10), [
+            Placement("a", "a1", 0, 11, 0, 11),
+        ])
+        part.duration = None
+        with self.assertRaisesRegex(ValueError, "Unknown media duration for a1"):
+            plan_placements(session, 0, 1, 10)
+        part.duration = 1.02
         part.duration_source = "srt_estimate"
         with self.assertRaisesRegex(ValueError, "Unverified media duration"):
             plan_placements(session, 0, 1, 10)
@@ -77,6 +86,77 @@ class ResolvePlacementTests(unittest.TestCase):
                 assemble("AutoClipper Stage1 test", [], 60, False)
         manager.CreateProject.assert_not_called()
         manager.SaveProject.assert_not_called()
+
+    def test_project_name_prefix_is_required_before_connecting(self):
+        sdk = Mock()
+        with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
+            for name in (None, "Owner Project", "AutoClipper Stage1 "):
+                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "fresh --project"):
+                    assemble(name, [], 60, True)
+        sdk.scriptapp.assert_not_called()
+
+    def test_open_owner_project_or_nonempty_untitled_is_refused(self):
+        sdk = Mock()
+        manager = sdk.scriptapp.return_value.GetProjectManager.return_value
+        current = manager.GetCurrentProject.return_value
+        current.GetTimelineCount.return_value = 1
+        with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
+            for name in ("Owner Project", "Untitled Project"):
+                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "(?i)close"):
+                    current.GetName.return_value = name
+                    assemble("AutoClipper Stage1 Test", [], 60, True)
+        manager.CreateProject.assert_not_called()
+        manager.SaveProject.assert_not_called()
+
+    def test_assemble_stacked_saves_only_the_active_scratch_project(self):
+        sdk = Mock()
+        manager = sdk.scriptapp.return_value.GetProjectManager.return_value
+        owner_placeholder, scratch = Mock(), manager.CreateProject.return_value
+        owner_placeholder.GetName.return_value = "Untitled Project"
+        owner_placeholder.GetTimelineCount.return_value = 0
+        root = owner_placeholder.GetMediaPool.return_value.GetRootFolder.return_value
+        root.GetClipList.return_value = root.GetSubFolderList.return_value = []
+        manager.GetCurrentProject.side_effect = [owner_placeholder, scratch, scratch]
+        manager.GetProjectListInCurrentFolder.return_value = []
+        scratch.GetTimelineCount.return_value = 0
+        pool = scratch.GetMediaPool.return_value
+        timeline = pool.CreateEmptyTimeline.return_value
+        timeline.GetSettings.return_value = {"timelineFrameRate": "60"}
+        timeline.GetStartFrame.return_value = 216000
+        timeline.GetTrackCount.return_value = 2
+        inputs = []
+        clips, items = [], []
+        for track in (1, 2):
+            path = Path(f"synthetic-{track}.mp4").resolve()
+            inputs.append((Placement(str(track), f"p{track}", 30, 90, 0, 60), path))
+            clip, item = Mock(), Mock()
+            props = {"File Path": str(path), "FPS": "60", "Frames": "120", "Start TC": "00:00:00:00"}
+            clip.GetName.return_value = path.name
+            clip.GetClipProperty.side_effect = props.__getitem__
+            clip.GetAudioMapping.return_value = "{}"
+            item.GetMediaPoolItem.return_value = clip
+            item.GetSourceStartFrame.return_value, item.GetSourceEndFrame.return_value = 30, 90
+            item.GetStart.return_value, item.GetEnd.return_value = 216000, 216060
+            item.GetDuration.return_value = 60
+            clips.append([clip])
+            items.append([item])
+        pool.ImportMedia.side_effect = clips
+        timeline.GetItemListInTrack.side_effect = items
+
+        def save():
+            self.assertEqual(manager.GetCurrentProject.call_count, 3)
+            return True
+
+        manager.SaveProject.side_effect = save
+        with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+              patch("autoclipper.resolve_stage1.mkdtemp", return_value="scratch"),
+              contextlib.redirect_stdout(io.StringIO())):
+            assemble("AutoClipper Stage1 Test", inputs, 60, True)
+        manager.CreateProject.assert_called_once_with("AutoClipper Stage1 Test", "scratch")
+        scratch.SetCurrentTimeline.assert_called_once_with(timeline)
+        owner_placeholder.SetSettings.assert_not_called()
+        owner_placeholder.SetCurrentTimeline.assert_not_called()
+        manager.SaveProject.assert_called_once_with()
 
     def test_append_passes_the_exclusive_source_end(self):
         pool, clip, item = Mock(), Mock(), Mock()
