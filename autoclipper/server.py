@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 DEFAULT_PORT = 8765
+MAX_POST_BODY_BYTES = 16 * 1024 * 1024
 
 
 class ApiError(Exception):
@@ -727,13 +728,25 @@ class Handler(BaseHTTPRequestHandler):
             self._error(exc)
 
     def do_POST(self):
-        url = urlparse(self.path)
         try:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            # Closing with unread request bytes can reset the connection before
+            # the client receives an early 403 or 404.
+            read_length = min(max(length, 0), MAX_POST_BODY_BYTES)
+            raw = self.rfile.read(read_length) if read_length else b""
             self._check_origin()
+            url = urlparse(self.path)
             if url.path not in POST_ROUTES:
                 raise ApiError("Not found", 404)
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
+            if length < 0:
+                raise ApiError("Invalid Content-Length")
+            if length > MAX_POST_BODY_BYTES:
+                raise ApiError("Request body too large", 413)
+            if len(raw) != length:
+                raise ApiError("Incomplete request body")
             try:
                 body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
             except ValueError:
