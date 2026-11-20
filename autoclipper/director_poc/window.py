@@ -3,6 +3,7 @@
 import csv
 import ctypes
 from ctypes import wintypes
+from multiprocessing import get_context
 from queue import Empty, Queue
 from threading import Event, Thread
 from time import perf_counter
@@ -36,21 +37,66 @@ def listen_for_hotkey(key, stopped, ready, presses):
         user32.UnregisterHotKey(None, hotkey_id)
 
 
-def run_window(review, store, log_path, hz, key):
+def resolve_worker(connect, note_path, jobs, results):
+    from .core import NoteStore
+
+    review = None
+    timeline = None
+    while True:
+        job = jobs.get()
+        if job is None:
+            return
+        name, args = job
+        try:
+            if name == "Connect":
+                review = connect()
+                timeline = review.active()
+                outcome = None
+            elif name == "Guarded playhead":
+                outcome = review.sample()
+            elif name == "Capture":
+                outcome = review.capture()
+            elif name == "Save note":
+                review.active()
+                outcome = NoteStore(note_path).add(*args)
+            elif name == "Jump":
+                outcome = review.jump(*args)
+            elif name in ("Add marker", "Read marker", "Delete marker"):
+                outcome = review.marker(args[0], name.split()[0].lower())
+            else:
+                # Direct probes use the verified scratch handle so the timing
+                # excludes identity getters. Only probe on the scratch timeline.
+                value = getattr(timeline, name)()
+                outcome = ("item present" if value else "no item") if name == "GetCurrentVideoItem" else repr(value)
+            results.put((outcome, "", perf_counter()))
+        except Exception as exc:
+            results.put((None, str(exc), perf_counter()))
+
+
+def run_window(connect, store, log_path, hz, key):
     root = tk.Tk()
     root.title(f"DirectorA POC | Ctrl+Alt+Shift+F{key}")
-    status = tk.StringVar(value="Set a video In/Out range in Resolve")
+    status = tk.StringVar(value="Connecting to the scratch project")
     playhead = tk.StringVar()
     details = tk.StringVar()
+    mode = tk.StringVar(value="Off")
     tk.Label(root, textvariable=playhead).pack(fill="x")
     tk.Label(root, textvariable=details).pack(fill="x")
     tk.Label(root, textvariable=status, wraplength=580).pack(fill="x")
+    tk.OptionMenu(root, mode, "Guarded playhead", "GetCurrentTimecode",
+                  "GetMarkInOut", "GetCurrentVideoItem", "Off").pack()
     entry = tk.Text(root, width=70, height=4)
     entry.pack(fill="x")
     catalog = tk.Listbox(root, width=70, exportselection=False)
     catalog.pack(fill="both", expand=True)
     pending = None
     notes = []
+    stopped, ready, presses = Event(), Queue(), Queue()
+    context = get_context("spawn")
+    jobs, results = context.Queue(), context.Queue()
+    inflight = None
+    next_poll = 0
+    connected = False
 
     def refresh():
         notes[:] = store.list()
@@ -59,95 +105,164 @@ def run_window(review, store, log_path, hz, key):
             title = note["text"].splitlines()[0][:54]
             catalog.insert("end", f"{note['in_timecode']}  {title}")
 
-    def capture():
+    def submit(name, args=(), complete=None):
+        nonlocal inflight
+        if inflight is not None:
+            status.set(f"{inflight[0]} is busy. Retry when it returns.")
+            return
+        if name != "Connect" and not connected:
+            status.set("Connect to the exact scratch review timeline first")
+            return
+        inflight = (name, complete, now(), perf_counter())
+        jobs.put((name, args))
+
+    def show_capture(value, elapsed):
         nonlocal pending
-        if pending is not None:
-            raise ValueError("Save or discard the pending capture first")
-        pending = review.capture()
+        pending = value
+        save_button.configure(state="normal")
         duration = pending.timeline_out_exclusive - pending.timeline_in
         details.set(f"{pending.in_timecode} to {pending.out_timecode_exclusive} (exclusive)"
                     f" | {duration} frames | capture playhead {pending.playhead}")
+        if elapsed > timeout:
+            status.set(f"Range returned after {elapsed:.2f} s. Verify these marks before saving.")
+        else:
+            status.set("Captured. Type note text and save.")
+
+    def capture():
+        if pending is not None:
+            status.set("Save or discard the pending capture first")
+            return
+        if inflight is not None or not connected:
+            status.set("Resolve is busy or disconnected. Retry when the current request returns.")
+            return
+        submit("Capture", complete=show_capture)
+        details.set("Range: waiting for Resolve (playback may be active)...")
         root.deiconify()
         root.lift()
         entry.focus_force()
-        return "Captured; type note text and save"
 
     def discard():
         nonlocal pending
+        if inflight is not None and inflight[0] in ("Capture", "Save note"):
+            status.set("Wait for the pending Resolve request.")
+            return
         pending = None
+        save_button.configure(state="disabled")
         details.set("")
         entry.delete("1.0", "end")
 
     def save():
         if pending is None:
-            raise ValueError("Capture a range first")
-        review.active()
-        store.add(pending, entry.get("1.0", "end-1c"))
-        discard()
-        refresh()
-        return "Note saved"
+            status.set("Capture a range first")
+            return
+        frozen, text = pending, entry.get("1.0", "end-1c")
 
-    def selected():
+        def saved(_):
+            discard()
+            refresh()
+            status.set("Note saved")
+
+        submit("Save note", (frozen, text), saved)
+
+    def selected_action(name):
         indexes = catalog.curselection()
         if not indexes:
-            raise ValueError("Select a saved note")
-        return notes[indexes[0]]
-
-    def action(callback):
-        try:
-            status.set(callback() or "")
-        except Exception as exc:
-            status.set(str(exc))
+            status.set("Select a saved note")
+            return
+        note = notes[indexes[0]]
+        submit(name, (note,), lambda value: status.set(str(value)))
 
     row = tk.Frame(root)
     row.pack(fill="x")
+    save_button = tk.Button(row, text="Save note", command=save, state="disabled")
+    save_button.pack(side="left")
     for label, callback in (
-            ("Save note", save), ("Discard capture", discard),
-            ("Jump", lambda: review.jump(selected())),
-            ("Add marker", lambda: repr(review.marker(selected(), "add"))),
-            ("Read marker", lambda: repr(review.marker(selected(), "read"))),
-            ("Delete marker", lambda: repr(review.marker(selected(), "delete")))):
-        tk.Button(row, text=label, command=lambda callback=callback: action(callback)).pack(side="left")
+            ("Discard capture", discard),
+            ("Jump", lambda: selected_action("Jump")),
+            ("Add marker", lambda: selected_action("Add marker")),
+            ("Read marker", lambda: selected_action("Read marker")),
+            ("Delete marker", lambda: selected_action("Delete marker"))):
+        tk.Button(row, text=label, command=callback).pack(side="left")
 
     refresh()
-    stopped, ready, presses = Event(), Queue(), Queue()
-    listener = Thread(target=listen_for_hotkey, args=(key, stopped, ready, presses), daemon=True)
-    listener.start()
-
-    def key_poll():
-        try:
-            presses.get_nowait()
-        except Empty:
-            pass
-        else:
-            action(capture)
-        root.after(10, key_poll)
+    Thread(target=listen_for_hotkey, args=(key, stopped, ready, presses), daemon=True).start()
+    worker = context.Process(target=resolve_worker, args=(connect, store.path, jobs, results), daemon=True)
+    worker.start()
+    timeout = 0.75
 
     try:
-        error = ready.get(timeout=2)
-        if error:
-            root.destroy()
-            raise error
-        with log_path.open("a", newline="", encoding="utf-8", buffering=1) as log:
+        with log_path.with_name("rpc-probe.csv").open("a", newline="", encoding="utf-8", buffering=1) as log:
             writer = csv.writer(log)
             if not log.tell():
-                writer.writerow(("utc", "monotonic_s", "rpc_ms", "timecode", "relative_frame", "error"))
+                writer.writerow(("utc", "monotonic_s", "name", "rpc_ms", "result", "error"))
 
-            def poll():
-                wall, start = now(), perf_counter()
-                tc, frame, error = "", "", ""
+            reported_timeout = False
+
+            def tick():
+                nonlocal inflight, next_poll, connected, reported_timeout
+                current = perf_counter()
+                if not worker.is_alive():
+                    playhead.set("Resolve worker exited. Restart the companion to reconnect.")
+                    return
+                if inflight:
+                    name, complete, wall, start = inflight
+                    try:
+                        value, error, finished = results.get_nowait()
+                    except Empty:
+                        if current - start > timeout and not reported_timeout:
+                            reported_timeout = True
+                            writer.writerow((wall, start, name, "", "", "pending after 750 ms"))
+                            playhead.set(f"{name} pending after 750 ms. The UI remains usable.")
+                    else:
+                        elapsed = finished - start
+                        logged = value if complete is None or name in (
+                            "Jump", "Add marker", "Read marker", "Delete marker") else ""
+                        writer.writerow((wall, start, name, round(elapsed * 1000, 3), logged, error))
+                        inflight = None
+                        reported_timeout = False
+                        next_poll = max(current, start + 1 / hz)
+                        if error:
+                            playhead.set(f"{name}: {error}")
+                            if name == "Capture":
+                                details.set("")
+                                message = ("Not saved. Mark a range with different In and Out points."
+                                           if error.startswith("Set two distinct") else f"Not saved. {error}")
+                                status.set(message)
+                            elif complete or name == "Connect":
+                                status.set(error)
+                        elif name == "Connect":
+                            connected = True
+                            status.set("Set a video In/Out range in Resolve")
+                        elif name == "Capture":
+                            complete(value, elapsed)
+                        elif complete:
+                            complete(value)
+                        else:
+                            playhead.set(f"{name}: {value} ({elapsed * 1000:.1f} ms)")
                 try:
-                    tc, frame = review.sample()
-                    playhead.set(f"Playhead {tc} | review frame {frame}")
-                except Exception as exc:
-                    error = str(exc)
-                    playhead.set(f"Resolve unavailable: {error}")
-                writer.writerow((wall, start, round((perf_counter() - start) * 1000, 3), tc, frame, error))
-                root.after(max(1, round(1000 / hz - (perf_counter() - start) * 1000)), poll)
+                    registration = ready.get_nowait()
+                except Empty:
+                    pass
+                else:
+                    if registration:
+                        status.set(f"Hotkey registration failed: {registration}")
+                try:
+                    presses.get_nowait()
+                except Empty:
+                    pass
+                else:
+                    capture()
+                if connected and not inflight and current >= next_poll and mode.get() != "Off":
+                    submit(mode.get())
+                root.after(10, tick)
 
-            root.after(0, key_poll)
-            root.after(0, poll)
+            submit("Connect")
+            root.after(0, tick)
             root.mainloop()
     finally:
         stopped.set()
-        listener.join(timeout=2)
+        jobs.put(None)
+        worker.join(0.3)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(1)

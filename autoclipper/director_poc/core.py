@@ -182,6 +182,15 @@ class Review:
         return timeline.GetMarkerByCustomData(key)
 
 
+def connect_review(result, manifest, out_inclusive):
+    from DaVinciResolveScript import scriptapp
+
+    resolve = scriptapp("Resolve")
+    if not resolve:
+        raise RuntimeError("Resolve unavailable. Verify Local scripting and SDK environment.")
+    return Review(resolve, result, manifest, out_inclusive=out_inclusive)
+
+
 class NoteStore:
     """One companion process per scratch directory."""
 

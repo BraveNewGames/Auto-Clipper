@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 import json
 from math import floor
 from pathlib import Path
@@ -13,7 +14,7 @@ from ..models import Review as Selection, Suggestion
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
 from ..resolve_manifest import _part_media, build_manifest
 from ..store import _write_json, load_session
-from .core import NoteStore, Review
+from .core import NoteStore, connect_review
 
 
 def read(path):
@@ -102,14 +103,10 @@ def main():
         print(f"Reopened {name} / {result['timeline']}")
         return
 
-    from DaVinciResolveScript import scriptapp
     from .window import run_window
 
-    resolve = scriptapp("Resolve")
-    if not resolve:
-        parser.error("Resolve API unavailable. Verify Local scripting and the SDK environment.")
-    review = Review(resolve, read(result_path), manifest, out_inclusive=not args.out_exclusive)
-    run_window(review, NoteStore(scratch / "notes.json"), scratch / "playhead.csv", args.hz, args.key)
+    connect = partial(connect_review, read(result_path), manifest, not args.out_exclusive)
+    run_window(connect, NoteStore(scratch / "notes.json"), scratch / "playhead.csv", args.hz, args.key)
 
 
 if __name__ == "__main__":
