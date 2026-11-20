@@ -2,7 +2,8 @@
 
 import argparse
 from collections import Counter
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fractions import Fraction
 import json
@@ -190,7 +191,21 @@ def _positive_duration(value):
     return duration if isfinite(duration) and duration > 0 else None
 
 
-def _part_media(folder, roots, pov, part, confirmations, fps):
+def _video_frames(stream, fps):
+    try:
+        count = int(stream["nb_frames"])
+    except (KeyError, TypeError, ValueError):
+        count = 0
+    if count > 0:
+        return count
+    try:
+        duration = Fraction(stream["duration_ts"]) * Fraction(stream["time_base"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        duration = Fraction(str(_positive_duration(stream.get("duration")) or 0))
+    return max(0, floor(duration * fps))
+
+
+def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=False):
     source = folder / part.video_path if part.video_path else None
     mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
     if not mp4 or mp4.suffix.lower() != ".mp4" or not mp4.is_file():
@@ -201,7 +216,8 @@ def _part_media(folder, roots, pov, part, confirmations, fps):
     if len(video) != 1:
         return None, part, "fps_mismatch", False
     duration = _positive_duration(video[0].get("duration"))
-    if duration is None:
+    frames = _video_frames(video[0], fps) if frame_count else None
+    if duration is None and not frames:
         return None, part, "duration_unverified", False
     source_part = replace(part, duration=duration, duration_source="ffprobe")
     if _rate(video[0]) != Fraction(str(fps)):
@@ -213,7 +229,10 @@ def _part_media(folder, roots, pov, part, confirmations, fps):
     mic, problem = _mic(metadata, streams, part.part_id, pov.name, confirmations)
     game = any(_normalized(track.get("speaker")).strip("[]") == "game audio"
                for track in _tracks(metadata))
-    return {"mp4_path": str(mp4.resolve()), "mic": mic}, source_part, problem, game
+    media = {"mp4_path": str(mp4.resolve()), "mic": mic}
+    if frame_count:
+        media["source_frame_count"] = frames
+    return media, source_part, problem, game
 
 
 def _selections(session, manifest):
@@ -279,7 +298,7 @@ def _angle(pov, part, media, placement, first_frame, last_frame, rate):
         "handle_after_frames": limit - source_out,
     }
 
-def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) -> dict:
+def _manifest_inputs(session, transcripts_dir, confirmations, fps):
     folder = Path(session.folder).resolve()
     roots = ([Path(transcripts_dir)] if transcripts_dir is not None else [])
     roots += [folder / "_Transcripts", folder.parent / "_Transcripts"]
@@ -300,6 +319,12 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
         "fps": fps, "created_at": datetime.now(timezone.utc).isoformat(),
         "blockers": [], "warnings": [], "segments": [],
     }
+    return folder, roots, confirmations, rate, manifest
+
+
+def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) -> dict:
+    folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
+    fps = manifest["fps"]
     selected, counts = _selections(session, manifest)
     if not selected:
         manifest["blockers"].append({"code": "no_selection", "part_id": None, "pov_name": None,
@@ -419,16 +444,251 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
     return manifest
 
 
+@dataclass(frozen=True)
+class _CoveredPart:
+    part_id: str
+    index: int
+    first: int
+    end: int
+    media: dict
+
+
+def _review_coverage(session, transcripts_dir, confirmations, fps):
+    folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
+    fps = manifest["fps"]
+    if type(fps) is not int:
+        raise ValueError("Director timelines require integer fps")
+    coverage = {pov.pov_id: [] for pov in session.povs}
+    first, end = 0, 0
+    game_identified = False
+    for pov, part in session.all_parts():
+        start = _record_frame(part.offset, 0, rate)
+        first = min(first, start)
+        media, _, problem, game = _part_media(folder, roots, pov, part, confirmations, fps,
+                                             frame_count=True)
+        estimated = _positive_duration(part.duration)
+        if estimated:
+            end = max(end, start + _record_frame(estimated, 0, rate))
+        if not problem and not media["source_frame_count"]:
+            problem = "duration_unverified"
+        if problem:
+            manifest["blockers"].append({"code": problem, "part_id": part.part_id, "pov_name": pov.name,
+                                         "message": _PROBLEMS[problem]})
+            continue
+        frames = media["source_frame_count"]
+        end = max(end, start + frames)
+        coverage[pov.pov_id].append(_CoveredPart(part.part_id, part.index, start, start + frames, media))
+        game_identified |= game
+        if conflict := media["mic"].get("metadata_conflict"):
+            manifest["warnings"].append({"code": "mic_metadata_conflict", "part_id": part.part_id,
+                                         "pov_name": pov.name, "message": conflict})
+    if not game_identified:
+        manifest["warnings"].append({"code": "game_audio_unidentified", "message": "Game audio not identified."})
+    return manifest, coverage, first, end
+
+
+def _coverage_spans(povs, coverage, first, end):
+    boundaries = {first, end}
+    for parts in coverage.values():
+        boundaries.update(frame for part in parts for frame in (part.first, part.end) if first < frame < end)
+    cuts = sorted(boundaries)
+    for left, right in zip(cuts, cuts[1:]):
+        angles, unavailable = [], []
+        for pov in povs:
+            parts = coverage[pov.pov_id]
+            active = [part for part in parts if part.first <= left and right <= part.end]
+            if len(active) == 1:
+                part, = active
+                angles.append({
+                    "pov_id": pov.pov_id, "pov_name": pov.name, "part_id": part.part_id,
+                    "part_index": part.index, **part.media,
+                    "source_in_frame": left - part.first, "source_out_frame": right - part.first,
+                    "handle_before_frames": left - part.first, "handle_after_frames": part.end - right,
+                })
+                continue
+            if active:
+                reason = "overlapping_parts"
+            elif any(part.end <= left for part in parts) and any(part.first >= right for part in parts):
+                reason = "recording_gap"
+            else:
+                reason = "no_coverage"
+            unavailable.append({"pov_id": pov.pov_id, "pov_name": pov.name, "reason": reason})
+        yield left, right, angles, unavailable
+
+
+def _frame_segment(fps, first, end, record, angles, unavailable, *, entry_id, title, kind, range_source):
+    return {
+        "event_id": entry_id, "suggestion_id": entry_id, "title": title,
+        "range_source": range_source, "kind": kind,
+        "session_start_frame": first, "session_end_frame": end,
+        "session_start": first / fps, "session_end": end / fps,
+        "record_start_frame": record, "duration_frames": end - first,
+        "angles": angles, "unavailable": unavailable,
+    }
+
+
+def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps=None):
+    """Build a frame-grid review without compressing interior gaps or trusting estimated tails."""
+    manifest, coverage, first, end = _review_coverage(session, transcripts_dir, confirmations, fps)
+    manifest.update(mode="director_review", requested_session_frames=[first, end])
+    spans = list(_coverage_spans(session.povs, coverage, first, end))
+    playable = [index for index, span in enumerate(spans) if span[2]]
+    if not playable:
+        manifest["blockers"].append({"code": "no_angles", "message": "Review has no usable coverage."})
+        return manifest
+
+    start_idx, end_idx = playable[0], playable[-1]
+    origin, last = spans[start_idx][0], spans[end_idx][1]
+    manifest["review_session_frames"] = [origin, last]
+    manifest["uncovered_edges"] = [
+        {"session_start_frame": left, "session_end_frame": right, "unavailable": unavailable}
+        for left, right, _, unavailable in spans[:start_idx] + spans[end_idx + 1:]
+    ]
+    if manifest["uncovered_edges"]:
+        manifest["warnings"].append({"code": "uncovered_edges",
+                                     "message": "Review clips to the first and last usable source frames."})
+
+    for number, (left, right, angles, unavailable) in enumerate(spans[start_idx:end_idx + 1], 1):
+        for missing in unavailable:
+            if missing["reason"] == "overlapping_parts":
+                manifest["warnings"].append({"code": "overlapping_parts", "pov_name": missing["pov_name"],
+                                             "message": f"Ambiguous coverage at session frames [{left}, {right})."})
+        segment = _frame_segment(manifest["fps"], left, right, left - origin, angles, unavailable,
+                                 entry_id="review", title="Full session review",
+                                 kind="media" if angles else "coverage_gap", range_source="session")
+        segment.update(segment_id=f"review-{number}", piece=number, pieces=end_idx - start_idx + 1)
+        manifest["segments"].append(segment)
+    return manifest
+
+
+def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None):
+    """Compile the assembler projection of an EditPlan, without importing Resolve.
+
+    The projection has plan_id, session_id, fps, revision_id, revision_history
+    and ordered entries. A source entry has session_in/session_out_exclusive and
+    optional pov_id/audio_pov_id. A placeholder has only provisional_frames and
+    a title for its timing. Both may carry candidate_ids and note_ids.
+    """
+    if plan["session_id"] != session.session_id:
+        raise ValueError("EditPlan belongs to another session")
+    if type(plan["fps"]) is not int or plan["fps"] <= 0:
+        raise ValueError("EditPlan requires a positive integer fps")
+    if not plan["entries"] or not isinstance(plan["revision_history"], (list, tuple)):
+        raise ValueError("EditPlan needs entries and a revision history")
+    if any(not isinstance(plan[key], str) or not plan[key].strip() for key in ("plan_id", "revision_id")):
+        raise ValueError("EditPlan needs plan and revision IDs")
+
+    pov_ids = {pov.pov_id for pov in session.povs}
+    entry_ids = set()
+    for entry in plan["entries"]:
+        entry_id, title = entry["entry_id"], entry["title"]
+        if not isinstance(entry_id, str) or not entry_id.strip() or entry_id in entry_ids:
+            raise ValueError("EditPlan entry IDs must be nonempty and unique")
+        entry_ids.add(entry_id)
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("Every EditPlan entry needs a title")
+        if entry["kind"] == "placeholder":
+            if (any(entry.get(key) is not None for key in (
+                    "session_in", "session_out_exclusive", "pov_id", "audio_pov_id"))
+                    or type(entry["provisional_frames"]) is not int or entry["provisional_frames"] <= 0):
+                raise ValueError("A placeholder needs provisional frames and no source range or POV")
+        elif entry["kind"] == "source":
+            first, end = entry["session_in"], entry["session_out_exclusive"]
+            if type(first) is not int or type(end) is not int or first >= end:
+                raise ValueError("A source entry needs a nonempty session-frame range")
+            if any(entry.get(key) is not None and entry[key] not in pov_ids for key in ("pov_id", "audio_pov_id")):
+                raise ValueError("EditPlan references an unknown POV")
+        else:
+            raise ValueError("Expected a source or placeholder entry")
+        for key in ("candidate_ids", "note_ids"):
+            refs = entry.get(key, ())
+            if not isinstance(refs, (tuple, list)) or any(not isinstance(ref, str) or not ref for ref in refs):
+                raise ValueError(f"Expected IDs in {key}")
+
+    manifest, coverage, _, _ = _review_coverage(session, transcripts_dir, confirmations, plan["fps"])
+    manifest.update(mode="director_edit_plan", edit_plan={
+        "plan_id": plan["plan_id"], "revision_id": plan["revision_id"],
+        "revision_history": deepcopy(list(plan["revision_history"])),
+    })
+    record = 0
+    for entry in plan["entries"]:
+        entry_id, title = entry["entry_id"], entry["title"]
+        provenance = {key: list(entry.get(key, ())) for key in ("candidate_ids", "note_ids")}
+        pov, audio_pov = entry.get("pov_id"), entry.get("audio_pov_id")
+        if entry["kind"] == "placeholder":
+            spans = [(0, entry["provisional_frames"], [], [])]
+        else:
+            spans = list(_coverage_spans(session.povs, coverage, entry["session_in"],
+                                         entry["session_out_exclusive"]))
+        for number, (first, end, available, missing) in enumerate(spans, 1):
+            angles = [angle for angle in available if pov is None or angle["pov_id"] == pov]
+            audio = next((angle for angle in available if angle["pov_id"] == audio_pov), None)
+            if angles and (audio_pov is None or audio is not None):
+                segment = _frame_segment(plan["fps"], first, end, record, angles, missing, entry_id=entry_id,
+                                         title=title, kind="media", range_source="edit_plan")
+                if audio is not None:
+                    segment["audio_angle"] = audio
+            else:
+                cause = "planned_missing_beat" if entry["kind"] == "placeholder" else "source_unavailable"
+                segment = {
+                    "event_id": entry_id, "suggestion_id": entry_id, "title": title, "range_source": "edit_plan",
+                    "kind": "placeholder", "placeholder_reason": cause, "record_start_frame": record,
+                    "duration_source": "provisional" if cause == "planned_missing_beat" else "requested_range",
+                    "duration_frames": end - first, "angles": [], "unavailable": missing,
+                }
+                if cause == "source_unavailable":
+                    manifest["warnings"].append({"code": cause, "event_id": entry_id,
+                                                 "message": "Requested video or microphone coverage is unavailable."})
+            segment.update(segment_id=f"{len(manifest['segments']) + 1:03d}", piece=number,
+                           pieces=len(spans), requested_pov_id=pov, requested_audio_pov_id=audio_pov, **provenance)
+            manifest["segments"].append(segment)
+            record += end - first
+    return manifest
+
+
+def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
+                          transcripts_dir=None, confirmations=None):
+    """Project one current FKB EditPlan into the offline assembler.
+
+    FKB entries use `frames: {"start": ..., "end": ...}` for source ranges.
+    A placeholder leaves `frames` absent and supplies `provisional_frames`.
+    """
+    if knowledge_base.mapping_stale:
+        raise ValueError("Refresh stale FKB source mapping before compiling an edit")
+    plans = [plan for plan in knowledge_base.edit_plans if plan.plan_id == plan_id]
+    if len(plans) != 1:
+        raise ValueError("Expected one FKB edit plan with the requested ID")
+    plan, = plans
+    entries = []
+    for entry in plan.entries:
+        if any(key in entry for key in ("session_in", "session_out_exclusive")):
+            raise ValueError("FKB entries use frames.start and frames.end")
+        projected = dict(entry)
+        frames = projected.pop("frames", None)
+        if frames is not None:
+            projected["session_in"], projected["session_out_exclusive"] = frames["start"], frames["end"]
+        entries.append(projected)
+    projection = {
+        "plan_id": plan.plan_id, "session_id": knowledge_base.session.session_id,
+        "fps": knowledge_base.session.fps, "revision_id": revision_id,
+        "revision_history": plan.revisions, "entries": entries,
+    }
+    return compile_edit_plan(session, projection, transcripts_dir, confirmations)
+
+
 def render_report(manifest) -> str:
     def cell(value):
         return str(value).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
     segments = manifest["segments"]
     selected = {segment["suggestion_id"] for segment in segments}
+    label = {"director_review": "Full-session review", "director_edit_plan": "Director edit plan"}.get(
+        manifest.get("mode"), f"{len(selected)} timed Keep selections")
+    summary = f"{label}, {len(segments)} segments, {manifest['fps']} fps."
     lines = [
         "# Resolve timeline manifest",
         "",
-        f"{len(selected)} timed Keep selections, {len(segments)} segments, {manifest['fps']} fps.",
+        summary,
         "",
         "Multicam audio uses Resolve Source mode with one switchable owner-mic pair.",
         "",
@@ -441,8 +701,9 @@ def render_report(manifest) -> str:
             f"expected ch {', '.join(map(str, angle['mic']['resolve_channels']))})" for angle in segment["angles"]
         )
         missing = ", ".join(f"{pov['pov_name']} ({pov['reason']})" for pov in segment["unavailable"])
-        row = (segment["segment_id"], f"{segment['title']} ({segment['range_source']})",
-               f"{segment['session_start']:.3f}–{segment['session_end']:.3f}",
+        session_span = (f"{segment['session_start']:.3f}–{segment['session_end']:.3f}"
+                        if "session_start" in segment else "Placeholder")
+        row = (segment["segment_id"], f"{segment['title']} ({segment['range_source']})", session_span,
                segment["record_start_frame"], segment["duration_frames"], angles or "—", missing or "—")
         lines.append("| " + " | ".join(map(cell, row)) + " |")
     for heading in ("blockers", "warnings"):
@@ -462,6 +723,7 @@ def main(argv=None):
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--full-session", action="store_true", help="Plan a coverage-aware Director review")
     parser.add_argument("--confirm-mic", action="append", nargs=3, metavar=("PART_ID", "TRACK", "SPEAKER"))
     args = parser.parse_args(argv)
     try:
@@ -478,7 +740,8 @@ def main(argv=None):
                        or item.get("transcriber_track") != track]
             rows.append({"part_id": part_id, "transcriber_track": track, "speaker": speaker,
                          "confirmed_by": "owner", "confirmed_at": datetime.now(timezone.utc).isoformat()})
-        manifest = build_manifest(session, args.transcripts, confirmations)
+        plan = build_review_manifest if args.full_session else build_manifest
+        manifest = plan(session, args.transcripts, confirmations)
         report = render_report(manifest)
         if not args.dry_run:
             out = args.out or (Path(session.folder) / "autoclipper_exports" / "resolve"

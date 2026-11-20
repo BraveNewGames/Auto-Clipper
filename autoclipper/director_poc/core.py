@@ -53,7 +53,9 @@ class Clock:
 
     def intervals(self, segment):
         record = segment["record_start_frame"]
-        session = floor(Fraction(str(segment["session_start"])) * self.fps + Fraction(1, 2))
+        session = segment.get("session_start_frame")
+        if session is None:
+            session = floor(Fraction(str(segment["session_start"])) * self.fps + Fraction(1, 2))
         return record, session, segment["duration_frames"]
 
     def session_range(self, first, end):
