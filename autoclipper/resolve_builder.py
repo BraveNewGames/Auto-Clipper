@@ -12,6 +12,7 @@ from .resolve_stage1 import append_clip, isolate_mic, read_item, require
 
 
 EXPORT_PREFIX = "AutoClipper Export "
+TEST_PROJECT_PREFIX = "AutoClipper Stage2 Test "
 START_TIMECODE = "01:00:00:00"
 
 
@@ -56,12 +57,19 @@ def validate_manifest(manifest):
                 raise ValueError("Each angle must cover the whole segment in source frames")
             mic = angle["mic"]
             track = mic["transcriber_track"]
+            expected_track = mic.get("expected_owner_track", track)
+            ordinal = mic.get("mp4_audio_ordinal", track)
+            title = mic.get("mp4_audio_title")
             channels = mic["resolve_channels"]
             if (mic["status"] not in ("verified", "owner_confirmed") or type(track) is not int
-                    or track <= 0 or len(channels) != 2
+                    or track <= 0 or type(expected_track) is not int or expected_track != track
+                    or type(ordinal) is not int or ordinal <= 0
+                    or mic.get("mp4_audio_channels", 2) != 2
+                    or mic.get("resolve_channels_status", "expected") != "expected"
+                    or (title is not None and not isinstance(title, str)) or len(channels) != 2
                     or any(type(ch) is not int or ch <= 0 for ch in channels) or channels[0] == channels[1]):
                 raise ValueError(f"Unverified stereo mic for {name}")
-            binding = (pov, name, track, tuple(channels))
+            binding = (pov, name, expected_track, ordinal, title, tuple(channels))
             if media.setdefault(path, binding) != binding:
                 raise ValueError(f"Conflicting POV or mic mappings for {path}")
     return media
@@ -80,7 +88,7 @@ def create_export_project(manager, name):
     current = manager.GetCurrentProject()
     active_name = current.GetName() if current else ""
     owned = any(active_name.startswith(prefix) and active_name[len(prefix):].strip()
-                for prefix in (EXPORT_PREFIX, "AutoClipper Stage1 "))
+                for prefix in (EXPORT_PREFIX, TEST_PROJECT_PREFIX, "AutoClipper Stage1 "))
     require(not current or active_name == "Untitled Project" or owned,
             "Save and close the active owner project before starting a Resolve export")
     if active_name == "Untitled Project":
@@ -108,7 +116,7 @@ def stereo_channels(mapping):
 
 def import_sources(pool, media, fps):
     clips = {}
-    for path, (_, name, track, channels) in media.items():
+    for path, (_, name, track, ordinal, title, channels) in media.items():
         items = pool.ImportMedia([str(path)])
         require(items and len(items) == 1, f"Expected one imported clip for {path}")
         clip = items[0]
@@ -118,18 +126,24 @@ def import_sources(pool, media, fps):
         inventory = audio["track_mapping"]
         matching = [key for key, entry in inventory.items()
                     if set(entry.get("channel_idx", [])) == set(channels)]
-        key = str(track)
+        key = str(ordinal)
         entry = inventory.get(key, {})
-        labels = [re.fullmatch(r"track\s*0*(\d+)", str(entry.get(field, "")).strip(), re.I)
-                  for field in ("name", "title", "track_name")]
+        labels = {str(entry[field]).strip().casefold() for field in ("name", "title", "track_name")
+                  if entry.get(field)}
+        track_labels = [re.fullmatch(r"track\s*0*(\d+)", label, re.I) for label in labels]
+        title_conflicts = title and any(
+            label != title.strip().casefold() and label not in {name.casefold(), f"track{track}", "soundhandler"}
+            for label in labels
+        )
         embedded = audio.get("embedded_audio_channels", max(channels))
         require(matching == [key] and entry.get("channel_idx") == list(channels)
                 and entry.get("type") == "stereo" and embedded >= max(channels)
                 and not audio.get("linked_audio")
-                and all(label is None or int(label[1]) == track for label in labels),
+                and not title_conflicts and all(label is None or int(label[1]) == track for label in track_labels),
                 f"Owner mic mismatch or ambiguity for {name} ({path}): "
-                f"expected Resolve track {track} to uniquely map to embedded channels {list(channels)}")
-        isolate_mic(clip, track, list(channels))
+                f"expected Resolve track {track} at inventory position {ordinal} "
+                f"to uniquely map to embedded channels {list(channels)}")
+        isolate_mic(clip, ordinal, list(channels))
         require(clip.SetName(name) and clip.GetName() == name, f"Could not set source clip name to {name}")
         clips[path] = clip
     return clips
@@ -252,9 +266,11 @@ def read_export(timeline, segments, names):
     return rows
 
 
-def build_export(manifest, *, dry_run=False):
+def build_export(manifest, *, dry_run=False, project_name=None):
     """Return the plan or a structured readback of the saved and reopened export."""
     media = validate_manifest(manifest)
+    if project_name is not None and not re.fullmatch(r"AutoClipper Stage2 Test \d{8}-\d{6}", project_name):
+        raise ValueError("Explicit project name must be AutoClipper Stage2 Test YYYYMMDD-HHMMSS")
     warnings = list(manifest["warnings"]) + [
         {"code": "short_segment", "event_id": segment["event_id"], "segment_id": segment["segment_id"],
          "message": f"Short multicam segment ({segment['duration_frames']} frames)."}
@@ -271,7 +287,7 @@ def build_export(manifest, *, dry_run=False):
     resolve = require(DaVinciResolveScript.scriptapp("Resolve"), "Resolve is unavailable")
     manager = require(resolve.GetProjectManager(), "Resolve project manager is unavailable")
     session = manifest["session_id"]
-    name = f"{EXPORT_PREFIX}{session} {datetime.now():%Y%m%d-%H%M%S}"
+    name = project_name or f"{EXPORT_PREFIX}{session} {datetime.now():%Y%m%d-%H%M%S}"
     project = create_export_project(manager, name)
     fps = manifest["fps"]
     require(project.SetSettings({"timelineFrameRate": str(fps)}), "Could not set export frame rate")
@@ -303,7 +319,7 @@ def build_export(manifest, *, dry_run=False):
         if path and Path(path).resolve() in media:
             key = Path(path).resolve()
             require(key not in persisted and key.is_file(), f"Unexpected duplicate or offline source: {key}")
-            _, pov_name, _, channels = media[key]
+            _, pov_name, _, _, _, channels = media[key]
             status = clip.GetClipProperty("Online Status")
             require(clip.GetName() == pov_name and "offline" not in str(status).casefold(),
                     f"Reopened media name or online status differs for {key}")
@@ -327,6 +343,7 @@ def build_export(manifest, *, dry_run=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
+    parser.add_argument("--project", help="Optional AutoClipper Stage2 Test YYYYMMDD-HHMMSS project name")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan without contacting Resolve")
     mode.add_argument("--execute", action="store_true",
@@ -334,7 +351,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        print(json.dumps(build_export(manifest, dry_run=args.dry_run), indent=2))
+        print(json.dumps(build_export(manifest, dry_run=args.dry_run, project_name=args.project), indent=2))
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(1, f"Resolve export stopped: {exc}\n")
 

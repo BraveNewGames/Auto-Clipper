@@ -264,13 +264,13 @@ class ResolveBuilderTests(unittest.TestCase):
                 (root / f"{name}.mp4").touch()
             with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
                   patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
-                report = build_export(manifest)
+                report = build_export(manifest, project_name="AutoClipper Stage2 Test 20260101-000000")
             self.assertTrue(report["reopened"])
             self.assertIs(state["current"], reopened)
             manager.SaveProject.assert_called_once_with()
             manager.CloseProject.assert_called_once_with(project)
             manager.LoadProject.assert_called_once_with(report["project"])
-            self.assertRegex(report["project"], r"^AutoClipper Export synthetic-session \d{8}-\d{6}$")
+            self.assertEqual(report["project"], "AutoClipper Stage2 Test 20260101-000000")
             self.assertEqual([row["record_start_frame"] for row in report["segments"]],
                              [216000, 216060, 216066, 216126])
             self.assertEqual([row["suggestion_id"] for row in report["segments"]],
@@ -307,8 +307,23 @@ class ResolveBuilderTests(unittest.TestCase):
             with self.subTest(inventory=inventory):
                 clip.GetAudioMapping.return_value = json.dumps({"track_mapping": inventory})
                 with self.assertRaisesRegex(RuntimeError, "expected Resolve track 2"):
-                    import_sources(pool, {path: ("pov", "Player", 2, (3, 4))}, 60)
+                    import_sources(pool, {path: ("pov", "Player", 2, 2, "Track2", (3, 4))}, 60)
         clip.SetAudioMapping.assert_not_called()
+
+    def test_mic_inventory_uses_mp4_ordinal_and_checks_owner_track_title(self):
+        pool = Mock()
+        path = Path("source.mp4").resolve()
+        clip = Mock()
+        pool.ImportMedia.return_value = [clip]
+        clip.GetClipProperty.side_effect = {"File Path": str(path), "FPS": "60"}.__getitem__
+        clip.GetName.return_value = "Player"
+        track = {"type": "stereo", "channel_idx": [3, 4], "mute": False, "title": "Track4"}
+        original = {"track_mapping": {"2": track}}
+        remapped = {"track_mapping": {"1": track}}
+        clip.GetAudioMapping.side_effect = list(map(json.dumps, (original, original, remapped)))
+        self.assertEqual(import_sources(pool, {path: ("pov", "Player", 4, 2, "Track4", (3, 4))}, 60),
+                         {path: clip})
+        self.assertEqual(json.loads(clip.SetAudioMapping.call_args.args[0]), remapped)
 
     def test_multicam_creation_failure_restores_marks(self):
         sdk, manager, state, project, _ = fake_resolve()
