@@ -145,15 +145,31 @@ def _mic(metadata, streams, part_id, speaker, confirmations):
     audio = sorted((stream for stream in streams if stream.get("codec_type") == "audio"),
                    key=lambda stream: stream["index"])
     mapping = _audio_mapping(audio, track)
+    conflict = None
+    if mapping is None and confirmed_tracks and set(track) - {"track"}:
+        # The owner's listening confirmation is authoritative: when the transcriber's
+        # index/title for the confirmed track contradicts the MP4, map the confirmed number
+        # against the MP4's own audio inventory only (a stream titled Track<N>).
+        mapping = _audio_mapping(audio, {"track": track["track"]})
+        if mapping is not None:
+            inventory = ", ".join(
+                f"#{stream['index']} {(stream.get('tags') or {}).get('title') or '(untitled)'}" for stream in audio)
+            conflict = (f"Metadata said track {track['track']} is stream index {track.get('index')} titled "
+                        f"{track.get('title')!r}; the MP4 has audio streams {inventory}; owner confirmed track "
+                        f"{track['track']} (MP4 stream #{mapping['mp4_audio_stream_index']}).")
     if mapping is None:
         return None, "mic_unmapped"
-    return {
+    mic = {
         "status": "owner_confirmed" if confirmed_tracks else "verified",
         "transcriber_track": track["track"], "speaker": speaker,
         **mapping,
         "evidence": ("owner confirmation + MP4 probe" if confirmed_tracks
                      else "transcriber recorder attribution + MP4 probe"),
-    }, None
+    }
+    if conflict:
+        mic["metadata_conflict"] = conflict
+        mic["evidence"] += " (overrides conflicting transcriber metadata)"
+    return mic, None
 
 def _rate(stream):
     for key in ("r_frame_rate", "avg_frame_rate"):
@@ -359,6 +375,13 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
                                        first_frame, last_frame, rate)
                         if angle is not None:
                             angles.append(angle)
+                            conflict = angle["mic"].get("metadata_conflict")
+                            if conflict and ("mic_metadata_conflict", part_id) not in reported:
+                                reported.add(("mic_metadata_conflict", part_id))
+                                manifest["warnings"].append({
+                                    "code": "mic_metadata_conflict", "pov_name": pov.name,
+                                    "part_id": part_id, "message": conflict,
+                                })
                             continue
                         problem = "source_frame_range"
                     block(problem, pov, part_id)

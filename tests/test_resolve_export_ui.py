@@ -25,10 +25,10 @@ INVENTORY = [
 ]
 
 
-def _metadata(name, inferred=False, track=2):
+def _metadata(name, inferred=False, track=2, index=None):
     data = {
         "speaker_tracks": [{"track": track, "speaker": name, "speaker_template": "{Recorder}",
-                            "index": track, "title": f"Track{track}"}],
+                            "index": track if index is None else index, "title": f"Track{track}"}],
         "recorder": {"name": name, "source": "filename", "tracks": [track]},
     }
     if inferred:
@@ -73,7 +73,7 @@ class ResolveApiCase(unittest.TestCase):
         self.assertEqual(status, expect, payload[:800])
         return json.loads(payload.decode("utf-8"))
 
-    def make_session(self, inferred_beta=False, beta_track=2):
+    def make_session(self, inferred_beta=False, beta_track=2, beta_index=None):
         folder = self.tmp / "session"
         session = Session(session_id="synthetic-ui", folder=str(folder), povs=[
             POV("alpha", "Alpha", [Part("alpha-p1", 1, "alpha1.mkv", duration=20, offset=0)]),
@@ -85,7 +85,8 @@ class ResolveApiCase(unittest.TestCase):
             dest = folder.parent / "_Transcripts" / stem
             dest.mkdir(parents=True)
             (dest / f"{stem}.json").write_text(
-                json.dumps(_metadata(name, inferred, beta_track if name == "Beta" else 2)), encoding="utf-8")
+                json.dumps(_metadata(name, inferred, beta_track if name == "Beta" else 2,
+                                     beta_index if name == "Beta" else None)), encoding="utf-8")
         for sid, first, last in (("one", 1, 3), ("two", 5, 6), ("three", 8, 10)):
             session.suggestions.append(Suggestion(sid, "synthetic", event_id=f"EV-{sid}", title=f"Moment {sid}",
                                                   start=first, end=last))
@@ -337,6 +338,46 @@ class TestMicChoices(ResolveApiCase):
         self.assertEqual([(r["part_id"], r["transcriber_track"]) for r in data["confirmations"]], [("beta-p1", 2)])
         beta = {m["part_id"]: m for m in self.call("/api/resolve/preview")["mics"]}["beta-p1"]
         self.assertEqual((beta["transcriber_track"], beta["resolve_channels"]), (2, [3, 4]))
+
+
+class TestMicMetadataConflict(ResolveApiCase):
+    def test_owner_confirmation_overrides_conflicting_metadata_with_a_warning(self):
+        # Metadata says Beta's track 2 is stream index 7; the MP4 has Track2 at index 2.
+        folder = self.make_session(beta_index=7)
+        preview = self.call("/api/resolve/preview")
+        self.assertEqual({(b["code"], b["part_id"]) for b in preview["manifest"]["blockers"]},
+                         {("mic_unmapped", "beta-p1")})  # fail closed without a confirmation
+        self.assertNotIn("mic_metadata_conflict", {w["code"] for w in preview["manifest"]["warnings"]})
+        beta = {m["part_id"]: m for m in preview["mics"]}["beta-p1"]
+        self.assertEqual((beta["expected_track"], beta["default_track"]), (2, 2))
+        self.assertEqual([(o["track"], o["mp4_audio_stream_index"]) for o in beta["options"]], [(1, 1), (2, 2)])
+
+        refused = self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 5}, expect=400)
+        self.assertIn("Track 5 is not an audio track", refused["error"])
+        self.assertFalse((folder / ".autoclipper" / "mic_confirmations.json").exists())
+
+        self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 2})
+        preview = self.call("/api/resolve/preview")
+        manifest = preview["manifest"]
+        self.assertEqual(manifest["blockers"], [])
+        conflict, = [w for w in manifest["warnings"] if w["code"] == "mic_metadata_conflict"]
+        self.assertEqual((conflict["pov_name"], conflict["part_id"]), ("Beta", "beta-p1"))
+        self.assertIn("stream index 7", conflict["message"])
+        self.assertIn("owner confirmed track 2 (MP4 stream #2)", conflict["message"])
+        self.assertIn("mic_metadata_conflict", preview["report"])
+        mic = next(a["mic"] for s in manifest["segments"] for a in s["angles"] if a["part_id"] == "beta-p1")
+        self.assertEqual((mic["status"], mic["transcriber_track"], mic["mp4_audio_stream_index"],
+                          mic["resolve_channels"]), ("owner_confirmed", 2, 2, [3, 4]))
+        alpha = next(a["mic"] for s in manifest["segments"] for a in s["angles"] if a["part_id"] == "alpha-p1")
+        self.assertEqual(alpha["status"], "verified")
+        self.assertNotIn("metadata_conflict", alpha)
+
+    def test_confirmation_without_conflict_keeps_metadata_mapping(self):
+        self.make_session(inferred_beta=True)
+        self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 2})
+        manifest = self.call("/api/resolve/preview")["manifest"]
+        self.assertEqual(manifest["blockers"], [])
+        self.assertNotIn("mic_metadata_conflict", {w["code"] for w in manifest["warnings"]})
 
 
 class TestResolveLocking(ResolveApiCase):

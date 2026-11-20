@@ -83,8 +83,10 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
    list (it only offers the MP4's real audio tracks, marking the one the metadata expects), tick
    **I listened**, then **Confirm mic**. Use **Change…** to correct a wrong pick; the new choice
    replaces the old one for that part. This writes only
-   `<session folder>\.autoclipper\mic_confirmations.json`. If the metadata names a track the MP4
-   cannot supply under that number, that track cannot be confirmed from the UI.
+   `<session folder>\.autoclipper\mic_confirmations.json`. Your confirmation wins over the
+   metadata: if the metadata's stream index or title for the confirmed track contradicts the MP4,
+   the track is matched to the MP4's `Track<N>` stream and the report shows a
+   `mic_metadata_conflict` warning.
 3. **Export to Resolve** (enabled only with no blockers) writes `manifest.json` and `report.md`
    to `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\`, then creates the new
    project **AutoClipper Export `<session id>` `<timestamp>`**, saves it, reopens it to verify it,
