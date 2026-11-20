@@ -89,21 +89,35 @@ def verify_item(item, source_in, source_out, record_in, *, verify_source_end=Tru
     return row
 
 
-def append_video(pool, clip, first, last, record, track):
+def append_clip(pool, clip, first, last, record, track, *, with_audio=False):
     # Resolve 21.2.0.6 treated the append endpoint as exclusive.
-    items = pool.AppendToTimeline([{
+    info = {
         "mediaPoolItem": clip,
         "startFrame": first,
         "endFrame": last,
         "recordFrame": record,
         "trackIndex": track,
-        "mediaType": 1,
-    }])
-    require(items and len(items) == 1, "Resolve did not append exactly one video item")
-    return items[0]
+    }
+    if not with_audio:
+        info["mediaType"] = 1
+    require(pool.AppendToTimeline([info]), "Resolve did not append the clip")
 
 
-def assemble(project_name, inputs, fps, stacked):
+def isolate_mic(clip, track, channels):
+    mapping = json.loads(clip.GetAudioMapping())
+    source = mapping["track_mapping"].get(str(track))
+    require(
+        source and source["type"] == "stereo" and source["channel_idx"] == channels,
+        "Requested mic track and channels do not match the imported source",
+    )
+    mapping["track_mapping"] = {"1": {**source, "mute": False}}
+    require(clip.SetAudioMapping(json.dumps(mapping)), "Resolve refused the mic mapping")
+    readback = json.loads(clip.GetAudioMapping())
+    require(readback == mapping, "Mic mapping readback differs from the requested mapping")
+    return readback
+
+
+def assemble(project_name, inputs, fps, stacked, mics=None):
     # This module is only imported after CLI preflight and outside dry-run.
     import DaVinciResolveScript
 
@@ -140,11 +154,14 @@ def assemble(project_name, inputs, fps, stacked):
         require(Path(clip.GetClipProperty("File Path")).resolve() == path, "Imported path differs")
         require(Fraction(clip.GetClipProperty("FPS")) == fps, "Imported source rate differs")
         require(int(clip.GetClipProperty("Frames")) >= placement.source_out, "MP4 range out of bounds")
+        audio_mapping = (
+            isolate_mic(clip, *mics[placement.part_id]) if mics else json.loads(clip.GetAudioMapping())
+        )
         print(json.dumps({
             "part_id": placement.part_id,
             "path": str(path),
             "start_tc": clip.GetClipProperty("Start TC"),
-            "audio_mapping": clip.GetAudioMapping(),
+            "audio_mapping": audio_mapping,
         }))
         clips.append(clip)
 
@@ -152,8 +169,10 @@ def assemble(project_name, inputs, fps, stacked):
         while timeline.GetTrackCount("video") < len(clips):
             require(timeline.AddTrack("video"), "Could not add a video track")
         for track, ((placement, path), clip) in enumerate(zip(inputs, clips), 1):
-            item = append_video(pool, clip, placement.source_in, placement.source_out, record, track)
-            row = verify_item(item, placement.source_in, placement.source_out, record)
+            append_clip(pool, clip, placement.source_in, placement.source_out, record, track)
+            items = timeline.GetItemListInTrack("video", track)
+            require(items and len(items) == 1, "Expected one item on the stacked video track")
+            row = verify_item(items[0], placement.source_in, placement.source_out, record)
             require(Path(row["path"]).resolve() == path, "Stacked item references unexpected media")
     else:
         for (placement, _), clip in zip(inputs, clips):
@@ -161,20 +180,22 @@ def assemble(project_name, inputs, fps, stacked):
                 clip.SetMarkInOut(placement.source_in, placement.source_out - 1),
                 "Could not set angle In/Out marks",
             )
-            marks = clip.GetMarkInOut()["video"]
-            print(json.dumps({"part_id": placement.part_id, "video_marks": marks}))
-            require(
-                marks["in"] == placement.source_in and marks["out"] == placement.source_out - 1,
-                "Angle source marks differ from the plan",
-            )
-        multicam = pool.CreateMulticamClip(clips, {
+            marks = clip.GetMarkInOut()
+            print(json.dumps({"part_id": placement.part_id, "source_marks": marks}))
+            expected = {"in": placement.source_in, "out": placement.source_out - 1}
+            for kind in ("video", "audio") if mics else ("video",):
+                require(marks.get(kind) == expected, f"Angle {kind} marks differ from the plan")
+        options = {
             "name": "Stage 1 Angles",
             "startTimecode": "01:00:00:00",
             "frameRate": fps,
             "angleSyncMode": resolve.MULTICAM_ANGLE_SYNC_IN,
             "useFullClipExtents": False,
             "createBinForSourceClips": False,
-        })
+        }
+        if mics:
+            options["multicamAudioMode"] = resolve.MULTICAM_AUDIO_SOURCE
+        multicam = pool.CreateMulticamClip(clips, options)
         require(multicam and len(multicam) == 1, "Resolve did not create one multicam clip")
         require(
             multicam[0].GetClipProperty("Type") == "Multicam",
@@ -182,15 +203,28 @@ def assemble(project_name, inputs, fps, stacked):
         )
         require(project.SetCurrentTimeline(timeline), "Could not reactivate scratch timeline")
         length = inputs[0][0].record_out
-        item = append_video(pool, multicam[0], 0, length, record, 1)
+        append_clip(pool, multicam[0], 0, length, record, 1, with_audio=bool(mics))
         require(int(multicam[0].GetClipProperty("Frames")) == length, "Multicam media length differs")
         # The composite source-end getter returned 1918 for a 1920-frame
         # full-length edit. Check parent record bounds and media length instead.
-        verify_item(item, 0, length, record, verify_source_end=False)
-        require(
-            item.GetMediaPoolItem().GetUniqueId() == multicam[0].GetUniqueId(),
-            "Parent edit references unexpected multicam media",
-        )
+        for kind in ("video", "audio") if mics else ("video",):
+            items = timeline.GetItemListInTrack(kind, 1)
+            require(items and len(items) == 1, f"Expected one multicam parent {kind} item")
+            item = items[0]
+            verify_item(item, 0, length, record, verify_source_end=False)
+            require(
+                item.GetMediaPoolItem().GetUniqueId() == multicam[0].GetUniqueId(),
+                "Parent edit references unexpected multicam media",
+            )
+            if kind == "audio":
+                mapping = json.loads(item.GetSourceAudioChannelMapping())
+                print(json.dumps({"parent_audio_mapping": mapping}))
+                tracks = list(mapping["track_mapping"].values())
+                require(
+                    len(tracks) == 1 and tracks[0]["type"] == "stereo" and not tracks[0]["mute"]
+                    and len(tracks[0]["channel_idx"]) == 2,
+                    "Expected one unmuted stereo output on the multicam parent",
+                )
 
         # Read the underlying angle's actual source trims, not only the parent edit.
         angles = multicam[0].GetTimeline()
@@ -220,6 +254,8 @@ def main(argv=None):
     parser.add_argument("end", type=float, help="Event end in session seconds")
     parser.add_argument("--fps", type=int, required=True, help="Common integer source/timeline fps")
     parser.add_argument("--source", nargs=2, action="append", required=True, metavar=("PART_ID", "MP4"))
+    parser.add_argument("--mic", nargs=3, action="append", metavar=("PART_ID", "TRACK", "CHANNELS"),
+                        help="Native audio: one entry per source, with comma-separated embedded channels")
     parser.add_argument("--project", help="Unused project name beginning with AutoClipper Stage1 ")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan without opening Resolve")
@@ -231,6 +267,16 @@ def main(argv=None):
         if len(args.source) != 2 or len({key for key, _ in args.source}) != 2:
             raise ValueError("Supply two distinct part IDs with --source")
         ids = {key for key, _ in args.source}
+        mics = {}
+        if args.mic:
+            if args.stacked or len(args.mic) != 2 or {row[0] for row in args.mic} != ids:
+                raise ValueError("Supply one --mic entry per source for native multicam")
+            for part_id, raw_track, raw_channels in args.mic:
+                track = int(raw_track)
+                channels = [int(channel) for channel in raw_channels.split(",")]
+                if track <= 0 or len(channels) != 2 or len(set(channels)) != 2 or min(channels) <= 0:
+                    raise ValueError("Expected a positive track and two distinct positive stereo channels")
+                mics[part_id] = (track, channels)
         session = replace(session, povs=[
             replace(pov, parts=[part for part in pov.parts if part.part_id in ids])
             for pov in session.povs
@@ -261,13 +307,18 @@ def main(argv=None):
             "fps": args.fps,
             "session_range": [args.start, args.end],
             "mode": "stacked" if args.stacked else "multicam",
-            "placements": [{**asdict(p), "mp4": str(path)} for p, path in inputs],
+            "placements": [
+                {**asdict(p), "mp4": str(path), **(
+                    {"mic": {"track": mics[p.part_id][0], "channels": mics[p.part_id][1]}} if mics else {}
+                )}
+                for p, path in inputs
+            ],
         }, indent=2))
         if args.execute:
             prefix = "AutoClipper Stage1 "
             if not args.project or not args.project.startswith(prefix) or not args.project[len(prefix):].strip():
                 raise ValueError(f"Use a fresh --project name beginning with {prefix!r}")
-            assemble(args.project, inputs, args.fps, args.stacked)
+            assemble(args.project, inputs, args.fps, args.stacked, mics)
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         parser.exit(1, f"Stage 1 stopped: {exc}\n")
 
