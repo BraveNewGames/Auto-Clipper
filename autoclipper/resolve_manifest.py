@@ -1,4 +1,4 @@
-﻿"""Build offline Resolve multicam manifests from reviewed selections."""
+"""Build offline Resolve multicam manifests from reviewed selections."""
 
 import argparse
 from collections import Counter
@@ -30,40 +30,60 @@ def _metadata(roots, stems):
         for stem in stems:
             for path in (root / stem / f"{stem}.json", root / f"{stem}.json"):
                 if path.is_file():
-                    return _read_json(path)
+                    try:
+                        data = _read_json(path)
+                    except (OSError, ValueError):
+                        return {}
+                    return data if isinstance(data, dict) else {}
     return {}
 
 
+def _track_number(value):
+    return type(value) is int and value > 0
+
+
 def _tracks(metadata):
-    tracks = metadata.get("speaker_tracks") or {}
+    tracks = metadata.get("speaker_tracks")
     if isinstance(tracks, list):
-        return [item for item in tracks if isinstance(item.get("track"), int)]
-    return [
-        {"track": int(match[1]), "speaker": speaker}
-        for label, speaker in tracks.items()
-        if (match := re.fullmatch(r"audio_track_(\d+)", label))
-    ]
+        return [item for item in tracks if isinstance(item, dict) and _track_number(item.get("track"))]
+    if isinstance(tracks, dict):
+        return [
+            {"track": int(match[1]), "speaker": speaker}
+            for label, speaker in tracks.items()
+            if (match := re.fullmatch(r"audio_track_([1-9][0-9]*)", label))
+        ]
+    return []
 
 
 def _normalized(value):
-    return str(value or "").strip().casefold()
+    return value.strip().casefold() if isinstance(value, str) else ""
 
 
-def _inferred(metadata, track, speaker):
-    # The latest relabel of this track determines provenance.
-    for entry in reversed(metadata.get("relabel_history") or []):
-        changes = entry.get("changes") or []
-        if not changes or any(
-            str(change.get("track")) == str(track)
-            and _normalized(change.get("to", speaker)) == _normalized(speaker)
-            for change in changes
-        ):
-            return _normalized(entry.get("provenance")).startswith("inferred")
-    return False
-
+def _recorder_evidence(metadata, track, speaker):
+    """Verify the original recorder attribution produced by the transcriber."""
+    rows = metadata.get("speaker_tracks")
+    recorder = metadata.get("recorder")
+    return (
+        isinstance(rows, list)
+        and len(_tracks(metadata)) == len(rows)
+        and all(isinstance(row.get("speaker"), str) for row in rows)
+        and metadata.get("original_speaker_tracks") is None
+        and metadata.get("relabel_history") is None
+        and not any("relabel" in key or "provenance" in key
+                    for key in track)
+        and not any(("relabel" in key and key != "relabel_history") or "provenance" in key
+                    for key in metadata)
+        and track.get("speaker_template") == "{Recorder}"
+        and isinstance(recorder, dict)
+        and _normalized(recorder.get("name")) == _normalized(speaker)
+        and recorder.get("source") == "filename"
+        and recorder.get("tracks") == [track["track"]]
+        and type(track.get("index")) is int
+        and bool(_normalized(track.get("title")))
+    )
 
 def _audio_mapping(audio, track):
-    """Match an explicit stream index or an unambiguous track title."""
+    """Identify an MP4 stream and provide provisional Resolve channel numbers."""
     titles = {_normalized(track.get("title")).replace(" ", ""), f"track{track['track']}"} - {""}
     named = [
         stream for stream in audio
@@ -71,46 +91,69 @@ def _audio_mapping(audio, track):
                for key, value in stream.get("tags", {}).items()
                if key.casefold() in {"title", "handler_name"})
     ]
-    indexed = [stream for stream in audio if stream["index"] == track.get("index")]
-    if len(named) > 1 or (named and indexed and named != indexed):
+    index = track.get("index")
+    indexed = [stream for stream in audio if type(index) is int and stream["index"] == index]
+    if len(named) > 1 or (named and type(index) is int and named != indexed):
         return None
     candidates = named or indexed
     if len(candidates) != 1:
         return None
     stream = candidates[0]
-    channels = [item.get("channels") for item in audio[:audio.index(stream) + 1]]
-    if any(not isinstance(count, int) or count <= 0 for count in channels):
+    tags = stream.get("tags", {})
+    title = tags.get("title") or tags.get("handler_name")
+    ordinal = audio.index(stream) + 1
+    counts = [item.get("channels") for item in audio[:ordinal]]
+    if not all(_track_number(count) for count in counts):
         return None
-    return stream["index"], list(range(sum(channels[:-1]) + 1, sum(channels) + 1))
+    return {
+        "mp4_audio_stream_index": stream["index"],
+        "mp4_audio_ordinal": ordinal,
+        "mp4_audio_title": title,
+        "mp4_audio_channels": counts[-1],
+        "expected_owner_track": track["track"],
+        "resolve_channels": list(range(sum(counts[:-1]) + 1, sum(counts) + 1)),
+        "resolve_channels_status": "expected",
+    }
 
 
 def _mic(metadata, streams, part_id, speaker, confirmations):
     tracks = _tracks(metadata)
-    owner_tracks = [track for track in tracks if _normalized(track.get("speaker")) == _normalized(speaker)]
-    if len(owner_tracks) != 1:
-        return None, "mic_unmapped"
-    track = owner_tracks[0]
-    confirmed = any(
-        item.get("part_id") == part_id and item.get("transcriber_track") == track["track"]
+    confirmed_tracks = {
+        item["transcriber_track"] for item in confirmations
+        if isinstance(item, dict) and item.get("part_id") == part_id
+        and _track_number(item.get("transcriber_track"))
         and _normalized(item.get("speaker")) == _normalized(speaker)
         and item.get("confirmed_by") == "owner"
-        for item in confirmations
-    )
-    if _inferred(metadata, track["track"], speaker) and not confirmed:
-        return None, "mic_inferred_unconfirmed"
+    }
+    if len(confirmed_tracks) > 1:
+        return None, "mic_unverified"
+    if confirmed_tracks:
+        number = next(iter(confirmed_tracks))
+        candidates = [track for track in tracks if track["track"] == number]
+        track = candidates[0] if len(candidates) == 1 else {"track": number}
+    else:
+        candidates = [track for track in tracks
+                      if _normalized(track.get("speaker")) == _normalized(speaker)]
+        if len(candidates) != 1:
+            return None, "mic_unverified"
+        track = candidates[0]
+        if sum(row["track"] == track["track"] for row in tracks) != 1:
+            return None, "mic_unverified"
+        if not _recorder_evidence(metadata, track, speaker):
+            return None, "mic_unverified"
+
     audio = sorted((stream for stream in streams if stream.get("codec_type") == "audio"),
                    key=lambda stream: stream["index"])
     mapping = _audio_mapping(audio, track)
     if mapping is None:
         return None, "mic_unmapped"
-    index, channels = mapping
     return {
-        "status": "owner_confirmed" if confirmed else "verified",
+        "status": "owner_confirmed" if confirmed_tracks else "verified",
         "transcriber_track": track["track"], "speaker": speaker,
-        "mp4_audio_stream_index": index, "resolve_channels": channels,
-        "evidence": "speaker_tracks + MP4 probe" + (" + owner confirmation" if confirmed else ""),
+        **mapping,
+        "evidence": ("owner confirmation + MP4 probe" if confirmed_tracks
+                     else "transcriber recorder attribution + MP4 probe"),
     }, None
-
 
 def _rate(stream):
     for key in ("r_frame_rate", "avg_frame_rate"):
@@ -139,15 +182,14 @@ def _part_media(folder, roots, pov, part, confirmations, fps):
 
     streams = probe_streams(mp4)
     video = [stream for stream in streams if stream.get("codec_type") == "video"]
-    if len(video) != 1 or _rate(video[0]) != Fraction(str(fps)):
+    if len(video) != 1:
         return None, part, "fps_mismatch", False
     duration = _positive_duration(video[0].get("duration"))
-    if duration is None and (part.duration is None or part.duration_source == "srt_estimate"):
+    if duration is None:
         return None, part, "duration_unverified", False
-
-    # Keep synced boundaries from the session. Clamp source frames against the
-    # actual video stream when placing angles, independently of those boundaries.
-    source_part = replace(part, duration=duration, duration_source="ffprobe") if duration else part
+    source_part = replace(part, duration=duration, duration_source="ffprobe")
+    if _rate(video[0]) != Fraction(str(fps)):
+        return None, source_part, "fps_mismatch", False
     stems = [source.stem]
     if part.srt_path:
         stems.append(Path(part.srt_path).stem)
@@ -195,36 +237,31 @@ _PROBLEMS = {
     "mp4_missing": "OBS-remuxed MP4 is missing.",
     "fps_mismatch": "MP4 video frame rate differs from the timeline or could not be verified.",
     "mic_unmapped": "Owner mic could not be matched to a unique MP4 audio stream.",
-    "mic_inferred_unconfirmed": "Owner must confirm the inferred mic label before export.",
+    "mic_unverified": "Owner must listen to and confirm the owner mic track before export.",
     "duration_unverified": "MP4 source duration could not be verified.",
     "source_frame_range": "MP4 video cannot supply the full segment frame range.",
     "overlapping_parts": "Multiple parts cover this segment for the same POV.",
 }
 
 
-def _duration_frames(start, end, fps):
-    # A virtual clock gives even fully uncovered segments the Stage 1 record
-    # length. Give it spare duration so the planner's source clamp is inactive.
-    clock = Session(povs=[POV(parts=[Part("clock", offset=start, duration=end - start + 1)])])
-    return plan_placements(clock, start, end, fps)[0].record_out
+def _record_frame(time, origin, rate):
+    """Use Stage 1 half-up rounding relative to the selection's frame origin."""
+    return floor((Fraction(str(time)) - origin) * rate + Fraction(1, 2))
 
 
-def _angle(pov, part, media, start, end, fps, duration_frames):
-    # Use Stage 1 source bounds and require the full planned segment length.
-    plan = Session(povs=[replace(pov, parts=[part])])
-    placements = plan_placements(plan, start, end, fps)
-    if len(placements) != 1 or placements[0].record_in != 0 or placements[0].record_out != duration_frames:
+def _angle(pov, part, media, placement, first_frame, last_frame, rate):
+    if placement is None or not placement.record_in <= first_frame < last_frame <= placement.record_out:
         return None
-    placement = placements[0]
-    limit = floor(Fraction(str(part.duration)) * Fraction(str(fps)))
+    source_in = placement.source_in + first_frame - placement.record_in
+    source_out = placement.source_in + last_frame - placement.record_in
+    limit = floor(Fraction(str(part.duration)) * rate)
     return {
         "pov_id": pov.pov_id, "pov_name": pov.name, "part_id": part.part_id,
         "part_index": part.index, **media,
-        "source_in_frame": placement.source_in, "source_out_frame": placement.source_out,
-        "handle_before_frames": placement.source_in,
-        "handle_after_frames": limit - placement.source_out,
+        "source_in_frame": source_in, "source_out_frame": source_out,
+        "handle_before_frames": source_in,
+        "handle_after_frames": limit - source_out,
     }
-
 
 def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) -> dict:
     folder = Path(session.folder).resolve()
@@ -253,13 +290,22 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
                                      "message": "No timed Keep selections."})
         return manifest
 
-    # SRT and cue contents are unnecessary for Resolve manifests.
+    # Probe before splitting so video stream ends, including sub-second gaps,
+    # determine coverage. Keep the session duration only for unavailable media.
+    last_selection_end = max(end for _, end, _, _ in selected)
+    media_cache = {
+        part.part_id: _part_media(folder, roots, pov, part, confirmations, fps)
+        for pov, part in session.all_parts() if part.offset < last_selection_end
+    }
     coverage_session = replace(session, povs=[
-        replace(pov, parts=[replace(part, srt_path=None) for part in pov.parts])
+        replace(pov, parts=[
+            replace(media_cache[part.part_id][1] if part.part_id in media_cache else part, srt_path=None)
+            for part in pov.parts
+        ])
         for pov in session.povs
     ])
-    parts = {part.part_id: part for _, part in session.all_parts()}
-    media_cache = {}
+    parts = {part.part_id: part for _, part in coverage_session.all_parts()}
+
     reported = set()
     record = 0
     game_identified = False
@@ -276,16 +322,19 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
     for start, end, suggestion, range_source in selected:
         coverage = map_range(coverage_session, start, end, pad_before=0, pad_after=0)
         boundaries = sorted({start, end} | {x for r in coverage for x in (r.session_start, r.session_end)})
+        origin = Fraction(str(start))
+        frames = [_record_frame(boundary, origin, rate) for boundary in boundaries]
+        placements = {}
         event_segments = []
-        for first, last in zip(boundaries, boundaries[1:]):
-            try:
-                length = _duration_frames(first, last, fps)
-            except ValueError:
+        for index, (first, last) in enumerate(zip(boundaries, boundaries[1:])):
+            first_frame, last_frame = frames[index:index + 2]
+            length = last_frame - first_frame
+            if length == 0:
                 manifest["warnings"].append({"code": "subframe_segment", "event_id": suggestion.event_id,
                                              "message": "Skipped coverage interval shorter than one frame."})
                 continue
             angles, unavailable = [], []
-            for pov in session.povs:
+            for pov in coverage_session.povs:
                 ranges = [r for r in coverage if r.pov_id == pov.pov_id]
                 active = [r for r in ranges if r.session_start <= first and last <= r.session_end]
                 reason = "recording_gap" if any(
@@ -295,15 +344,19 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
                     block("overlapping_parts", pov)
                 elif active:
                     part_id = active[0].part_id
-                    if part_id not in media_cache:
-                        media_cache[part_id] = _part_media(folder, roots, pov, parts[part_id], confirmations, fps)
-                    media, source_part, problem, game = media_cache[part_id]
+                    media, _, problem, game = media_cache[part_id]
+                    source_part = parts[part_id]
                     game_identified |= game
                     if problem is None:
-                        try:
-                            angle = _angle(pov, source_part, media, first, last, fps, length)
-                        except ValueError:
-                            angle = None
+                        if part_id not in placements:
+                            plan = Session(povs=[replace(pov, parts=[source_part])])
+                            try:
+                                placement, = plan_placements(plan, start, end, rate)
+                            except ValueError:
+                                placement = None
+                            placements[part_id] = placement
+                        angle = _angle(pov, source_part, media, placements[part_id],
+                                       first_frame, last_frame, rate)
                         if angle is not None:
                             angles.append(angle)
                             continue
@@ -314,6 +367,11 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
                     for part in pov.parts:
                         if part.duration is None and part.offset < last:
                             block("duration_unverified", pov, part.part_id)
+                if reason == "recording_gap" and last - first < 1:
+                    manifest["warnings"].append({
+                        "code": "short_gap_segment", "event_id": suggestion.event_id, "pov_name": pov.name,
+                        "message": f"Recording gap at {first:.3f}?{last:.3f} s ({last - first:.3f} s).",
+                    })
                 unavailable.append({"pov_id": pov.pov_id, "pov_name": pov.name, "reason": reason})
             if not angles:
                 manifest["warnings"].append({"code": "no_angles", "event_id": suggestion.event_id,
@@ -357,7 +415,7 @@ def render_report(manifest) -> str:
     for segment in segments:
         angles = ", ".join(
             f"{angle['pov_name']} P{angle['part_index']} ({angle['mic']['status']}, "
-            f"ch {', '.join(map(str, angle['mic']['resolve_channels']))})" for angle in segment["angles"]
+            f"expected ch {', '.join(map(str, angle['mic']['resolve_channels']))})" for angle in segment["angles"]
         )
         missing = ", ".join(f"{pov['pov_name']} ({pov['reason']})" for pov in segment["unavailable"])
         row = (segment["segment_id"], f"{segment['title']} ({segment['range_source']})",
