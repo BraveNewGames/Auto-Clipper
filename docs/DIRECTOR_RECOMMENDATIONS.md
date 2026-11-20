@@ -35,7 +35,9 @@ exclusive Out. An empty candidate `frames` dict represents a missing range.
 Candidate loglines are editorial proposals. Candidate evidence IDs resolve to
 FKB dialogue or human notes. Timed review selections use the reviewer's
 suggested bounds after checking in-range evidence. Citation text must match
-locally, and uncited keyword matches carry a weaker evidence flag. Visual
+the cited occurrence. A quote can supply a stable `span_id` or a session
+timestamp to distinguish repeated words. Unresolved ties are flagged.
+Uncited keyword matches carry a weaker evidence flag. Visual
 verification remains false and incomplete or stale media coverage is flagged.
 Earlier candidate states are preserved in `revisions`.
 

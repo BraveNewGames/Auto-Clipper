@@ -89,6 +89,53 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("mapping is stale", candidate.uncertainty)
         self.assertEqual(available_povs(self.db, FrameRange(**candidate.frames)), [])
 
+    def test_repeated_quotes_bind_to_timed_occurrences_and_span_ids(self):
+        path = Path(self.source.folder) / "one.srt"
+        path.write_text(path.read_text(encoding="utf-8").replace("Drop the piano!", self.span.text),
+                        encoding="utf-8")
+        self.db = ingest_session(self.source, fps=24)
+        first, second, _ = self.db.transcript_spans
+        packet = session_packet_lines(self.source)
+        self.assertEqual(len(packet[0].members), 2)
+        raw = self.review(end=5, quotes=[
+            {"line": packet[0].packet_id, "text": first.text, "time": "00:00:03.200"},
+            {"span_id": first.span_id, "text": first.text},
+        ])
+        candidate, = import_recommendations(self.db, self.source, raw, run_id="repeated")
+        self.assertEqual(candidate.evidence_ids, [second.span_id, first.span_id])
+        for index, hint in enumerate(({}, {"line": packet[0].packet_id}, {"time": 2.125})):
+            ambiguous = self.review(end=5, quotes=[{"text": first.text, **hint}])
+            candidate, = import_recommendations(self.db, self.source, ambiguous,
+                                                 run_id=f"ambiguous-{index}")
+            self.assertEqual(candidate.evidence_ids, [])
+            self.assertEqual(candidate.frames, {})
+            self.assertIn("ambiguous", candidate.uncertainty)
+
+        legacy = import_review(self.source, self.review(end=5, quotes=[
+            {"line": packet[0].packet_id, "text": first.text},
+        ]), None)
+        self.assertIsNotNone(legacy[0].quotes[0]["time"])
+        candidate, = import_recommendations(self.db, self.source, run_id="legacy-repeated")
+        self.assertEqual(candidate.evidence_ids, [])
+        self.assertIn("ambiguous", candidate.uncertainty)
+
+    def test_reused_packet_id_does_not_override_quote_timestamp(self):
+        path = Path(self.source.folder) / "one.srt"
+        path.write_text(path.read_text(encoding="utf-8").replace("Quiet hallway.", self.span.text),
+                        encoding="utf-8")
+        self.db = ingest_session(self.source, fps=24)
+        first, _, last = self.db.transcript_spans
+        raw = self.review(end=9, quotes=[
+            {"line": "L0001", "text": first.text, "time": 8},
+            {"text": first.text, "time": 1.1},
+        ])
+        candidate, = import_recommendations(self.db, self.source, raw, run_id="stale-id")
+        self.assertEqual(candidate.evidence_ids, [last.span_id, first.span_id])
+        outside = self.review(quotes=[{"line": "L0001", "text": first.text, "time": 8}])
+        candidate, = import_recommendations(self.db, self.source, outside, run_id="outside")
+        self.assertEqual(candidate.evidence_ids, [])
+        self.assertEqual(candidate.frames, {})
+
     def test_legacy_import_and_note_revisions_roundtrip(self):
         import_review(self.source, self.review(), None)
         store = FKBStore(self.source.folder)
