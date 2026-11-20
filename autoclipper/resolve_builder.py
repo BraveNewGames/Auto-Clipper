@@ -114,6 +114,13 @@ def stereo_channels(mapping):
     return tracks[0]["channel_idx"]
 
 
+def _track_label(value):
+    """Canonical form so 'Track2', 'Track 2' and 'track 02' compare equal."""
+    label = str(value).strip().casefold()
+    match = re.fullmatch(r"track\s*0*(\d+)", label)
+    return f"track{match[1]}" if match else label
+
+
 def import_sources(pool, media, fps):
     clips = {}
     for path, (_, name, track, ordinal, title, channels) in media.items():
@@ -132,7 +139,7 @@ def import_sources(pool, media, fps):
                   if entry.get(field)}
         track_labels = [re.fullmatch(r"track\s*0*(\d+)", label, re.I) for label in labels]
         title_conflicts = title and any(
-            label != title.strip().casefold() and label not in {name.casefold(), f"track{track}", "soundhandler"}
+            _track_label(label) not in {_track_label(title), _track_label(name), f"track{track}", "soundhandler"}
             for label in labels
         )
         embedded = audio.get("embedded_audio_channels", max(channels))
@@ -182,7 +189,8 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
         try:
             restore_source_marks(modified)
         except Exception as restore_error:
-            raise original from restore_error
+            # The restore failure happened after, not because of, the original error.
+            original.cleanup_failures = [*getattr(original, "cleanup_failures", []), restore_error]
         raise
     else:
         restore_source_marks(modified)
@@ -275,8 +283,11 @@ def read_export(timeline, segments, names):
 def build_export(manifest, *, dry_run=False, project_name=None):
     """Return the plan or a structured readback of the saved and reopened export."""
     media = validate_manifest(manifest)
-    if project_name is not None and not re.fullmatch(r"AutoClipper Stage2 Test \d{8}-\d{6}", project_name):
-        raise ValueError("Explicit project name must be AutoClipper Stage2 Test YYYYMMDD-HHMMSS")
+    export_name = re.escape(f"{EXPORT_PREFIX}{manifest['session_id']} ")
+    if project_name is not None and not re.fullmatch(
+            rf"(?:AutoClipper Stage2 Test |{export_name})\d{{8}}-\d{{6}}", project_name):
+        raise ValueError("Explicit project name must be AutoClipper Stage2 Test YYYYMMDD-HHMMSS "
+                         "or AutoClipper Export <session_id> YYYYMMDD-HHMMSS")
     warnings = list(manifest["warnings"]) + [
         {"code": "short_segment", "event_id": segment["event_id"], "segment_id": segment["segment_id"],
          "message": f"Short multicam segment ({segment['duration_frames']} frames)."}
@@ -349,7 +360,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--project", help="Optional AutoClipper Stage2 Test YYYYMMDD-HHMMSS project name")
+    parser.add_argument("--project", help="Optional new project name: AutoClipper Stage2 Test YYYYMMDD-HHMMSS "
+                                          "or AutoClipper Export <session_id> YYYYMMDD-HHMMSS")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Print the plan without contacting Resolve")
     mode.add_argument("--execute", action="store_true",
@@ -359,8 +371,18 @@ def main(argv=None):
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         print(json.dumps(build_export(manifest, dry_run=args.dry_run, project_name=args.project), indent=2))
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        cleanup = f"\nAdditional failure: {exc.__cause__}" if exc.__cause__ is not None else ""
-        parser.exit(1, f"Resolve export stopped: {exc}{cleanup}\n")
+        parser.exit(1, describe_failure(exc))
+
+
+def describe_failure(exc):
+    """Original error first, then its causes, then later cleanup failures, each labelled."""
+    lines = [f"Resolve export stopped: {exc}"]
+    cause = exc.__cause__
+    while cause is not None:
+        lines.append(f"Caused by: {cause}")
+        cause = cause.__cause__
+    lines.extend(f"Cleanup also failed: {failure}" for failure in getattr(exc, "cleanup_failures", []))
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":

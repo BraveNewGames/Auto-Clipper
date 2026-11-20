@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_builder import build_export, import_sources, main
+from autoclipper.resolve_builder import build_export, describe_failure, import_sources, main
 from autoclipper.resolve_manifest import build_manifest
 
 
@@ -357,8 +357,59 @@ class ResolveBuilderTests(unittest.TestCase):
                   self.assertRaises(RuntimeError) as raised):
                 build_export(manifest)
         self.assertIs(raised.exception, failure)
-        self.assertIs(raised.exception.__cause__, cleanup)
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(raised.exception.cleanup_failures, [cleanup])
+        self.assertEqual(describe_failure(raised.exception),
+                         "Resolve export stopped: create failed\nCleanup also failed: restore failed\n")
         manager.SaveProject.assert_not_called()
+
+    def test_cli_failure_labels_causes_in_order(self):
+        root = RuntimeError("root cause")
+        middle = RuntimeError("middle")
+        middle.__cause__ = root
+        top = ValueError("top")
+        top.__cause__ = middle
+        self.assertEqual(describe_failure(top), "Resolve export stopped: top\nCaused by: middle\n"
+                                                "Caused by: root cause\n")
+        self.assertEqual(describe_failure(RuntimeError("plain")), "Resolve export stopped: plain\n")
+
+    def test_mic_title_accepts_equivalent_track_forms(self):
+        path = Path("source.mp4").resolve()
+        for label in ("Track2", "Track 2", "track 2", "TRACK2", "Track 02"):
+            with self.subTest(label=label):
+                pool = Mock()
+                clip = Mock()
+                pool.ImportMedia.return_value = [clip]
+                clip.GetClipProperty.side_effect = {"File Path": str(path), "FPS": "60"}.__getitem__
+                clip.GetName.return_value = "Player"
+                track = {"type": "stereo", "channel_idx": [3, 4], "mute": False, "title": label}
+                original = {"track_mapping": {"2": track}}
+                remapped = {"track_mapping": {"1": track}}
+                clip.GetAudioMapping.side_effect = list(map(json.dumps, (original, original, remapped)))
+                self.assertEqual(import_sources(pool, {path: ("pov", "Player", 2, 2, "Track2", (3, 4))}, 60),
+                                 {path: clip})
+        for label in ("Track 3", "track3", "Game", "Track 2b"):
+            with self.subTest(mismatch=label):
+                pool = Mock()
+                clip = Mock()
+                pool.ImportMedia.return_value = [clip]
+                clip.GetClipProperty.side_effect = {"File Path": str(path), "FPS": "60"}.__getitem__
+                clip.GetAudioMapping.return_value = json.dumps(
+                    {"track_mapping": {"2": {"type": "stereo", "channel_idx": [3, 4], "title": label}}})
+                with self.assertRaisesRegex(RuntimeError, "expected Resolve track 2"):
+                    import_sources(pool, {path: ("pov", "Player", 2, 2, "Track2", (3, 4))}, 60)
+                clip.SetAudioMapping.assert_not_called()
+
+    def test_explicit_export_project_name_must_match_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = make_manifest(Path(folder))
+            session = manifest["session_id"]
+            plan = build_export(manifest, dry_run=True, project_name=f"AutoClipper Export {session} 20260101-000000")
+            self.assertEqual(plan["mode"], "dry-run")
+            for name in ("AutoClipper Export other 20260101-000000", f"AutoClipper Export {session} now",
+                         "Owner Edit"):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "Explicit project name"):
+                    build_export(manifest, dry_run=True, project_name=name)
 
     def test_owner_checkout_and_failed_reopen(self):
         sdk, manager, state, _, _ = fake_resolve()
