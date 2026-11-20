@@ -659,12 +659,28 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
     if len(plans) != 1:
         raise ValueError("Expected one FKB edit plan with the requested ID")
     plan, = plans
+    candidates = {candidate.candidate_id: candidate for candidate in getattr(knowledge_base, "candidate_moments", ())}
+    note_ids = {note.note_id for note in getattr(knowledge_base, "director_notes", ()) if not note.deleted}
     entries = []
     for entry in plan.entries:
         if any(key in entry for key in ("session_in", "session_out_exclusive")):
             raise ValueError("FKB entries use frames.start and frames.end")
         projected = dict(entry)
         frames = projected.pop("frames", None)
+        if projected["kind"] == "candidate":
+            candidate = candidates.get(projected.pop("candidate_id"))
+            if candidate is None or frames is not None:
+                raise ValueError("Candidate entries must reference a saved candidate without frame overrides")
+            frames = candidate.frames or None
+            projected["kind"] = "source" if frames else "placeholder"
+            projected.setdefault("title", candidate.logline)
+            projected["candidate_ids"] = list(dict.fromkeys(
+                [candidate.candidate_id, *projected.get("candidate_ids", ())]))
+            projected["note_ids"] = list(dict.fromkeys([
+                *projected.get("note_ids", ()), *(key for key in candidate.evidence_ids if key in note_ids)
+            ]))
+            if not frames and "provisional_frames" not in projected:
+                raise ValueError("Untimed candidates require provisional placeholder frames")
         if frames is not None:
             projected["session_in"], projected["session_out_exclusive"] = frames["start"], frames["end"]
         entries.append(projected)

@@ -121,6 +121,14 @@ class CandidateMoment(_Model):
     model_version: str | None = None
     revisions: list[dict] = field(default_factory=list)
 
+    def __post_init__(self):
+        if not isinstance(self.frames, dict):
+            raise ValueError("Candidate frames must be an empty object or a positive frame range")
+        if self.frames:
+            if set(self.frames) != {"start", "end"}:
+                raise ValueError("Candidate frame range must contain start and end")
+            FrameRange(**self.frames)
+
 
 @dataclass
 class EditPlan(_Model):

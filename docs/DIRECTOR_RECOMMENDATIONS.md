@@ -32,6 +32,13 @@ case-insensitive speaker filter for transcript hits and an overlapping session
 including partial coverage. Positions are session-relative frames with an
 exclusive Out. An empty candidate `frames` dict represents a missing range.
 
+An FKB edit plan can reference a saved recommendation with an entry containing
+`entry_id`, `kind: "candidate"`, and `candidate_id`. A timed recommendation
+supplies its existing frame range. For an untimed recommendation, supply
+`provisional_frames` and optionally a title. The assembler labels it as missing
+footage and assigns only draft positions. Candidate entries cannot override
+their underlying source frame bounds.
+
 Candidate loglines are editorial proposals. Candidate evidence IDs resolve to
 FKB dialogue or human notes. Timed review selections use the reviewer's
 suggested bounds after checking in-range evidence. Citation text must match
