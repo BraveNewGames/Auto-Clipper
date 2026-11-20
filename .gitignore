@@ -3,5 +3,9 @@ __pycache__/
 .autoclipper/
 autoclipper_exports/
 samples/**/*.mkv
+samples/**/*.mp4
+.pytest_cache/
+.mypy_cache/
+.venv/
 
 SampleData
