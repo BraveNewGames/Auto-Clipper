@@ -268,6 +268,21 @@ class ResolveBuilderTests(unittest.TestCase):
                     main([str(path), "--dry-run", "--result-file", str(failed)])
                 self.assertFalse(failed.exists())
 
+    def test_director_build_records_reopened_scratch_identity(self):
+        sdk, _, _, _, reopened = fake_resolve()
+        reopened.GetUniqueId.return_value = "scratch-project-id"
+        reopened.GetTimelineByIndex.return_value.GetUniqueId.return_value = "review-timeline-id"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                result = build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")
+        self.assertEqual(result["project_id"], "scratch-project-id")
+        self.assertEqual(result["timeline_id"], "review-timeline-id")
+
     def test_multicam_compilation_saves_and_verifies_after_reopen(self):
         sdk, manager, state, project, reopened = fake_resolve()
         with tempfile.TemporaryDirectory() as folder:

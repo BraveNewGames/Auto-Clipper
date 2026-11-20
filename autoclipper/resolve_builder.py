@@ -13,6 +13,7 @@ from .resolve_stage1 import append_clip, isolate_mic, read_item, require
 
 EXPORT_PREFIX = "AutoClipper Export "
 TEST_PROJECT_PREFIX = "AutoClipper Stage2 Test "
+DIRECTOR_TEST_PREFIX = "AutoClipper DirectorA Test "
 START_TIMECODE = "01:00:00:00"
 
 
@@ -285,9 +286,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     media = validate_manifest(manifest)
     export_name = re.escape(f"{EXPORT_PREFIX}{manifest['session_id']} ")
     if project_name is not None and not re.fullmatch(
-            rf"(?:AutoClipper Stage2 Test |{export_name})\d{{8}}-\d{{6}}", project_name):
-        raise ValueError("Explicit project name must be AutoClipper Stage2 Test YYYYMMDD-HHMMSS "
-                         "or AutoClipper Export <session_id> YYYYMMDD-HHMMSS")
+            rf"(?:{TEST_PROJECT_PREFIX}|{DIRECTOR_TEST_PREFIX}|{export_name})\d{{8}}-\d{{6}}", project_name):
+        raise ValueError("Explicit project name must be a timestamped Stage2 Test, DirectorA Test or Export name")
     warnings = list(manifest["warnings"]) + [
         {"code": "short_segment", "event_id": segment["event_id"], "segment_id": segment["segment_id"],
          "message": f"Short multicam segment ({segment['duration_frames']} frames)."}
@@ -352,7 +352,11 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     if any(row["angles"] is None for row in rows):
         limitations.append("Resolve did not expose the internal angle timeline. Verify angle names, switching and "
                            "segment-specific trims for repeated source media in the UI.")
-    return {"project": name, "timeline": session, "fps": fps, "reopened": True,
+    identity = {}
+    if name.startswith(DIRECTOR_TEST_PREFIX):
+        identity = {"project_id": require(reopened.GetUniqueId(), "Missing project ID"),
+                    "timeline_id": require(timeline.GetUniqueId(), "Missing timeline ID")}
+    return {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity,
             "sources": list(persisted.values()), "segments": rows,
             "warnings": warnings, "limitations": limitations}
 
