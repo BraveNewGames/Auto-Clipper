@@ -6,6 +6,8 @@ lazily so the server still starts when one of them is missing.
 """
 from __future__ import annotations
 
+import atexit
+import copy
 import dataclasses
 import importlib
 import json
@@ -103,6 +105,9 @@ class App:
         self._resolve_lock = threading.Lock()
         self._resolve_job = {"state": "idle"}
         self.builder_timeout = 1800  # seconds; a Resolve export of many segments can be slow
+        self.builder_command = [sys.executable, "-m", "autoclipper.resolve_builder"]
+        self._builder_proc = None
+        atexit.register(self.stop_builder)
 
     # ------------------------------------------------------------ helpers
     def require(self):
@@ -596,14 +601,75 @@ class App:
                     "out_dir": str(self.folder() / "autoclipper_exports")}
 
     # ------------------------------------------------------------ Resolve export
-    def _resolve_manifest(self, s):
+    # ffprobe can be slow, so manifests are built from a session snapshot outside self.lock;
+    # the session is re-checked afterwards and a change makes the caller try again.
+    def _snapshot(self):
+        with self.lock:
+            s = self.require()
+            return copy.deepcopy(s), self._fingerprint(s)
+
+    @staticmethod
+    def _fingerprint(s):
+        return json.dumps(s.to_dict(), sort_keys=True, default=str)
+
+    def _unchanged(self, fingerprint):
+        if self.session is None or self._fingerprint(self.session) != fingerprint:
+            raise ApiError("The session changed while Auto-Clipper was reading the MP4s. Try again.", 409)
+
+    def _resolve_manifest(self):
         rm = _mod("resolve_manifest")
-        manifest = rm.build_manifest(s)
-        return manifest, rm.render_report(manifest)
+        snap, fingerprint = self._snapshot()
+        manifest = rm.build_manifest(snap)
+        return snap, fingerprint, manifest, rm.render_report(manifest)
+
+    @staticmethod
+    def _pov_of(s, part):
+        return next((p for p in s.povs if any(x is part for x in p.parts)), None)
+
+    def _mic_choices(self, s, pov, part):
+        """The part's MP4 audio tracks an owner confirmation can select.
+
+        Each candidate track number is run through the manifest's own mic check with a trial
+        confirmation, so only tracks the export will accept (an existing MP4 audio stream
+        that maps uniquely) are offered or accepted.
+        """
+        rm = _mod("resolve_manifest")
+        folder = Path(s.folder).resolve()
+        roots = [folder / "_Transcripts", folder.parent / "_Transcripts"]
+        source = folder / part.video_path if part.video_path else None
+        mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
+        stems = [source.stem] if source else []
+        if part.srt_path:
+            stems.append(Path(part.srt_path).stem)
+        metadata = rm._metadata(roots, stems) if stems else {}
+        tracks = rm._tracks(metadata)
+        expected = [t["track"] for t in tracks if rm._normalized(t.get("speaker")) == rm._normalized(pov.name)]
+        info = {"mp4": None, "metadata": metadata, "tracks": tracks,
+                "expected_track": expected[0] if len(expected) == 1 else None, "options": [],
+                "audio_streams": 0}
+        if not mp4 or mp4.suffix.lower() != ".mp4" or not mp4.is_file():
+            return info
+        info["mp4"] = str(mp4)
+        streams = rm.probe_streams(mp4)
+        audio = [st for st in streams if st.get("codec_type") == "audio"]
+        info["audio_streams"] = len(audio)
+        seen = set()
+        for number in sorted(set(range(1, len(audio) + 1)) | {t["track"] for t in tracks}):
+            trial = [{"part_id": part.part_id, "transcriber_track": number, "speaker": pov.name,
+                      "confirmed_by": "owner"}]
+            mic, _ = rm._mic(metadata, streams, part.part_id, pov.name, trial)
+            if mic is None or mic["mp4_audio_ordinal"] in seen:
+                continue
+            seen.add(mic["mp4_audio_ordinal"])
+            info["options"].append({
+                "track": number, "mp4_audio_ordinal": mic["mp4_audio_ordinal"],
+                "mp4_audio_stream_index": mic["mp4_audio_stream_index"],
+                "mp4_audio_title": mic.get("mp4_audio_title"), "resolve_channels": mic["resolve_channels"],
+            })
+        return info
 
     def _mic_rows(self, s, manifest):
-        """One row per part that appears in the plan: verified mics and blocked ones."""
-        rm = _mod("resolve_manifest")
+        """One row per part in the plan: verified mics, owner-confirmed mics and blocked ones."""
         rows = {}
         for segment in manifest["segments"]:
             for angle in segment["angles"]:
@@ -615,39 +681,44 @@ class App:
                     "mp4_audio_title": mic.get("mp4_audio_title"),
                     "resolve_channels": mic.get("resolve_channels"), "evidence": mic.get("evidence"),
                 })
-        folder = Path(s.folder).resolve()
-        roots = [folder / "_Transcripts", folder.parent / "_Transcripts"]
         for blocker in manifest["blockers"]:
             part = _part(s, blocker.get("part_id"))
-            if part is None or not str(blocker.get("code", "")).startswith("mic_") or part.part_id in rows:
+            if (part is None or blocker.get("code") not in ("mic_unverified", "mic_unmapped")
+                    or part.part_id in rows):
                 continue
-            pov = next((p for p in s.povs if any(x is part for x in p.parts)), None)
-            stems = [Path(x).stem for x in (part.video_path, part.srt_path) if x]
-            metadata = rm._metadata(roots, stems)
-            tracks = [{"track": t["track"], "speaker": t.get("speaker"), "title": t.get("title")}
-                      for t in rm._tracks(metadata)]
-            history = metadata.get("relabel_history")
-            provenance = sorted({str(h.get("provenance")) for h in history
-                                 if isinstance(h, dict) and h.get("provenance")}) \
-                if isinstance(history, list) else []
-            name = pov.name if pov else ""
-            matching = [t["track"] for t in tracks if rm._normalized(t["speaker"]) == rm._normalized(name)]
             rows[part.part_id] = {
-                "part_id": part.part_id, "pov_name": name, "part_index": part.index,
+                "part_id": part.part_id, "pov_name": blocker.get("pov_name") or "", "part_index": part.index,
                 "status": "unverified" if blocker["code"] == "mic_unverified" else "unmapped",
                 "blocker": blocker["code"], "message": blocker["message"],
-                "metadata_found": bool(metadata), "metadata_tracks": tracks,
-                "relabel_provenance": provenance,
-                "suggested_track": matching[0] if len(matching) == 1 else None,
             }
+        for row in rows.values():
+            if row["status"] == "verified":
+                continue  # positively verified from recorder metadata; nothing to confirm
+            part = _part(s, row["part_id"])
+            info = self._mic_choices(s, self._pov_of(s, part), part)
+            history = info["metadata"].get("relabel_history")
+            row.update({
+                "metadata_found": bool(info["metadata"]),
+                "metadata_tracks": [{"track": t["track"], "speaker": t.get("speaker"), "title": t.get("title")}
+                                    for t in info["tracks"]],
+                "relabel_provenance": sorted({str(h.get("provenance")) for h in history
+                                              if isinstance(h, dict) and h.get("provenance")})
+                if isinstance(history, list) else [],
+                "expected_track": info["expected_track"], "options": info["options"],
+                "mp4_found": info["mp4"] is not None, "audio_streams": info["audio_streams"],
+            })
+            choices = [o["track"] for o in info["options"]]
+            row["default_track"] = (row.get("transcriber_track") if row.get("transcriber_track") in choices
+                                    else info["expected_track"] if info["expected_track"] in choices else None)
         return sorted(rows.values(), key=lambda r: (r["pov_name"].casefold(), r["part_index"] or 0))
 
     def resolve_preview(self, _q=None):
+        snap, fingerprint, manifest, report = self._resolve_manifest()
+        mics = self._mic_rows(snap, manifest)
         with self.lock:
-            s = self.require()
-            manifest, report = self._resolve_manifest(s)
-            return {"manifest": manifest, "report": report, "mics": self._mic_rows(s, manifest),
-                    "can_export": not manifest["blockers"], "job": self.resolve_status()}
+            self._unchanged(fingerprint)
+        return {"manifest": manifest, "report": report, "mics": mics,
+                "can_export": not manifest["blockers"], "job": self.resolve_status()}
 
     def resolve_confirm_mic(self, body):
         part_id = (body.get("part_id") or "").strip()
@@ -656,16 +727,28 @@ class App:
             track = int(track)
         if type(track) is not int or track < 1:
             raise ApiError("transcriber_track must be a positive integer")
+        snap, fingerprint = self._snapshot()
+        part = _part(snap, part_id)
+        pov = self._pov_of(snap, part) if part is not None else None
+        if pov is None:
+            raise ApiError(f"Unknown part: {part_id!r}", 404)
+        speaker = (body.get("speaker") or pov.name).strip()
+        if speaker.casefold() != pov.name.strip().casefold():
+            raise ApiError(f"Speaker must be the recording owner ({pov.name}) for part {part_id}")
+        info = self._mic_choices(snap, pov, part)
+        if info["mp4"] is None:
+            raise ApiError(f"No OBS-remuxed MP4 found for {part.part_id}; a mic can only be confirmed "
+                           "against the MP4's audio tracks.", 409)
+        if track not in [o["track"] for o in info["options"]]:
+            available = ", ".join(
+                f"track {o['track']} (MP4 audio {o['mp4_audio_ordinal']}"
+                + (f" \u201c{o['mp4_audio_title']}\u201d" if o.get("mp4_audio_title") else "") + ")"
+                for o in info["options"]) or "none"
+            raise ApiError(f"Track {track} is not an audio track of {Path(info['mp4']).name} that the export can "
+                           f"use ({info['audio_streams']} audio stream(s)). Choose one of: {available}.")
+        rm = _mod("resolve_manifest")
         with self.lock:
-            s = self.require()
-            part = _part(s, part_id)
-            pov = next((p for p in s.povs if any(x is part for x in p.parts)), None)
-            if pov is None:
-                raise ApiError(f"Unknown part: {part_id!r}", 404)
-            speaker = (body.get("speaker") or pov.name).strip()
-            if speaker.casefold() != pov.name.strip().casefold():
-                raise ApiError(f"Speaker must be the recording owner ({pov.name}) for part {part_id}")
-            rm = _mod("resolve_manifest")
+            self._unchanged(fingerprint)
             path = self.folder() / ".autoclipper" / "mic_confirmations.json"
             data = rm._load_confirmations(path)
             rows = data.setdefault("confirmations", [])
@@ -683,65 +766,98 @@ class App:
             return dict(self._resolve_job)
 
     def resolve_export(self, body):
-        with self.lock:
-            s = self.require()
-            with self._resolve_lock:
-                if self._resolve_job.get("state") == "running":
-                    raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
-                manifest, report = self._resolve_manifest(s)
-                if manifest["blockers"]:
-                    raise ApiError("Export blocked: " + "; ".join(b["message"] for b in manifest["blockers"]),
-                                   409, blockers=manifest["blockers"])
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            _, fingerprint, manifest, report = self._resolve_manifest()
+            if manifest["blockers"]:
+                raise ApiError("Export blocked: " + "; ".join(b["message"] for b in manifest["blockers"]),
+                               409, blockers=manifest["blockers"])
+            with self.lock:
+                self._unchanged(fingerprint)
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 out = self.folder() / "autoclipper_exports" / "resolve" / stamp
                 if out.exists():
                     raise ApiError(f"Export folder already exists: {out}. Try again in a second.", 409)
                 out.mkdir(parents=True)
-                store = _mod("store")
-                store._write_json(out / "manifest.json", manifest)
+                _mod("store")._write_json(out / "manifest.json", manifest)
                 (out / "report.md").write_text(report, encoding="utf-8")
-                project = f"AutoClipper Export {manifest['session_id']} {stamp}"
-                self._resolve_job = {
-                    "state": "running", "project": project, "out_dir": str(out),
-                    "manifest_path": str(out / "manifest.json"), "report_path": str(out / "report.md"),
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                }
-                job = dict(self._resolve_job)
+            job = {
+                "state": "running", "project": f"AutoClipper Export {manifest['session_id']} {stamp}",
+                "out_dir": str(out), "manifest_path": str(out / "manifest.json"),
+                "report_path": str(out / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
         threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
         return job
 
     def _run_resolve_job(self, job):
         result = {"state": "failed"}
+        readback = Path(job["out_dir"]) / "readback.json"
         try:
-            code, stdout, stderr = self.run_builder(Path(job["manifest_path"]), job["project"])
-            if code == 0:
-                readback = json.loads(stdout)
-                path = Path(job["out_dir"]) / "readback.json"
-                _mod("store")._write_json(path, readback)
-                result = {"state": "done", "readback": readback, "readback_path": str(path)}
+            code, stdout, stderr = self.run_builder(Path(job["manifest_path"]), job["project"], readback)
+            if code == 0 and readback.is_file():
+                result = {"state": "done", "readback": json.loads(readback.read_text(encoding="utf-8")),
+                          "readback_path": str(readback)}
+            elif code == 0:
+                result["error"] = "The Resolve builder finished without writing its result file."
             else:
                 result["error"] = (stderr or stdout).strip() or f"Resolve builder exited with code {code}"
         except subprocess.TimeoutExpired:
-            result["error"] = (f"Resolve export timed out after {self.builder_timeout} s. "
+            result["error"] = (f"Resolve export timed out after {self.builder_timeout} s and was stopped. "
                                "Check Resolve before trying again.")
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
         with self._resolve_lock:
             self._resolve_job = {**job, **result, "finished_at": datetime.now(timezone.utc).isoformat()}
 
-    def run_builder(self, manifest_path: Path, project: str):
-        """Run the builder in a separate process so a Resolve hang cannot wedge the UI."""
+    def run_builder(self, manifest_path: Path, project: str, result_path: Path):
+        """Run the builder in a separate process so a Resolve hang cannot wedge the UI.
+
+        The builder writes its JSON result to result_path. The process is killed on timeout
+        and terminated if Auto-Clipper exits (stop_builder, registered with atexit).
+        """
         env = dict(os.environ)
         modules = Path(os.environ.get("PROGRAMDATA") or "C:/ProgramData") / \
             "Blackmagic Design" / "DaVinci Resolve" / "Support" / "Developer" / "Scripting" / "Modules"
         if modules.is_dir():
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH"), str(modules)]))
-        proc = subprocess.run(
-            [sys.executable, "-m", "autoclipper.resolve_builder", str(manifest_path),
-             "--execute", "--project", project],
-            cwd=str(Path(__file__).resolve().parent.parent), env=env, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=self.builder_timeout)
-        return proc.returncode, proc.stdout, proc.stderr
+        proc = subprocess.Popen(
+            [*self.builder_command, str(manifest_path), "--execute", "--project", project,
+             "--result-file", str(result_path)],
+            cwd=str(Path(__file__).resolve().parent.parent), env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        with self._resolve_lock:
+            self._builder_proc = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=self.builder_timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        finally:
+            with self._resolve_lock:
+                self._builder_proc = None
+        return proc.returncode, stdout, stderr
+
+    def stop_builder(self):
+        """Terminate a running builder child, e.g. when the server process exits."""
+        with self._resolve_lock:
+            proc = self._builder_proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     # ------------------------------------------------------------ OS helpers
     def open_path(self, body):

@@ -839,32 +839,54 @@ function issueList(items, cls) {
     b.message, " ", h("span", { class: "mono small muted" }, b.code))));
 }
 
+function micOptionLabel(o, m) {
+  return `Track ${o.track} · MP4 audio ${o.mp4_audio_ordinal}${o.mp4_audio_title ? " “" + o.mp4_audio_title + "”" : ""}` +
+    ` → Resolve ch ${o.resolve_channels.join("-")}${o.track === m.expected_track ? " (metadata expects this)" : ""}`;
+}
+
+// Pick one of the MP4's real audio tracks and confirm it in-page (no native dialogs): the
+// button stays disabled until the owner ticks "I listened", so a stray click or double-click
+// can never record a confirmation. Re-confirming replaces the earlier choice for the part.
+function micConfirmControl(m, box) {
+  const options = m.options || [];
+  if (!m.mp4_found) return h("div", { class: "bad-text small" }, "No OBS-remuxed MP4 found for this part.");
+  if (!options.length) {
+    return h("div", { class: "bad-text small" },
+      `None of the MP4's ${m.audio_streams} audio stream(s) can be matched to a track number; check the MP4's audio track titles.`);
+  }
+  const pick = h("select", null,
+    m.default_track ? null : h("option", { value: "", selected: true }, "Choose the mic track…"),
+    options.map((o) => h("option", { value: o.track, selected: o.track === m.default_track ? true : null }, micOptionLabel(o, m))));
+  const listened = h("input", { type: "checkbox" });
+  const button = h("button", { class: "btn small primary", disabled: true, onclick: action(async () => {
+    const track = parseInt(pick.value, 10);
+    if (!listened.checked) throw new Error("Tick “I listened” first");
+    if (!(track > 0)) throw new Error("Choose the mic track first");
+    await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
+    toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}: track ${track}`, "ok");
+    await loadResolvePreview(box);
+  }) }, "Confirm mic");
+  const sync = () => { button.disabled = !listened.checked || !pick.value; };
+  listened.addEventListener("change", sync);
+  pick.addEventListener("change", () => { listened.checked = false; sync(); });
+  return h("div", { class: "row" }, pick,
+    h("label", { class: "small" }, listened, " I listened: this is ", m.pov_name, "'s own mic"), button);
+}
+
 function resolveMicRow(m, box) {
   const verified = m.status === "verified" || m.status === "owner_confirmed";
   let control = null;
-  if (m.status === "unverified") {
-    const tracks = m.metadata_tracks || [];
-    const pick = tracks.length
-      ? h("select", null, tracks.map((t) => h("option", { value: t.track, selected: t.track === m.suggested_track ? true : null },
-          `Track ${t.track}${t.speaker ? " · " + t.speaker : ""}`)))
-      : h("input", { type: "number", min: 1, class: "num", value: m.suggested_track || "" });
-    // In-page confirmation (no native dialogs): the button stays disabled until the owner
-    // ticks "I listened", so a stray click or double-click can never record a confirmation.
-    const listened = h("input", { type: "checkbox" });
-    const button = h("button", { class: "btn small primary", disabled: true, onclick: action(async () => {
-      const track = parseInt(pick.value, 10);
-      if (!listened.checked) throw new Error("Tick “I listened” first");
-      if (!(track > 0)) throw new Error("Choose the mic track first");
-      await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
-      toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}: track ${track}`, "ok");
-      await loadResolvePreview(box);
-    }) }, "Confirm mic");
-    const sync = () => { button.disabled = !listened.checked; };
-    listened.addEventListener("change", sync);
-    pick.addEventListener("change", () => { listened.checked = false; sync(); });
-    control = h("div", { class: "row" }, pick,
-      h("label", { class: "small" }, listened, " I listened: this is ", m.pov_name, "'s own mic"), button);
+  if (m.status === "unverified" || m.status === "unmapped") {
+    control = micConfirmControl(m, box);
+  } else if (m.status === "owner_confirmed") {
+    // Let the owner correct a wrong pick without a dialog: reveal the same control on demand.
+    control = h("div", null);
+    control.appendChild(h("button", { class: "btn small", onclick: () => control.replaceChildren(micConfirmControl(m, box)) }, "Change…"));
   }
+  const expected = m.expected_track
+    ? ` · metadata expects track ${m.expected_track}` +
+      ((m.options || []).some((o) => o.track === m.expected_track) ? "" : ", which the MP4 cannot supply")
+    : "";
   const says = verified
     ? `Track ${m.transcriber_track} · ${m.speaker}${m.mp4_audio_title ? " · MP4 “" + m.mp4_audio_title + "”" : ""}` +
       (m.resolve_channels ? ` → Resolve ch ${m.resolve_channels.join("-")}` : "")
@@ -875,7 +897,8 @@ function resolveMicRow(m, box) {
   return h("tr", null,
     h("td", null, m.pov_name), h("td", null, m.part_index ?? m.part_id),
     h("td", null, h("span", { class: "badge " + (verified ? "good" : "bad") }, m.status.replace("_", " "))),
-    h("td", { class: "small" }, says, verified ? h("div", { class: "muted small" }, m.evidence || "") : h("div", { class: "bad-text small" }, m.message || "")),
+    h("td", { class: "small" }, says, expected && h("span", { class: "muted" }, expected),
+      verified ? h("div", { class: "muted small" }, m.evidence || "") : h("div", { class: "bad-text small" }, m.message || "")),
     h("td", null, control));
 }
 

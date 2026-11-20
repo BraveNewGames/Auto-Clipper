@@ -74,13 +74,24 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
 1. *Preview* lists the segments (an event that crosses a recording-part boundary is split into
    consecutive segments), the angles per segment, POVs that are unavailable and why, and the
    microphone status of each part. Nothing is written.
-2. Blockers are shown in red. A microphone whose label the transcriber *inferred* must be checked:
-   listen to that track, then choose it and click **Confirm mic (I listened)**. This writes only
-   `<session folder>\.autoclipper\mic_confirmations.json`.
+2. Blockers are shown in red. A microphone is **verified** only when the transcriber JSON
+   positively attributes exactly one track to the recording's owner from the file name
+   (`speaker_template` `{Recorder}`, no relabelling) and that track matches exactly one MP4 audio
+   stream. **Every other mic needs your confirmation**: labels the transcriber relabelled or
+   *inferred* (`relabel_history`), a missing or ambiguous owner track, and *unmapped* mics whose
+   track does not match the MP4's audio streams. Listen to the MP4, pick the owner's track from the
+   list (it only offers the MP4's real audio tracks, marking the one the metadata expects), tick
+   **I listened**, then **Confirm mic**. Use **Change…** to correct a wrong pick; the new choice
+   replaces the old one for that part. This writes only
+   `<session folder>\.autoclipper\mic_confirmations.json`. If the metadata names a track the MP4
+   cannot supply under that number, that track cannot be confirmed from the UI.
 3. **Export to Resolve** (enabled only with no blockers) writes `manifest.json` and `report.md`
    to `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\`, then creates the new
    project **AutoClipper Export `<session id>` `<timestamp>`**, saves it, reopens it to verify it,
    and writes `readback.json` next to the report. Errors from Resolve are shown as-is.
+   Keep Auto-Clipper running until the export finishes: stopping it (or a 30-minute timeout)
+   stops the export, and a partly built *AutoClipper Export …* project may be left in Resolve.
+   Delete that project and export again.
 
 Audio uses Resolve multicam *Source* mode: each angle carries its owner's mic (one switchable
 pair). Game audio is reported as not identified unless the transcriber metadata names it.

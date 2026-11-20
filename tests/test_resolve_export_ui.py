@@ -25,11 +25,11 @@ INVENTORY = [
 ]
 
 
-def _metadata(name, inferred=False):
+def _metadata(name, inferred=False, track=2):
     data = {
-        "speaker_tracks": [{"track": 2, "speaker": name, "speaker_template": "{Recorder}",
-                            "index": 2, "title": "Track2"}],
-        "recorder": {"name": name, "source": "filename", "tracks": [2]},
+        "speaker_tracks": [{"track": track, "speaker": name, "speaker_template": "{Recorder}",
+                            "index": track, "title": f"Track{track}"}],
+        "recorder": {"name": name, "source": "filename", "tracks": [track]},
     }
     if inferred:
         data["original_speaker_tracks"] = [{"track": 2, "speaker": "Speaker 2"}]
@@ -73,7 +73,7 @@ class ResolveApiCase(unittest.TestCase):
         self.assertEqual(status, expect, payload[:800])
         return json.loads(payload.decode("utf-8"))
 
-    def make_session(self, inferred_beta=False):
+    def make_session(self, inferred_beta=False, beta_track=2):
         folder = self.tmp / "session"
         session = Session(session_id="synthetic-ui", folder=str(folder), povs=[
             POV("alpha", "Alpha", [Part("alpha-p1", 1, "alpha1.mkv", duration=20, offset=0)]),
@@ -84,7 +84,8 @@ class ResolveApiCase(unittest.TestCase):
             (folder / f"{stem}.mp4").touch()
             dest = folder.parent / "_Transcripts" / stem
             dest.mkdir(parents=True)
-            (dest / f"{stem}.json").write_text(json.dumps(_metadata(name, inferred)), encoding="utf-8")
+            (dest / f"{stem}.json").write_text(
+                json.dumps(_metadata(name, inferred, beta_track if name == "Beta" else 2)), encoding="utf-8")
         for sid, first, last in (("one", 1, 3), ("two", 5, 6), ("three", 8, 10)):
             session.suggestions.append(Suggestion(sid, "synthetic", event_id=f"EV-{sid}", title=f"Moment {sid}",
                                                   start=first, end=last))
@@ -93,14 +94,18 @@ class ResolveApiCase(unittest.TestCase):
         self.call("/api/session/open", {"folder": str(folder)})
         return folder
 
-    def stub_builder(self, result=(0, json.dumps({"project": "stub", "reopened": True}), ""), gate=None):
+    def stub_builder(self, result=(0, {"project": "stub", "reopened": True}, ""), gate=None):
         calls = []
 
-        def run(manifest_path, project):
-            calls.append((manifest_path, project))
+        def run(manifest_path, project, result_path):
+            calls.append((manifest_path, project, result_path))
             if gate is not None:
                 gate.wait(10)
-            return result
+            code, readback, stderr = result
+            if readback is not None:
+                result_path.write_text(json.dumps(readback), encoding="utf-8")
+            # Noise on stdout must not matter: the result comes from the result file.
+            return code, "progress text, not JSON\n", stderr
 
         self.app.run_builder = run
         return calls
@@ -157,7 +162,7 @@ class TestResolveExportApi(ResolveApiCase):
         self.assertEqual(mics["alpha-p1"]["status"], "verified")
         self.assertEqual(mics["alpha-p1"]["resolve_channels"], [3, 4])
         beta = mics["beta-p1"]
-        self.assertEqual((beta["status"], beta["suggested_track"]), ("unverified", 2))
+        self.assertEqual((beta["status"], beta["expected_track"], beta["default_track"]), ("unverified", 2, 2))
         self.assertEqual(beta["relabel_provenance"], ["inferred_from_labels"])
         self.assertEqual(beta["metadata_tracks"], [{"track": 2, "speaker": "Beta", "title": "Track2"}])
         self.call("/api/resolve/export", {}, expect=409)
@@ -199,7 +204,7 @@ class TestResolveExportApi(ResolveApiCase):
         self.assertEqual(job["project"], f"AutoClipper Export synthetic-ui {out.name}")
         done = self.wait_job()
         self.assertEqual(done["state"], "done", done)
-        self.assertEqual(calls, [(out / "manifest.json", job["project"])])
+        self.assertEqual(calls, [(out / "manifest.json", job["project"], out / "readback.json")])
         manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["blockers"], [])
         self.assertEqual([s["suggestion_id"] for s in manifest["segments"]], ["one", "two", "three"])
@@ -222,11 +227,19 @@ class TestResolveExportApi(ResolveApiCase):
     def test_builder_failure_is_surfaced_verbatim(self):
         self.make_session()
         message = "Resolve export stopped: Save and close the active owner project before starting a Resolve export"
-        self.stub_builder(result=(1, "", message + "\n"))
+        self.stub_builder(result=(1, None, message + "\n"))
         self.call("/api/resolve/export", {})
         job = self.wait_job()
         self.assertEqual((job["state"], job["error"]), ("failed", message))
         self.assertFalse(Path(job["out_dir"], "readback.json").exists())
+
+    def test_missing_result_file_is_a_failure(self):
+        self.make_session()
+        self.stub_builder(result=(0, None, ""))
+        self.call("/api/resolve/export", {})
+        job = self.wait_job()
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("without writing its result file", job["error"])
 
     def test_builder_timeout_is_reported(self):
         self.make_session()
@@ -242,15 +255,127 @@ class TestResolveExportApi(ResolveApiCase):
 
     def test_run_builder_command_line(self):
         manifest = self.tmp / "manifest.json"
-        with patch("autoclipper.server.subprocess.run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "{}", "")
-            self.assertEqual(self.app.run_builder(manifest, "AutoClipper Export s 20260101-000000"), (0, "{}", ""))
-        args, kwargs = run.call_args
+        result = self.tmp / "readback.json"
+        with patch("autoclipper.server.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = ("{}", "")
+            popen.return_value.returncode = 0
+            self.assertEqual(self.app.run_builder(manifest, "AutoClipper Export s 20260101-000000", result),
+                             (0, "{}", ""))
+        args, kwargs = popen.call_args
         self.assertEqual(args[0], [sys.executable, "-m", "autoclipper.resolve_builder", str(manifest),
-                                   "--execute", "--project", "AutoClipper Export s 20260101-000000"])
+                                   "--execute", "--project", "AutoClipper Export s 20260101-000000",
+                                   "--result-file", str(result)])
         self.assertEqual(Path(kwargs["cwd"]), ROOT)
-        self.assertEqual(kwargs["timeout"], self.app.builder_timeout)
+        popen.return_value.communicate.assert_called_once_with(timeout=self.app.builder_timeout)
+        self.assertIsNone(self.app._builder_proc)
 
+    def test_builder_child_is_killed_on_timeout_and_stopped_on_exit(self):
+        self.app.builder_command = [sys.executable, "-c", "import time; time.sleep(60)"]
+        self.app.builder_timeout = 1
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.app.run_builder(self.tmp / "m.json", "p", self.tmp / "r.json")
+        self.assertLess(time.monotonic() - started, 30)
+
+        self.app.builder_timeout = 60
+        outcome = {}
+        worker = threading.Thread(target=lambda: outcome.update(
+            result=self.app.run_builder(self.tmp / "m.json", "p", self.tmp / "r.json")))
+        worker.start()
+        for _ in range(500):
+            if self.app._builder_proc is not None:
+                break
+            time.sleep(0.01)
+        proc = self.app._builder_proc
+        self.assertIsNotNone(proc)
+        self.app.stop_builder()  # what the atexit hook runs when the server stops
+        worker.join(20)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNotNone(proc.poll())
+        self.assertNotEqual(outcome["result"][0], 0)
+
+
+class TestMicChoices(ResolveApiCase):
+    def test_confirm_rejects_tracks_missing_from_the_mp4(self):
+        folder = self.make_session(inferred_beta=True)
+        beta = {m["part_id"]: m for m in self.call("/api/resolve/preview")["mics"]}["beta-p1"]
+        self.assertEqual(beta["expected_track"], 2)
+        self.assertEqual(beta["default_track"], 2)
+        self.assertEqual([(o["track"], o["mp4_audio_ordinal"], o["resolve_channels"]) for o in beta["options"]],
+                         [(1, 1, [1, 2]), (2, 2, [3, 4])])
+        refused = self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 3}, expect=400)
+        self.assertIn("Track 3 is not an audio track of beta1.mp4", refused["error"])
+        self.assertIn("track 2 (MP4 audio 2", refused["error"])
+        self.assertFalse((folder / ".autoclipper" / "mic_confirmations.json").exists())
+        (folder / "beta1.mp4").unlink()
+        refused = self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 2}, expect=409)
+        self.assertIn("No OBS-remuxed MP4", refused["error"])
+
+    def test_unmapped_mic_can_be_cleared_and_a_wrong_pick_corrected(self):
+        # Metadata names track 3, but the MP4 only has two audio streams.
+        folder = self.make_session(beta_track=3)
+        preview = self.call("/api/resolve/preview")
+        self.assertEqual({(b["code"], b["part_id"]) for b in preview["manifest"]["blockers"]},
+                         {("mic_unmapped", "beta-p1")})
+        mics = {m["part_id"]: m for m in preview["mics"]}
+        self.assertNotIn("options", mics["alpha-p1"])  # verified from recorder metadata
+        beta = mics["beta-p1"]
+        self.assertEqual((beta["status"], beta["expected_track"], beta["default_track"]), ("unmapped", 3, None))
+        self.assertEqual([o["track"] for o in beta["options"]], [1, 2])
+
+        self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 3}, expect=400)
+        self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 1})
+        preview = self.call("/api/resolve/preview")
+        self.assertTrue(preview["can_export"])
+        beta = {m["part_id"]: m for m in preview["mics"]}["beta-p1"]
+        self.assertEqual((beta["status"], beta["transcriber_track"], beta["default_track"]),
+                         ("owner_confirmed", 1, 1))
+        self.assertEqual([o["track"] for o in beta["options"]], [1, 2])  # can still be corrected
+
+        self.call("/api/resolve/confirm-mic", {"part_id": "beta-p1", "transcriber_track": 2})
+        data = json.loads((folder / ".autoclipper" / "mic_confirmations.json").read_text(encoding="utf-8"))
+        self.assertEqual([(r["part_id"], r["transcriber_track"]) for r in data["confirmations"]], [("beta-p1", 2)])
+        beta = {m["part_id"]: m for m in self.call("/api/resolve/preview")["mics"]}["beta-p1"]
+        self.assertEqual((beta["transcriber_track"], beta["resolve_channels"]), (2, [3, 4]))
+
+
+class TestResolveLocking(ResolveApiCase):
+    def test_probe_runs_outside_the_app_lock_and_session_changes_are_detected(self):
+        self.make_session()
+        seen = {}
+
+        def probe(path):
+            if "lock_free" not in seen:
+                result = {}
+
+                def try_lock():  # from another thread, as a concurrent request would
+                    result["ok"] = self.app.lock.acquire(timeout=0.5)
+                    if result["ok"]:
+                        self.app.lock.release()
+
+                t = threading.Thread(target=try_lock)
+                t.start()
+                t.join()
+                seen["lock_free"] = result["ok"]
+                # Another request edits the session while the MP4s are being probed.
+                self.call("/api/review", {"suggestion_id": "two", "status": seen.get("status", "reject")})
+            return INVENTORY
+
+        with patch("autoclipper.resolve_manifest.probe_streams", side_effect=probe):
+            refused = self.call("/api/resolve/preview", expect=409)
+        self.assertTrue(seen["lock_free"])
+        self.assertIn("session changed", refused["error"])
+        preview = self.call("/api/resolve/preview")
+        self.assertEqual([s["suggestion_id"] for s in preview["manifest"]["segments"]], ["one", "three"])
+
+        seen.clear()
+        seen["status"] = "maybe"  # a real change again for the export attempt
+        calls = self.stub_builder()
+        with patch("autoclipper.resolve_manifest.probe_streams", side_effect=probe):
+            self.call("/api/resolve/export", {}, expect=409)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.call("/api/resolve/status")["state"], "idle")
+        self.assertFalse((self.tmp / "session" / "autoclipper_exports").exists())
 
 if __name__ == "__main__":
     unittest.main()
