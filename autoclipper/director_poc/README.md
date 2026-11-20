@@ -63,8 +63,9 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
 `python -m autoclipper.resolve_manifest <session-folder> --full-session --dry-run`
 plans a review without contacting Resolve or writing outputs. Omit `--dry-run` and
 provide `--out <scratch-dir>` to save the manifest when authorized. The existing
-`resolve_builder` accepts this manifest. Ordinary reviewed Keep exports still use
-the existing strict Stage 2 planning path.
+`resolve_builder` accepts this manifest. The scratch companion's `prepare` command
+uses the same coverage-aware planner with its approved temp inputs. Ordinary
+reviewed Keep exports still use the existing strict Stage 2 planning path.
 
 The review anchors each part at its nearest session frame and uses the verified
 MP4 frame count or a conservative count from video-stream duration. The requested

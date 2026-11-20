@@ -1,18 +1,15 @@
 """Run only during the owner-approved Resolve window, except for prepare."""
 
 import argparse
-from dataclasses import replace
 from datetime import datetime
 from functools import partial
 import json
-from math import floor
 from pathlib import Path
 from shutil import copyfile
 from tempfile import gettempdir, mkdtemp
 
-from ..models import Review as Selection, Suggestion
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
-from ..resolve_manifest import _part_media, build_manifest
+from ..resolve_manifest import build_review_manifest
 from ..store import _write_json, load_session
 from .core import NoteStore, connect_review
 
@@ -43,26 +40,14 @@ def prepare(args):
         if not part.video_path:
             raise ValueError("A session part has no video path")
         path = (root / part.video_path).resolve()
-        if not path.is_relative_to(root):
+        source_path = path.with_suffix(".mp4") if path.suffix.lower() == ".mkv" else path
+        if not path.is_relative_to(root) or not source_path.resolve().is_relative_to(root):
             raise ValueError("A recording path lies outside the approved media root")
         part.video_path = str(path)
     confirmed = read(confirmations)["confirmations"]
     session.folder = str(scratch)
     session.session_id = "DirectorA REVIEW"
-    roots = [metadata] if metadata else []
-    for pov, part in session.all_parts():
-        _, probed, problem, _ = _part_media(scratch, roots, pov, part, confirmed, args.fps)
-        if problem:
-            raise ValueError(f"Cannot verify recording part {part.part_id}: {problem}")
-        part.duration = probed.duration
-    first = min(0, *(part.offset for _, part in session.all_parts()))
-    # Put the selection origin on the canonical session frame grid.
-    first = floor(first * args.fps) / args.fps
-    end = max(part.offset + part.duration for _, part in session.all_parts())
-    proposal = Suggestion(suggestion_id="review", event_id="review", title="Full session review",
-                          start=first, end=end)
-    session = replace(session, suggestions=[proposal], reviews={"review": Selection(status="keep")})
-    manifest = build_manifest(session, transcripts_dir=metadata, confirmations=confirmed, fps=args.fps)
+    manifest = build_review_manifest(session, transcripts_dir=metadata, confirmations=confirmed, fps=args.fps)
     _write_json(scratch / "manifest.json", manifest)
     validate_manifest(manifest)
     print(f"Verified {len(manifest['segments'])} planned segments at {args.fps} fps")
