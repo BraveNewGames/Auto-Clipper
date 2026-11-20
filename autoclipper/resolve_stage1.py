@@ -103,7 +103,7 @@ def verify_item(item, source_in, source_out, record_in, *, verify_source_end=Tru
     return row
 
 
-def append_clip(pool, clip, first, last, record, track, *, with_audio=False):
+def append_clip(pool, clip, first, last, record, track, *, with_audio=False, audio_only=False):
     # Resolve 21.2.0.6 treated the append endpoint as exclusive.
     info = {
         "mediaPoolItem": clip,
@@ -112,7 +112,9 @@ def append_clip(pool, clip, first, last, record, track, *, with_audio=False):
         "recordFrame": record,
         "trackIndex": track,
     }
-    if not with_audio:
+    if audio_only:
+        info["mediaType"] = 2
+    elif not with_audio:
         info["mediaType"] = 1
     require(pool.AppendToTimeline([info]), "Resolve did not append the clip")
 

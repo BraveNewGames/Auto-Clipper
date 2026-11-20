@@ -3,11 +3,15 @@
 import argparse
 import json
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from tempfile import mkdtemp
+from textwrap import fill
 
+from .media import FFMPEG_BIN
 from .resolve_stage1 import append_clip, isolate_mic, read_item, require
 
 
@@ -30,13 +34,18 @@ def validate_manifest(manifest):
     if not isinstance(manifest["session_id"], str) or not manifest["session_id"].strip():
         raise ValueError("Expected a nonempty session ID")
 
-    review = manifest.get("mode") == "director_review"
+    mode = manifest.get("mode")
+    review = mode == "director_review"
+    edit = mode == "director_edit_plan"
+    if edit and any(not manifest["edit_plan"].get(key) for key in ("plan_id", "revision_id")):
+        raise ValueError("Edit manifest needs plan and revision IDs")
     if review:
         origin, review_end = manifest["review_session_frames"]
         if (type(origin) is not int or type(review_end) is not int or origin >= review_end
                 or not manifest["segments"][0]["angles"] or not manifest["segments"][-1]["angles"]):
             raise ValueError("Review needs covered first and last segments")
     media = {}
+    segment_ids = set()
     record = 0
     for segment in manifest["segments"]:
         length = segment["duration_frames"]
@@ -48,14 +57,36 @@ def validate_manifest(manifest):
                     or segment["session_end_frame"] - segment["session_start_frame"] != length
                     or segment["kind"] != ("media" if segment["angles"] else "coverage_gap")):
                 raise ValueError("Review segment differs from the declared session coverage")
+        elif edit and segment["kind"] == "placeholder":
+            if (segment["angles"] or any(key in segment for key in (
+                    "session_start_frame", "session_end_frame", "session_start", "session_end", "audio_angle"))
+                    or not isinstance(segment["title"], str) or not segment["title"].strip()
+                    or segment.get("placeholder_reason") not in ("planned_missing_beat", "source_unavailable")):
+                raise ValueError("Placeholder needs a label and no source coordinates")
+        elif edit:
+            if (segment["kind"] != "media" or not segment["angles"]
+                    or type(segment["session_start_frame"]) is not int
+                    or type(segment["session_end_frame"]) is not int
+                    or segment["session_end_frame"] - segment["session_start_frame"] != length):
+                raise ValueError("Expected bounded media or a labeled placeholder")
         elif not segment["angles"]:
             raise ValueError("Segments need at least one angle")
+        if not edit and ("audio_angle" in segment or segment.get("kind") == "placeholder"):
+            raise ValueError("Slates and independent audio choices require an edit plan")
         # Read marker identity during preflight, before making a project.
         marker_data(segment)
+        if edit:
+            if segment["segment_id"] in segment_ids:
+                raise ValueError("Edit segment IDs must be unique")
+            segment_ids.add(segment["segment_id"])
         record += length
         povs = set()
         paths = set()
-        for angle in segment["angles"]:
+        angles = segment["angles"]
+        audio = segment.get("audio_angle") if edit else None
+        if audio is not None and audio not in angles:
+            angles = [*angles, audio]
+        for angle in angles:
             path = Path(angle["mp4_path"])
             if not path.is_absolute() or path.suffix.lower() != ".mp4":
                 raise ValueError("Each angle needs an absolute MP4 path")
@@ -69,8 +100,9 @@ def validate_manifest(manifest):
             first, last = angle["source_in_frame"], angle["source_out_frame"]
             if type(first) is not int or type(last) is not int or first < 0 or last - first != length:
                 raise ValueError("Each angle must cover the whole segment in source frames")
-            if review and (type(angle.get("source_frame_count")) is not int or last > angle["source_frame_count"]):
-                raise ValueError("Review angle exceeds verified source frames")
+            if (review or edit) and (type(angle.get("source_frame_count")) is not int
+                                     or last > angle["source_frame_count"]):
+                raise ValueError("Director angle exceeds verified source frames")
             mic = angle["mic"]
             track = mic["transcriber_track"]
             expected_track = mic.get("expected_owner_track", track)
@@ -94,7 +126,9 @@ def validate_manifest(manifest):
 
 
 def marker_data(segment):
-    return {key: segment[key] for key in ("event_id", "suggestion_id", "title", "segment_id")}
+    base = {key: segment[key] for key in ("event_id", "suggestion_id", "title", "segment_id")}
+    base.update({key: segment[key] for key in ("candidate_ids", "note_ids", "placeholder_reason") if key in segment})
+    return base
 
 
 def project_is_active(manager, project, name):
@@ -219,12 +253,52 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
             f"Unexpected multicam type or length for {multicam_name}")
     require(project.SetCurrentTimeline(timeline), "Could not activate the export timeline")
     offset = segment["record_start_frame"]
-    append_clip(pool, multicam, 0, length, timeline.GetStartFrame() + offset, 1, with_audio=True)
+    record = timeline.GetStartFrame() + offset
+    audio = segment.get("audio_angle")
+    append_clip(pool, multicam, 0, length, record, 1, with_audio=audio is None)
+    if audio is not None:
+        source = clips[Path(audio["mp4_path"]).resolve()]
+        require(int(source.GetClipProperty("Frames")) >= audio["source_out_frame"],
+                "Selected audio range exceeds source media")
+        append_clip(pool, source, audio["source_in_frame"], audio["source_out_frame"], record, 1, audio_only=True)
     marker = marker_data(segment)
     note = f"Event {marker['event_id']} | Suggestion {marker['suggestion_id']} | {marker['title']}"
     require(timeline.AddMarker(offset, "Blue", marker["title"] or marker["event_id"], note,
                                length, json.dumps(marker)),
             f"Could not add marker for {multicam_name}")
+
+
+def render_placeholder(folder, segment, fps):
+    """Create one silent labeled slate. Keep its scratch media for project reopen."""
+    label = "MISSING FOOTAGE\n" + fill(segment["title"], width=38)
+    (folder / "label.txt").write_text(label, encoding="utf-8")
+    target = folder / "placeholder.mp4"
+    executable = shutil.which("ffmpeg") or FFMPEG_BIN / "ffmpeg.exe"
+    source = f"color=c=0x151a27:s=1280x720:r={fps}"
+    draw = ("drawtext=textfile=label.txt:expansion=none:fontcolor=white:fontsize=48:"
+            "line_spacing=14:x=(w-tw)/2:y=(h-th)/2")
+    try:
+        subprocess.run([str(executable), "-v", "error", "-nostdin", "-f", "lavfi", "-i", source,
+                        "-vf", draw, "-frames:v", str(segment["duration_frames"]), "-an", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", str(target)], cwd=folder, capture_output=True, check=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Could not render a labeled slate with the installed ffmpeg") from exc
+    return target
+
+
+def build_placeholder(project, pool, timeline, segment, path):
+    clips = pool.ImportMedia([str(path)])
+    require(clips and len(clips) == 1, "Could not import the missing-footage slate")
+    clip = clips[0]
+    name = f"MISSING FOOTAGE: {segment['title']}"
+    require(clip.SetName(name), "Could not label the missing-footage slate")
+    length = segment["duration_frames"]
+    require(int(clip.GetClipProperty("Frames")) == length, "Slate duration differs from the plan")
+    require(project.SetCurrentTimeline(timeline), "Could not activate the edit timeline")
+    offset = segment["record_start_frame"]
+    append_clip(pool, clip, 0, length, timeline.GetStartFrame() + offset, 1)
+    require(timeline.AddMarker(offset, "Red", name, segment["placeholder_reason"], length,
+                               json.dumps(marker_data(segment))), "Could not label the missing beat")
 
 
 def restore_source_marks(modified):
@@ -266,24 +340,36 @@ def read_angles(multicam, segment):
     return rows
 
 
-def read_export(timeline, segments, names):
+def read_export(timeline, segments, names, placeholders=None):
+    placeholders = placeholders or {}
     record = timeline.GetStartFrame()
     tracks = {kind: sorted(timeline.GetItemListInTrack(kind, 1) or [], key=lambda item: item.GetStart())
               for kind in ("video", "audio")}
-    expected = sum(bool(segment["angles"]) for segment in segments)
-    require(all(len(items) == expected for items in tracks.values()),
+    expected_audio = sum(bool(segment["angles"]) for segment in segments)
+    require(len(tracks["video"]) == expected_audio + len(placeholders) and len(tracks["audio"]) == expected_audio,
             "Export must have one video and one audio item per segment")
-    items = iter(zip(tracks["video"], tracks["audio"]))
+    videos, audios = iter(tracks["video"]), iter(tracks["audio"])
     rows = []
     for segment, name in zip(segments, names):
-        if not segment["angles"]:
-            rows.append({**segment, "record_start_frame": record + segment["record_start_frame"]})
-            continue
-        video, audio = next(items)
-        multicam = video.GetMediaPoolItem()
         start = record + segment["record_start_frame"]
         length = segment["duration_frames"]
-        for item in (video, audio):
+        if segment.get("kind") == "placeholder":
+            video = next(videos)
+            row = read_item(video)
+            marker = json.loads(timeline.GetMarkerCustomData(segment["record_start_frame"]))
+            require(Path(row["path"]).resolve() == placeholders[segment["segment_id"]]
+                    and row["record_start"] == start and row["record_end"] == start + length
+                    and row["duration"] == length and row["source_start"] == 0
+                    and marker == marker_data(segment), "Missing-footage slate differs from the plan")
+            rows.append({**segment, "record_start_frame": start, "video": row})
+            continue
+        if not segment["angles"]:
+            rows.append({**segment, "record_start_frame": start})
+            continue
+        video, audio = next(videos), next(audios)
+        multicam = video.GetMediaPoolItem()
+        selected_audio = segment.get("audio_angle")
+        for item in (video,) if selected_audio is not None else (video, audio):
             media = item.GetMediaPoolItem()
             require(media and media.GetUniqueId() == multicam.GetUniqueId() and media.GetName() == name
                     and media.GetClipProperty("Type") == "Multicam"
@@ -291,11 +377,17 @@ def read_export(timeline, segments, names):
                     and item.GetStart() == start and item.GetEnd() == start + length
                     and item.GetDuration() == length and item.GetSourceStartFrame() == 0,
                     f"Parent media or record range differs for {name}")
+        if selected_audio is not None:
+            actual = read_item(audio)
+            require(Path(actual["path"]).resolve() == Path(selected_audio["mp4_path"]).resolve()
+                    and actual["record_start"] == start and actual["record_end"] == start + length
+                    and actual["duration"] == length and actual["source_start"] == selected_audio["source_in_frame"],
+                    f"Selected microphone source or placement differs for {name}")
         audio_mapping = json.loads(audio.GetSourceAudioChannelMapping())
         stereo_channels(audio_mapping)
         marker = json.loads(timeline.GetMarkerCustomData(segment["record_start_frame"]))
         require(marker == marker_data(segment), f"Marker readback differs for {name}")
-        timing = {key: segment[key] for key in ("kind", "session_start_frame", "session_end_frame")
+        timing = {key: segment[key] for key in ("kind", "session_start_frame", "session_end_frame", "audio_angle")
                   if key in segment}
         rows.append({
             **marker, **timing, "multicam": name, "record_start_frame": start, "duration_frames": length,
@@ -316,13 +408,19 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     warnings = list(manifest["warnings"]) + [
         {"code": "short_segment", "event_id": segment["event_id"], "segment_id": segment["segment_id"],
          "message": f"Short multicam segment ({segment['duration_frames']} frames)."}
-        for segment in manifest["segments"] if segment["duration_frames"] < manifest["fps"]
+        for segment in manifest["segments"] if segment["angles"] and segment["duration_frames"] < manifest["fps"]
     ]
     if dry_run:
         return {"mode": "dry-run", "manifest": manifest, "warnings": warnings}
     for path in media:
         if not path.is_file():
             raise ValueError(f"MP4 is missing: {path}")
+
+    slates = {}
+    for segment in manifest["segments"]:
+        if segment.get("kind") == "placeholder":
+            folder = Path(mkdtemp(prefix="autoclipper-missing-footage-"))
+            slates[segment["segment_id"]] = render_placeholder(folder, segment, manifest["fps"]).resolve()
 
     import DaVinciResolveScript
 
@@ -342,7 +440,9 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     for segment, multicam_name in zip(segments, names):
         if segment["angles"]:
             build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps)
-    read_export(timeline, segments, names)
+        elif segment.get("kind") == "placeholder":
+            build_placeholder(project, pool, timeline, segment, slates[segment["segment_id"]])
+    read_export(timeline, segments, names, slates)
     require(project_is_active(manager, project, name), "Export project is no longer active")
     require(manager.SaveProject(), f"Could not save {name}")
     require(project_is_active(manager, project, name), "Export project changed before reload")
@@ -370,7 +470,7 @@ def build_export(manifest, *, dry_run=False, project_name=None):
                     f"Reopened mic mapping differs for {key}")
             persisted[key] = {"path": str(key), "pov_name": pov_name, "mic_channels": list(channels)}
     require(persisted.keys() == media.keys(), "Reopened export is missing source media")
-    rows = read_export(timeline, segments, names)
+    rows = read_export(timeline, segments, names, slates)
     limitations = [
         "Source audio provides one switchable owner-mic pair. Game audio is not identified by manifest v1.",
         "Reported source handles are not included in the marked multicam extents.",
@@ -382,7 +482,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     if name.startswith(DIRECTOR_TEST_PREFIX):
         identity = {"project_id": require(reopened.GetUniqueId(), "Missing project ID"),
                     "timeline_id": require(timeline.GetUniqueId(), "Missing timeline ID")}
-    review = {key: manifest[key] for key in ("mode", "review_session_frames", "uncovered_edges") if key in manifest}
+    review = {key: manifest[key] for key in ("mode", "review_session_frames", "uncovered_edges", "edit_plan")
+              if key in manifest}
     return {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity, **review,
             "sources": list(persisted.values()), "segments": rows,
             "warnings": warnings, "limitations": limitations}

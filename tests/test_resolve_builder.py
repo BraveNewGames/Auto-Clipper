@@ -138,22 +138,25 @@ def fake_resolve():
 
     def append(infos):
         info, = infos
-        assert "mediaType" not in info
         start = info["recordFrame"]
         length = info["endFrame"] - info["startFrame"]
-        for kind in ("video", "audio"):
+        source_start = info["startFrame"]
+        streams = {1: ("video",), 2: ("audio",)}.get(info.get("mediaType"), ("video", "audio"))
+        items = []
+        for kind in streams:
             item = Mock()
             item.GetMediaPoolItem.return_value = info["mediaPoolItem"]
             item.GetStart.return_value = start
             item.GetEnd.return_value = start + length
             item.GetDuration.return_value = length
-            item.GetSourceStartFrame.return_value = 0
-            item.GetSourceEndFrame.return_value = length - 2
+            item.GetSourceStartFrame.return_value = source_start
+            item.GetSourceEndFrame.return_value = source_start + length - 2
             item.GetSourceAudioChannelMapping.return_value = json.dumps({
                 "track_mapping": {"1": {"channel_idx": [1, 2], "mute": False, "type": "stereo"}},
             })
             state[kind].append(item)
-        return [state["video"][-1]]
+            items.append(item)
+        return items
 
     def mark(frame, _color, _name, _note, _duration, data):
         state["markers"][frame] = data
@@ -267,6 +270,53 @@ class ResolveBuilderTests(unittest.TestCase):
                 with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
                     main([str(path), "--dry-run", "--result-file", str(failed)])
                 self.assertFalse(failed.exists())
+
+    def test_director_edit_build_keeps_selected_mic_and_silent_slate_after_reopen(self):
+        sdk, _, state, project, _ = fake_resolve()
+        pool = project.GetMediaPool.return_value
+        import_media = pool.ImportMedia.side_effect
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1", "placeholder"):
+                (root / f"{name}.mp4").touch()
+            segments = manifest["segments"]
+            manifest.update(mode="director_edit_plan", edit_plan={"plan_id": "demo", "revision_id": "r1"})
+            for segment in segments:
+                start = segment["record_start_frame"]
+                segment.update(kind="media", session_start_frame=start, session_end_frame=start + 60)
+                for angle in segment["angles"]:
+                    angle["source_frame_count"] = 600
+            video, audio = segments[0]["angles"]
+            segments[0].update(angles=[video], audio_angle=audio, note_ids=["note-1"])
+            slate = segments[1]
+            for field in ("session_start", "session_end", "session_start_frame", "session_end_frame"):
+                del slate[field]
+            slate.update(kind="placeholder", angles=[], placeholder_reason="planned_missing_beat", candidate_ids=[])
+
+            def import_with_slate(paths):
+                clips = import_media(paths)
+                if Path(paths[0]).name == "placeholder.mp4":
+                    clip, = clips
+                    properties = clip.GetClipProperty.side_effect
+                    clip.GetClipProperty.side_effect = lambda key: "60" if key == "Frames" else properties(key)
+                return clips
+
+            pool.ImportMedia.side_effect = import_with_slate
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder),
+                  patch("autoclipper.resolve_builder.render_placeholder", return_value=root / "placeholder.mp4")
+                  as render):
+                result = build_export(manifest)
+            self.assertEqual(result["edit_plan"]["revision_id"], "r1")
+            self.assertEqual(result["segments"][0]["audio"]["path"], str(root / "b1.mp4"))
+            self.assertEqual(result["segments"][0]["audio"]["source_start"], 120)
+            self.assertEqual(result["segments"][0]["note_ids"], ["note-1"])
+            self.assertEqual(result["segments"][1]["video"]["record_start"], 216060)
+            self.assertEqual(result["segments"][1]["video"]["name"], "MISSING FOOTAGE: Moment 1")
+            self.assertEqual(len(state["video"]), 4)
+            self.assertEqual(len(state["audio"]), 3)
+            render.assert_called_once_with(root, slate, 60)
 
     def test_director_review_preserves_blank_interior_frames_after_reopen(self):
         sdk, _, _, project, _ = fake_resolve()

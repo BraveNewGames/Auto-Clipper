@@ -75,3 +75,23 @@ overlap ambiguously. Missing or unverified media and microphone mappings still
 block the build. Review gap and placement handling have synthetic and mocked
 coverage. A later authorized Resolve session must verify native blank spans,
 one-angle and changing-angle multicams, and reopen behavior.
+
+## EditPlan assembler adapter
+
+`compile_edit_plan(session, plan, ...)` in `autoclipper.resolve_manifest`
+accepts the assembler projection of a Director plan. The projection has a plan
+ID, session ID, integer fps, revision ID, revision history, and ordered entries.
+A source entry provides half-open session frames and can specify a video POV and
+an independent microphone POV. An undecided choice keeps the verified multicam
+angles and existing Source-mode audio. Entries can carry candidate and note IDs.
+Placeholder entries supply a title and provisional output frames.
+
+The compiler splits entries at verified coverage changes and preserves edit
+order and evidence IDs. Where requested footage or the chosen mic has no
+coverage, it emits a labeled slate with no source coordinates. The existing
+builder renders slates with the installed FFmpeg, imports them as silent video,
+and assembles to a new project. Keep the generated slate files in the temporary
+directory while the project references them. A later authorized Resolve test
+must verify the native audio-only append, slate visibility and exact duration,
+and source and slate readback after reopen. No Resolve connection was made for
+Phase B verification.

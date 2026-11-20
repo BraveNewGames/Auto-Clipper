@@ -8,7 +8,9 @@ import unittest
 from unittest.mock import patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_manifest import _video_frames, build_manifest, build_review_manifest, main, render_report
+from autoclipper.resolve_manifest import (
+    _video_frames, build_manifest, build_review_manifest, compile_edit_plan, main, render_report,
+)
 from autoclipper.store import save_session
 
 
@@ -154,6 +156,49 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual(_video_frames({"nb_frames": "2", "duration": "0.033333"}, 60), 2)
         self.assertEqual(_video_frames({"duration_ts": 2, "time_base": "1/60"}, 60), 2)
         self.assertEqual(_video_frames({"duration": "0.033333"}, 60), 1)
+
+    def test_edit_plan_preserves_order_choices_and_provenance_across_split_and_gaps(self):
+        self.add_part("Alpha", duration=2)
+        self.add_part("Alpha", 2, offset=2, duration=2)
+        self.add_part("Bravo", duration=3)
+        entries = [
+            {"entry_id": "later", "kind": "source", "title": "Later first", "session_in": 100,
+             "session_out_exclusive": 190, "pov_id": "alpha", "audio_pov_id": "bravo",
+             "note_ids": ["note-a"], "candidate_ids": ["candidate-a"]},
+            {"entry_id": "missing", "kind": "placeholder", "title": "Intended beat", "provisional_frames": 15},
+            {"entry_id": "early", "kind": "source", "title": "Earlier last", "session_in": 5,
+             "session_out_exclusive": 10},
+        ]
+        plan = {"plan_id": "plan", "revision_id": "r2", "session_id": self.session.session_id, "fps": 60,
+                "revision_history": [{"revision_id": "r1"}], "entries": entries}
+        manifest = compile_edit_plan(self.session, plan)
+        self.assertEqual(manifest["blockers"], [])
+        self.assertEqual(manifest["edit_plan"]["revision_history"], [{"revision_id": "r1"}])
+        plan["revision_history"][0]["revision_id"] = "changed"
+        self.assertEqual(manifest["edit_plan"]["revision_history"][0]["revision_id"], "r1")
+        segments = manifest["segments"]
+        self.assertEqual([s["kind"] for s in segments], ["media", "media", "placeholder", "placeholder", "media"])
+        self.assertEqual([(s["record_start_frame"], s["duration_frames"]) for s in segments],
+                         [(0, 20), (20, 60), (80, 10), (90, 15), (105, 5)])
+        self.assertEqual([segments[i]["angles"][0]["part_id"] for i in (0, 1)], ["alpha-1", "alpha-2"])
+        self.assertEqual(segments[1]["audio_angle"]["source_in_frame"], 120)
+        self.assertEqual(segments[1]["note_ids"], ["note-a"])
+        self.assertEqual(segments[2]["candidate_ids"], ["candidate-a"])
+        for segment in segments[2:4]:
+            self.assertNotIn("session_start_frame", segment)
+            self.assertNotIn("session_end", segment)
+        self.assertEqual([s["placeholder_reason"] for s in segments[2:4]],
+                         ["source_unavailable", "planned_missing_beat"])
+        self.assertEqual([a["pov_id"] for a in segments[-1]["angles"]], ["alpha", "bravo"])
+        self.assertIn("Intended beat", render_report(manifest))
+
+    def test_edit_plan_rejects_placeholder_with_source_coordinates(self):
+        plan = {"plan_id": "plan", "revision_id": "r1", "session_id": self.session.session_id, "fps": 60,
+                "revision_history": [], "entries": [{"entry_id": "missing", "kind": "placeholder",
+                    "title": "Missing", "provisional_frames": 10, "session_in": 0}]}
+        with self.assertRaisesRegex(ValueError, "no source range"):
+            compile_edit_plan(self.session, plan)
+        self.probe.assert_not_called()
 
     def test_selection_ranges_order_warnings_and_report(self):
         self.add_part("Alpha")
