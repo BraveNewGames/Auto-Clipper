@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from autoclipper.models import Part, POV, Review, Session, Suggestion
 from autoclipper.resolve_builder import build_export, main
+from autoclipper.resolve_manifest import build_manifest
 
 
 def make_manifest(root):
@@ -158,6 +160,60 @@ def fake_resolve():
 
 
 class ResolveBuilderTests(unittest.TestCase):
+    def test_session_to_manifest_to_builder_dry_run(self):
+        sdk = Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            transcripts = root / "_Transcripts"
+            session = Session(session_id="synthetic-integration", folder=str(root), povs=[
+                POV("alpha", "Alpha", [Part("a1", 1, "a1.mkv", duration=2, offset=0),
+                                       Part("a2", 2, "a2.mkv", duration=5, offset=2)]),
+                POV("beta", "Beta", [Part("b1", 1, "b1.mkv", duration=2, offset=0)]),
+            ])
+            for part, name in (("a1", "Alpha"), ("a2", "Alpha"), ("b1", "Beta")):
+                (root / f"{part}.mp4").touch()
+                dest = transcripts / part
+                dest.mkdir(parents=True)
+                (dest / f"{part}.json").write_text(
+                    json.dumps({"speaker_tracks": {"audio_track_2": name}}), encoding="utf-8",
+                )
+            for sid, first, last in (("later", 4, 5), ("split", 1, 3), ("early", 0.25, 0.75)):
+                session.suggestions.append(Suggestion(sid, "synthetic", event_id=f"ev-{sid}",
+                                                       title=sid, start=first, end=last))
+                session.reviews[sid] = Review("keep")
+            inventory = [
+                {"index": 0, "codec_type": "video", "r_frame_rate": "60/1"},
+                {"index": 1, "codec_type": "audio", "channels": 1, "tags": {"title": "Track1"}},
+                {"index": 7, "codec_type": "audio", "channels": 2, "tags": {"title": "Track2"}},
+            ]
+            path = root / "manifest.json"
+            output = io.StringIO()
+            with (patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory),
+                  patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), redirect_stdout(output)):
+                manifest = build_manifest(session)
+                self.assertEqual(manifest["blockers"], [])
+                path.write_text(json.dumps(manifest), encoding="utf-8")
+                main([str(path), "--dry-run"])
+                segments = json.loads(output.getvalue())["manifest"]["segments"]
+                self.assertEqual([s["suggestion_id"] for s in segments], ["early", "split", "split", "later"])
+                self.assertEqual([(s["record_start_frame"], s["duration_frames"]) for s in segments],
+                                 [(0, 30), (30, 60), (90, 60), (150, 60)])
+                self.assertEqual([{a["part_id"] for a in s["angles"]} for s in segments],
+                                 [{"a1", "b1"}, {"a1", "b1"}, {"a2"}, {"a2"}])
+                self.assertEqual({v["pov_id"] for v in segments[2]["unavailable"]}, {"beta"})
+                self.assertTrue(all(a["mic"]["resolve_channels"] == [2, 3]
+                                    for s in segments for a in s["angles"]))
+
+                (root / "a2.mp4").unlink()
+                blocked = build_manifest(session)
+                self.assertIn("mp4_missing", {item["code"] for item in blocked["blockers"]})
+                path.write_text(json.dumps(blocked), encoding="utf-8")
+                with self.assertRaises(SystemExit) as stopped, patch("sys.stderr", new_callable=io.StringIO) as err:
+                    main([str(path), "--dry-run"])
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertIn("Manifest has blockers", err.getvalue())
+        sdk.scriptapp.assert_not_called()
+
     def test_dry_run_and_blockers_never_contact_resolve(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
