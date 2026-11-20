@@ -1,6 +1,7 @@
 """Session-local editorial proposals grounded in the existing FKB."""
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from math import isfinite
 from typing import Protocol, Sequence
 
@@ -148,12 +149,27 @@ def _contains_quote(text, span):
     return bool(quoted and f" {quoted} " in f" {normalize(span.text)} ")
 
 
+def _quote_matches(quote, local_spans, packet_spans, database):
+    matches = [span for span in local_spans if _contains_quote(quote["text"], span)]
+    if quote.get("span_id"):
+        return [span for span in matches if span.span_id == quote["span_id"]]
+    if quote.get("time") is not None and matches:
+        # Consider occurrences outside the proposed cut too. A quote that
+        # points there must never be reassigned to an in-range repetition.
+        target = Fraction(str(quote["time"])) * database.session.fps
+        timed = [span for span in database.transcript_spans if _contains_quote(quote["text"], span)]
+        distances = [abs(span.frames["start"] - target) for span in timed]
+        nearest = min(distances)
+        closest = [span for span, distance in zip(timed, distances) if distance == nearest]
+        return closest if len(closest) > 1 else [span for span in closest if span in matches]
+    packet_ids = {span.span_id for span in packet_spans.get(quote.get("line"), [])
+                  if _contains_quote(quote["text"], span)}
+    return [span for span in matches if span.span_id in packet_ids] if packet_ids else matches
+
+
 def _review_candidates(database, source, suggestions, packet_lines, run_id, model, model_version):
     packet_spans = _packet_spans(database, packet_lines, source)
-    quoted_texts = [[quote["text"] for quote in suggestion.quotes]
-                    for suggestion in suggestions]
-    reviews.resolve_quote_lines(source, suggestions, plines=packet_lines)
-    for suggestion, texts in zip(suggestions, quoted_texts):
+    for suggestion in suggestions:
         logline = " — ".join(filter(None, (suggestion.title, suggestion.what_happens)))
         frames = None
         if (suggestion.kind == "clip_now" and isfinite(suggestion.start)
@@ -161,19 +177,21 @@ def _review_candidates(database, source, suggestions, packet_lines, run_id, mode
             frames = database.session.frames(suggestion.start, suggestion.end)
         local_spans = [span for span in database.transcript_spans
                        if frames and frames.overlaps(FrameRange(**span.frames))]
-        local_ids = {span.span_id for span in local_spans}
         cited = {}
         missed = 0
-        for quote, text in zip(suggestion.quotes, texts):
-            pool = (packet_spans.get(quote["line"], []) if quote.get("line") else local_spans)
-            matches = [span for span in pool if span.span_id in local_ids
-                       and not quote.get("line_unresolved") and _contains_quote(text, span)]
+        ambiguous = 0
+        for quote in suggestion.quotes:
+            matches = _quote_matches(quote, local_spans, packet_spans, database)
             if len(matches) == 1:
                 cited[matches[0].span_id] = matches[0]
+            elif matches:
+                ambiguous += 1
             else:
                 missed += 1
 
         caveats = [suggestion.uncertainty, suggestion.needs_visual_check]
+        if ambiguous:
+            caveats.append("Some quotes are ambiguous across repeated transcript occurrences.")
         if missed:
             caveats.append("Some quotes could not be uniquely verified in the proposed range.")
         if not cited and not suggestion.quotes:
@@ -203,8 +221,16 @@ def import_recommendations(database, source, review_json=None, *, run_id, model=
     if not run_id:
         raise ValueError("A stable review run ID is required")
     existing = review_json is None
-    suggestions = (deepcopy(source.suggestions) if existing
-                   else reviews.parse_review(review_json, reviewer))
+    if existing:
+        suggestions = deepcopy(source.suggestions)
+        for suggestion in suggestions:
+            if suggestion.raw:
+                # Legacy import fills missing quote timestamps from its packet match.
+                # Recover the reviewer's actual hints before disambiguating.
+                parsed, = reviews.parse_review([suggestion.raw], suggestion.reviewer_name)
+                suggestion.quotes = parsed.quotes
+    else:
+        suggestions = reviews.parse_review(review_json, reviewer)
     if not existing:
         # Parser IDs are provisional and may coincide with unrelated legacy decisions.
         source = replace(source, reviews={})
