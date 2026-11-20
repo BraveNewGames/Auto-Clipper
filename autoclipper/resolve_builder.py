@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
@@ -54,11 +55,13 @@ def validate_manifest(manifest):
             if type(first) is not int or type(last) is not int or first < 0 or last - first != length:
                 raise ValueError("Each angle must cover the whole segment in source frames")
             mic = angle["mic"]
+            track = mic["transcriber_track"]
             channels = mic["resolve_channels"]
-            if (mic["status"] not in ("verified", "owner_confirmed") or len(channels) != 2
+            if (mic["status"] not in ("verified", "owner_confirmed") or type(track) is not int
+                    or track <= 0 or len(channels) != 2
                     or any(type(ch) is not int or ch <= 0 for ch in channels) or channels[0] == channels[1]):
                 raise ValueError(f"Unverified stereo mic for {name}")
-            binding = (pov, name, tuple(channels))
+            binding = (pov, name, track, tuple(channels))
             if media.setdefault(path, binding) != binding:
                 raise ValueError(f"Conflicting POV or mic mappings for {path}")
     return media
@@ -105,17 +108,28 @@ def stereo_channels(mapping):
 
 def import_sources(pool, media, fps):
     clips = {}
-    for path, (_, name, channels) in media.items():
+    for path, (_, name, track, channels) in media.items():
         items = pool.ImportMedia([str(path)])
         require(items and len(items) == 1, f"Expected one imported clip for {path}")
         clip = items[0]
         require(Path(clip.GetClipProperty("File Path")).resolve() == path, f"Imported path differs for {path}")
         require(Fraction(clip.GetClipProperty("FPS")) == fps, f"Unexpected imported rate for {path}")
         audio = json.loads(clip.GetAudioMapping())
-        tracks = [key for key, track in audio["track_mapping"].items()
-                  if track["channel_idx"] == list(channels) and track["type"] == "stereo"]
-        require(len(tracks) == 1, f"Cannot uniquely match requested owner-mic channels for {path}")
-        isolate_mic(clip, tracks[0], list(channels))
+        inventory = audio["track_mapping"]
+        matching = [key for key, entry in inventory.items()
+                    if set(entry.get("channel_idx", [])) == set(channels)]
+        key = str(track)
+        entry = inventory.get(key, {})
+        labels = [re.fullmatch(r"track\s*0*(\d+)", str(entry.get(field, "")).strip(), re.I)
+                  for field in ("name", "title", "track_name")]
+        embedded = audio.get("embedded_audio_channels", max(channels))
+        require(matching == [key] and entry.get("channel_idx") == list(channels)
+                and entry.get("type") == "stereo" and embedded >= max(channels)
+                and not audio.get("linked_audio")
+                and all(label is None or int(label[1]) == track for label in labels),
+                f"Owner mic mismatch or ambiguity for {name} ({path}): "
+                f"expected Resolve track {track} to uniquely map to embedded channels {list(channels)}")
+        isolate_mic(clip, track, list(channels))
         require(clip.SetName(name) and clip.GetName() == name, f"Could not set source clip name to {name}")
         clips[path] = clip
     return clips
@@ -127,23 +141,31 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
         clip = clips[Path(angle["mp4_path"]).resolve()]
         first, last = angle["source_in_frame"], angle["source_out_frame"]
         require(int(clip.GetClipProperty("Frames")) >= last, f"Source range exceeds media for {angle['part_id']}")
-        require(clip.SetMarkInOut(first, last - 1), f"Could not set source marks for {angle['part_id']}")
-        marks = clip.GetMarkInOut()
-        expected = {"in": first, "out": last - 1}
-        require(marks.get("video") == marks.get("audio") == expected,
-                f"Source mark readback differs for {angle['part_id']}")
-        sources.append(clip)
+        sources.append((clip, first, last - 1, angle["part_id"]))
 
-    items = pool.CreateMulticamClip(sources, {
-        "name": multicam_name,
-        "startTimecode": START_TIMECODE,
-        "frameRate": fps,
-        "angleSyncMode": resolve.MULTICAM_ANGLE_SYNC_IN,
-        "angleNameMode": resolve.MULTICAM_ANGLE_NAME_CLIP,
-        "multicamAudioMode": resolve.MULTICAM_AUDIO_SOURCE,
-        "useFullClipExtents": False,
-        "createBinForSourceClips": False,
-    })
+    modified = []
+    try:
+        for clip, first, last, part_id in sources:
+            original = clip.GetMarkInOut()
+            require(isinstance(original, dict), f"Could not read preexisting source marks for {part_id}")
+            modified.append((clip, original, part_id))
+            require(clip.SetMarkInOut(first, last), f"Could not set source marks for {part_id}")
+            marks = clip.GetMarkInOut()
+            expected = {"in": first, "out": last}
+            require(marks.get("video") == marks.get("audio") == expected,
+                    f"Source mark readback differs for {part_id}")
+        items = pool.CreateMulticamClip([clip for clip, *_ in sources], {
+            "name": multicam_name,
+            "startTimecode": START_TIMECODE,
+            "frameRate": fps,
+            "angleSyncMode": resolve.MULTICAM_ANGLE_SYNC_IN,
+            "angleNameMode": resolve.MULTICAM_ANGLE_NAME_CLIP,
+            "multicamAudioMode": resolve.MULTICAM_AUDIO_SOURCE,
+            "useFullClipExtents": False,
+            "createBinForSourceClips": False,
+        })
+    finally:
+        restore_source_marks(modified)
     require(items and len(items) == 1, f"Resolve did not create one multicam for {multicam_name}")
     multicam = items[0]
     length = segment["duration_frames"]
@@ -157,6 +179,23 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
     require(timeline.AddMarker(offset, "Blue", marker["title"] or marker["event_id"], note,
                                length, json.dumps(marker)),
             f"Could not add marker for {multicam_name}")
+
+
+def restore_source_marks(modified):
+    failures = []
+    for clip, original, part_id in reversed(modified):
+        try:
+            require(clip.ClearMarkInOut(), "Could not clear temporary marks")
+            for kind in ("video", "audio"):
+                marks = original.get(kind)
+                if marks:
+                    require(clip.SetMarkInOut(marks["in"], marks["out"], kind), f"Could not restore {kind} marks")
+            restored = clip.GetMarkInOut()
+            require(all((restored.get(kind) or {}) == (original.get(kind) or {})
+                        for kind in ("video", "audio")), "Restored marks differ")
+        except (AttributeError, KeyError, RuntimeError, TypeError) as exc:
+            failures.append(f"{part_id}: {exc}")
+    require(not failures, f"Could not restore source marks: {', '.join(failures)}")
 
 
 def read_angles(multicam, segment):
@@ -216,8 +255,13 @@ def read_export(timeline, segments, names):
 def build_export(manifest, *, dry_run=False):
     """Return the plan or a structured readback of the saved and reopened export."""
     media = validate_manifest(manifest)
+    warnings = list(manifest["warnings"]) + [
+        {"code": "short_segment", "event_id": segment["event_id"], "segment_id": segment["segment_id"],
+         "message": f"Short multicam segment ({segment['duration_frames']} frames)."}
+        for segment in manifest["segments"] if segment["duration_frames"] < manifest["fps"]
+    ]
     if dry_run:
-        return {"mode": "dry-run", "manifest": manifest}
+        return {"mode": "dry-run", "manifest": manifest, "warnings": warnings}
     for path in media:
         if not path.is_file():
             raise ValueError(f"MP4 is missing: {path}")
@@ -259,7 +303,7 @@ def build_export(manifest, *, dry_run=False):
         if path and Path(path).resolve() in media:
             key = Path(path).resolve()
             require(key not in persisted and key.is_file(), f"Unexpected duplicate or offline source: {key}")
-            _, pov_name, channels = media[key]
+            _, pov_name, _, channels = media[key]
             status = clip.GetClipProperty("Online Status")
             require(clip.GetName() == pov_name and "offline" not in str(status).casefold(),
                     f"Reopened media name or online status differs for {key}")
@@ -273,10 +317,11 @@ def build_export(manifest, *, dry_run=False):
         "Reported source handles are not included in the marked multicam extents.",
     ]
     if any(row["angles"] is None for row in rows):
-        limitations.append("Resolve did not expose the internal angle timeline. Verify angle names, trims and switching in the UI.")
+        limitations.append("Resolve did not expose the internal angle timeline. Verify angle names, switching and "
+                           "segment-specific trims for repeated source media in the UI.")
     return {"project": name, "timeline": session, "fps": fps, "reopened": True,
             "sources": list(persisted.values()), "segments": rows,
-            "warnings": manifest["warnings"], "limitations": limitations}
+            "warnings": warnings, "limitations": limitations}
 
 
 def main(argv=None):

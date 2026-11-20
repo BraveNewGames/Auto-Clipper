@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_builder import build_export, main
+from autoclipper.resolve_builder import build_export, import_sources, main
 from autoclipper.resolve_manifest import build_manifest
 
 
@@ -20,7 +20,7 @@ def make_manifest(root):
             "mp4_path": str(root / f"{part}.mp4"),
             "source_in_frame": first, "source_out_frame": first + 60,
             "handle_before_frames": 12, "handle_after_frames": 30,
-            "mic": {"status": "verified", "transcriber_track": 2, "speaker": pov.upper(),
+            "mic": {"status": "verified", "transcriber_track": 2 if pov == "a" else 3, "speaker": pov.upper(),
                     "mp4_audio_stream_index": 2, "resolve_channels": channels, "evidence": "synthetic"},
         }
 
@@ -97,6 +97,9 @@ def fake_resolve():
             "2": {"channel_idx": [3, 4], "mute": False, "type": "stereo"},
             "3": {"channel_idx": [5, 6], "mute": False, "type": "stereo"},
         }})
+        clip.GetMarkInOut.return_value = {"video": {"in": 9, "out": 20}, "audio": {}} if path.endswith(
+            "a1.mp4",
+        ) else {"video": {}, "audio": {}}
 
         def set_name(name):
             clip.GetName.return_value = name
@@ -106,13 +109,21 @@ def fake_resolve():
             clip.GetAudioMapping.return_value = mapping
             return True
 
-        def set_marks(first, last):
-            clip.GetMarkInOut.return_value = {kind: {"in": first, "out": last} for kind in ("video", "audio")}
+        def set_marks(first, last, kind="all"):
+            marks = dict(clip.GetMarkInOut.return_value)
+            for key in ("video", "audio") if kind == "all" else (kind,):
+                marks[key] = {"in": first, "out": last}
+            clip.GetMarkInOut.return_value = marks
+            return True
+
+        def clear_marks():
+            clip.GetMarkInOut.return_value = {"video": {}, "audio": {}}
             return True
 
         clip.SetName.side_effect = set_name
         clip.SetAudioMapping.side_effect = set_mapping
         clip.SetMarkInOut.side_effect = set_marks
+        clip.ClearMarkInOut.side_effect = clear_marks
         state["media"].append(clip)
         return [clip]
 
@@ -233,6 +244,13 @@ class ResolveBuilderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             manifest = make_manifest(root)
+            short = manifest["segments"][1]
+            short["duration_frames"] = 6
+            short["angles"] = short["angles"][1:]
+            short["angles"][0]["source_out_frame"] = short["angles"][0]["source_in_frame"] + 6
+            short["unavailable"].append({"pov_id": "a", "pov_name": "A", "reason": "recording_gap"})
+            for later in manifest["segments"][2:]:
+                later["record_start_frame"] -= 54
             for name in ("a1", "a2", "b1"):
                 (root / f"{name}.mp4").touch()
             with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
@@ -245,10 +263,13 @@ class ResolveBuilderTests(unittest.TestCase):
             manager.LoadProject.assert_called_once_with(report["project"])
             self.assertRegex(report["project"], r"^AutoClipper Export synthetic-session \d{8}-\d{6}$")
             self.assertEqual([row["record_start_frame"] for row in report["segments"]],
-                             [216000, 216060, 216120, 216180])
+                             [216000, 216060, 216066, 216126])
             self.assertEqual([row["suggestion_id"] for row in report["segments"]],
                              ["pick-1", "pick-1", "pick-2", "pick-3"])
             self.assertEqual(report["segments"][0]["unavailable"][0]["reason"], "recording_gap")
+            self.assertEqual(report["segments"][1]["duration_frames"], 6)
+            self.assertEqual(len(report["segments"][1]["planned_angles"]), 1)
+            self.assertIn("short_segment", {warning["code"] for warning in report["warnings"]})
             pool = project.GetMediaPool.return_value
             self.assertEqual(pool.ImportMedia.call_count, 3)
             self.assertEqual(pool.CreateEmptyTimeline.call_count, 1)
@@ -257,7 +278,44 @@ class ResolveBuilderTests(unittest.TestCase):
             self.assertEqual([options[key] for key in ("angleSyncMode", "angleNameMode", "multicamAudioMode")],
                              ["in", "clip", "source"])
             self.assertEqual([clip.SetAudioMapping.call_count for clip in state["media"]], [1, 1, 1])
-            self.assertEqual([clip.SetMarkInOut.call_count for clip in state["media"]], [1, 4, 3])
+            self.assertEqual([clip.SetMarkInOut.call_count for clip in state["media"]], [2, 4, 2])
+            self.assertEqual([clip.ClearMarkInOut.call_count for clip in state["media"]], [1, 4, 2])
+            self.assertEqual(state["media"][0].GetMarkInOut(), {"video": {"in": 9, "out": 20}, "audio": {}})
+            self.assertEqual(state["media"][1].GetMarkInOut(), {"video": {}, "audio": {}})
+
+    def test_mic_inventory_must_match_expected_track_before_remapping(self):
+        pool = Mock()
+        path = Path("source.mp4").resolve()
+        clip = Mock()
+        pool.ImportMedia.return_value = [clip]
+        clip.GetClipProperty.side_effect = {"File Path": str(path), "FPS": "60"}.__getitem__
+        expected = {"type": "stereo", "channel_idx": [3, 4]}
+        for inventory in (
+            {"1": expected},
+            {"2": expected, "3": expected},
+            {"2": {**expected, "title": "Track3"}},
+        ):
+            with self.subTest(inventory=inventory):
+                clip.GetAudioMapping.return_value = json.dumps({"track_mapping": inventory})
+                with self.assertRaisesRegex(RuntimeError, "expected Resolve track 2"):
+                    import_sources(pool, {path: ("pov", "Player", 2, (3, 4))}, 60)
+        clip.SetAudioMapping.assert_not_called()
+
+    def test_multicam_creation_failure_restores_marks(self):
+        sdk, manager, state, project, _ = fake_resolve()
+        project.GetMediaPool.return_value.CreateMulticamClip.side_effect = RuntimeError("create failed")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                with self.assertRaisesRegex(RuntimeError, "create failed"):
+                    build_export(manifest)
+        self.assertEqual(state["media"][0].GetMarkInOut(), {"video": {"in": 9, "out": 20}, "audio": {}})
+        self.assertEqual(state["media"][1].GetMarkInOut(), {"video": {}, "audio": {}})
+        manager.SaveProject.assert_not_called()
 
     def test_owner_checkout_and_failed_reopen(self):
         sdk, manager, state, _, _ = fake_resolve()
