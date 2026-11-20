@@ -848,15 +848,22 @@ function resolveMicRow(m, box) {
       ? h("select", null, tracks.map((t) => h("option", { value: t.track, selected: t.track === m.suggested_track ? true : null },
           `Track ${t.track}${t.speaker ? " · " + t.speaker : ""}`)))
       : h("input", { type: "number", min: 1, class: "num", value: m.suggested_track || "" });
+    // In-page confirmation (no native dialogs): the button stays disabled until the owner
+    // ticks "I listened", so a stray click or double-click can never record a confirmation.
+    const listened = h("input", { type: "checkbox" });
+    const button = h("button", { class: "btn small primary", disabled: true, onclick: action(async () => {
+      const track = parseInt(pick.value, 10);
+      if (!listened.checked) throw new Error("Tick “I listened” first");
+      if (!(track > 0)) throw new Error("Choose the mic track first");
+      await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
+      toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}: track ${track}`, "ok");
+      await loadResolvePreview(box);
+    }) }, "Confirm mic");
+    const sync = () => { button.disabled = !listened.checked; };
+    listened.addEventListener("change", sync);
+    pick.addEventListener("change", () => { listened.checked = false; sync(); });
     control = h("div", { class: "row" }, pick,
-      h("button", { class: "btn small primary", onclick: action(async () => {
-        const track = parseInt(pick.value, 10);
-        if (!(track > 0)) throw new Error("Choose the mic track first");
-        if (!confirm(`Confirm that transcriber track ${track} of ${m.part_id} is ${m.pov_name}'s own microphone?\n\nOnly confirm after listening to it.`)) return;
-        await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
-        toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}`, "ok");
-        await loadResolvePreview(box);
-      }) }, "Confirm mic (I listened)"));
+      h("label", { class: "small" }, listened, " I listened: this is ", m.pov_name, "'s own mic"), button);
   }
   const says = verified
     ? `Track ${m.transcriber_track} · ${m.speaker}${m.mp4_audio_title ? " · MP4 “" + m.mp4_audio_title + "”" : ""}` +
