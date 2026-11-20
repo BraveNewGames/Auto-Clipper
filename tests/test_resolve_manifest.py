@@ -1,4 +1,5 @@
 import contextlib
+from fractions import Fraction
 import io
 import json
 from pathlib import Path
@@ -21,32 +22,48 @@ class ResolveManifestTests(unittest.TestCase):
         self.transcripts = self.root / "_Transcripts"
         self.session = Session(session_id="synthetic", folder=str(self.folder))
         self.streams = [
-            {"index": 0, "codec_type": "video", "r_frame_rate": "60/1"},
+            {"index": 0, "codec_type": "video", "r_frame_rate": "60/1", "duration": "10"},
             {"index": 3, "codec_type": "audio", "channels": 1, "tags": {"title": "Track1"}},
             {"index": 7, "codec_type": "audio", "channels": 2, "tags": {"handler_name": "Track2"}},
         ]
         probe = patch("autoclipper.resolve_manifest.probe_streams", return_value=self.streams)
         self.probe = probe.start()
+        self.durations = {}
+        self.probe.side_effect = lambda path: [
+            {**self.streams[0], "duration": str(self.durations[path.stem])}, *self.streams[1:]
+        ]
         self.addCleanup(probe.stop)
 
-    def add_part(self, name, index=1, offset=0, duration=10, mp4=True, inferred=False):
+    def add_part(self, name, index=1, offset=0, duration=10, mp4=True, inferred=False, video_duration=None):
         pov = next((pov for pov in self.session.povs if pov.name == name), None)
         if pov is None:
             pov = POV(name.lower(), name)
             self.session.povs.append(pov)
         stem = f"{pov.pov_id}-{index}"
         pov.parts.append(Part(stem, index, f"{stem}.mkv", duration=duration, offset=offset))
+        self.durations[stem] = duration if video_duration is None else video_duration
         if mp4:
             (self.folder / f"{stem}.mp4").touch()
-        metadata = {"speaker_tracks": {"audio_track_2": name}}
+        metadata = {
+            "speaker_tracks": [{"track": 2, "speaker": name, "speaker_template": "{Recorder}",
+                                "index": 7, "title": "Track2"}],
+            "recorder": {"name": name, "source": "filename", "tracks": [2]},
+        }
         if inferred:
-            metadata["relabel_history"] = [
-                {"provenance": "inferred_from_labels", "changes": [{"track": 2, "to": name}]},
-            ]
-        dest = self.transcripts / stem
-        dest.mkdir(parents=True)
-        (dest / f"{stem}.json").write_text(json.dumps(metadata), encoding="utf-8")
+            metadata = {
+                "speaker_tracks": {"audio_track_2": name},
+                "original_speaker_tracks": {"2": "Another speaker"},
+                "relabel_history": [{"provenance": "inferred_from_labels", "changes": [
+                    {"track": 2, "from": "Another speaker", "to": name}
+                ]}],
+            }
+        self.write_metadata(stem, metadata)
         return stem
+
+    def write_metadata(self, stem, metadata):
+        dest = self.transcripts / stem
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / f"{stem}.json").write_text(json.dumps(metadata), encoding="utf-8")
 
     def select(self, sid, event, first, last, approved=(None, None), status="keep"):
         self.session.suggestions.append(Suggestion(sid, "reviewer", event_id=event, title="Test | Clip",
@@ -71,7 +88,13 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual(a["angles"][0]["handle_after_frames"], 0)
         self.assertEqual(b["angles"][0]["part_index"], 2)
         self.assertEqual(a["angles"][0]["mic"]["mp4_audio_stream_index"], 7)
-        self.assertEqual(a["angles"][0]["mic"]["resolve_channels"], [2, 3])
+        mic = a["angles"][0]["mic"]
+        self.assertEqual(mic["resolve_channels"], [2, 3])
+        self.assertEqual(mic["resolve_channels_status"], "expected")
+        self.assertEqual(mic["expected_owner_track"], 2)
+        self.assertEqual(mic["mp4_audio_ordinal"], 2)
+        self.assertEqual(mic["mp4_audio_channels"], 2)
+        self.assertEqual(mic["mp4_audio_title"], "Track2")
         self.assertEqual(self.probe.call_count, 5)
 
     def test_gap_and_missing_pov_preserve_time(self):
@@ -99,7 +122,7 @@ class ResolveManifestTests(unittest.TestCase):
         codes = {w["code"] for w in manifest["warnings"]}
         self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection", "game_audio_unidentified"})
         report = render_report(manifest)
-        for value in ("3 timed Keep selections", "Alpha P1 (verified, ch 2, 3)",
+        for value in ("3 timed Keep selections", "Alpha P1 (verified, expected ch 2, 3)",
                       r"Test \| Clip (approved)", "Game audio not identified", "Source mode"):
             self.assertIn(value, report)
 
@@ -107,7 +130,7 @@ class ResolveManifestTests(unittest.TestCase):
         part_id = self.add_part("Alpha", inferred=True)
         self.select("pick", "EV-01", 1, 2)
         manifest = build_manifest(self.session)
-        self.assertIn("mic_inferred_unconfirmed", {x["code"] for x in manifest["blockers"]})
+        self.assertIn("mic_unverified", {x["code"] for x in manifest["blockers"]})
         self.assertEqual(manifest["segments"][0]["unavailable"][0]["reason"], "mic_blocked")
         confirmation = {"part_id": part_id, "transcriber_track": 2, "speaker": "Alpha",
                         "confirmed_by": "owner"}
@@ -127,9 +150,88 @@ class ResolveManifestTests(unittest.TestCase):
     def test_generic_tags_do_not_establish_track_identity(self):
         self.add_part("Alpha")
         self.streams[2]["tags"] = {"handler_name": "SoundHandler"}
+        self.write_metadata("alpha-1", {"speaker_tracks": {"audio_track_2": "Alpha"}})
         self.select("pick", "EV-01", 1, 2)
-        manifest = build_manifest(self.session)
+        confirmation = {"part_id": "alpha-1", "transcriber_track": 2, "speaker": "Alpha",
+                        "confirmed_by": "owner"}
+        manifest = build_manifest(self.session, confirmations=[confirmation])
         self.assertIn("mic_unmapped", {x["code"] for x in manifest["blockers"]})
+
+    def test_unknown_provenance_fails_closed_but_owner_can_confirm(self):
+        part = self.add_part("Alpha")
+        self.select("pick", "EV", 1, 2)
+        raw = json.loads((self.transcripts / part / f"{part}.json").read_text())
+        cases = [
+            {"speaker_tracks": {"audio_track_2": "Alpha"}},
+            {**raw, "original_speaker_tracks": {"2": "Another speaker"}},
+            {**raw, "relabel_history": [{"source": "inferred", "changes": [{"track": 2}]}]},
+            {**raw, "relabel_history": [{"provenance": "manual", "changes": {"2": "Alpha"}}]},
+            {**raw, "relabel_history": "unknown"},
+            {**raw, "speaker_tracks": [None, "Alpha"]},
+            {**raw, "relabel_provenance": "unknown"},
+            {"speaker_tracks": "Alpha"},
+            ["unexpected top-level shape"],
+        ]
+        confirmation_path = self.root / "confirmations.json"
+        confirmation_path.write_text(json.dumps({"schema_version": 1, "confirmations": [
+            {"part_id": part, "transcriber_track": 2, "speaker": "Alpha", "confirmed_by": "owner"},
+        ]}))
+        for data in cases:
+            with self.subTest(data=data):
+                self.write_metadata(part, data)
+                manifest = build_manifest(self.session)
+                self.assertIn("mic_unverified", {x["code"] for x in manifest["blockers"]})
+                confirmed = build_manifest(self.session, confirmations=confirmation_path)
+                self.assertEqual(confirmed["blockers"], [])
+                self.assertEqual(confirmed["segments"][0]["angles"][0]["mic"]["status"],
+                                 "owner_confirmed")
+
+    def test_actual_video_duration_splits_short_recording_gap(self):
+        self.add_part("Alpha", duration=1800.492, video_duration=1800.399)
+        self.add_part("Alpha", 2, offset=1800.492)
+        self.add_part("Bravo", offset=1700, duration=200)
+        self.select("pick", "EV", 1800, 1801)
+        manifest = build_manifest(self.session)
+        self.assertEqual(manifest["blockers"], [])
+        left, gap, right = manifest["segments"]
+        self.assertEqual([(s["session_start"], s["session_end"]) for s in (left, gap, right)],
+                         [(1800, 1800.399), (1800.399, 1800.492), (1800.492, 1801)])
+        self.assertEqual([s["duration_frames"] for s in (left, gap, right)], [24, 6, 30])
+        self.assertEqual(gap["unavailable"][0]["reason"], "recording_gap")
+        self.assertEqual(left["angles"][0]["source_out_frame"], 108023)
+        self.assertEqual(right["angles"][0]["source_in_frame"], 0)
+        self.assertEqual(self.session.povs[0].parts[1].offset, 1800.492)
+        self.assertIn("short_gap_segment", render_report(manifest))
+        self.assertIn("0.093 s", render_report(manifest))
+        self.assertEqual(left["angles"][-1]["source_out_frame"], gap["angles"][0]["source_in_frame"])
+        self.assertEqual(gap["angles"][0]["source_out_frame"], right["angles"][-1]["source_in_frame"])
+
+    def test_video_duration_must_be_verified(self):
+        self.add_part("Alpha", video_duration="N/A")
+        self.select("pick", "EV", 1, 2)
+        manifest = build_manifest(self.session)
+        self.assertIn("duration_unverified", {x["code"] for x in manifest["blockers"]})
+        self.assertEqual(manifest["segments"][0]["angles"], [])
+
+    def test_continuing_pov_has_contiguous_source_frames_over_fractional_boundaries(self):
+        self.add_part("Alpha", offset=-0.1)
+        self.add_part("Bravo")
+        self.add_part("Bravo", 2, offset=1)
+        self.select("pick", "EV", 0.1, 2.105)
+        alpha, bravo = (pov.parts for pov in self.session.povs)
+        for phase in range(17):
+            alpha[0].offset = -phase / 1000
+            for boundary in range(985, 1015):
+                with self.subTest(phase=phase, boundary=boundary):
+                    self.durations["bravo-1"] = bravo[1].offset = boundary / 1000
+                    manifest = build_manifest(self.session)
+                    self.assertEqual(manifest["blockers"], [])
+                    left, right = manifest["segments"]
+                    self.assertEqual(left["angles"][0]["source_out_frame"],
+                                     right["angles"][0]["source_in_frame"])
+                    self.assertEqual(left["duration_frames"], right["record_start_frame"])
+                    self.assertEqual(left["duration_frames"] + right["duration_frames"],
+                                     int(Fraction("2.005") * 60 + Fraction(1, 2)))
 
     def test_cli_only_writes_when_requested(self):
         part_id = self.add_part("Alpha", inferred=True)
