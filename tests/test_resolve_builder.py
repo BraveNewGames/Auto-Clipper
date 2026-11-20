@@ -341,6 +341,25 @@ class ResolveBuilderTests(unittest.TestCase):
         self.assertEqual(state["media"][1].GetMarkInOut(), {"video": {}, "audio": {}})
         manager.SaveProject.assert_not_called()
 
+    def test_restore_failure_preserves_original_build_error(self):
+        sdk, manager, _, project, _ = fake_resolve()
+        failure = RuntimeError("create failed")
+        cleanup = RuntimeError("restore failed")
+        project.GetMediaPool.return_value.CreateMulticamClip.side_effect = failure
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder),
+                  patch("autoclipper.resolve_builder.restore_source_marks", side_effect=cleanup),
+                  self.assertRaises(RuntimeError) as raised):
+                build_export(manifest)
+        self.assertIs(raised.exception, failure)
+        self.assertIs(raised.exception.__cause__, cleanup)
+        manager.SaveProject.assert_not_called()
+
     def test_owner_checkout_and_failed_reopen(self):
         sdk, manager, state, _, _ = fake_resolve()
         with tempfile.TemporaryDirectory() as folder:

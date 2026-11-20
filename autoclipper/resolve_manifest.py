@@ -370,7 +370,7 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
                 if reason == "recording_gap" and last - first < 1:
                     manifest["warnings"].append({
                         "code": "short_gap_segment", "event_id": suggestion.event_id, "pov_name": pov.name,
-                        "message": f"Recording gap at {first:.3f}?{last:.3f} s ({last - first:.3f} s).",
+                        "message": f"Recording gap at {first:.3f}-{last:.3f} s ({last - first:.3f} s).",
                     })
                 unavailable.append({"pov_id": pov.pov_id, "pov_name": pov.name, "reason": reason})
             if not angles:

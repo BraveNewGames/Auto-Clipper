@@ -178,7 +178,13 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
             "useFullClipExtents": False,
             "createBinForSourceClips": False,
         })
-    finally:
+    except BaseException as original:
+        try:
+            restore_source_marks(modified)
+        except Exception as restore_error:
+            raise original from restore_error
+        raise
+    else:
         restore_source_marks(modified)
     require(items and len(items) == 1, f"Resolve did not create one multicam for {multicam_name}")
     multicam = items[0]
@@ -353,7 +359,8 @@ def main(argv=None):
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         print(json.dumps(build_export(manifest, dry_run=args.dry_run, project_name=args.project), indent=2))
     except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-        parser.exit(1, f"Resolve export stopped: {exc}\n")
+        cleanup = f"\nAdditional failure: {exc.__cause__}" if exc.__cause__ is not None else ""
+        parser.exit(1, f"Resolve export stopped: {exc}{cleanup}\n")
 
 
 if __name__ == "__main__":
