@@ -2,7 +2,7 @@
 import unittest
 from pathlib import Path
 
-from autoclipper.fkb import FKBStore, FrameRange
+from autoclipper.fkb import FKBStore, FrameRange, Session as FKBSession
 from autoclipper.models import Part, POV, Session
 from autoclipper.store import save_session
 
@@ -37,4 +37,8 @@ class FKBTest(unittest.TestCase):
         for start, end in [(1, 1), (2, 1), (1.0, 2), (False, 2)]:
             with self.subTest(start=start, end=end), self.assertRaises(ValueError):
                 FrameRange(start, end)
+
+    def test_legacy_session_defaults_to_zero_review_origin(self):
+        session = FKBSession.from_dict({"session_id": "synthetic", "fps": 60, "timeline_start_frame": 216000})
+        self.assertEqual(session.review_session_start_frame, 0)
 

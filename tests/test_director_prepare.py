@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+from dataclasses import replace
 import io
 import json
 from pathlib import Path
@@ -7,8 +8,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from autoclipper.director_poc.__main__ import main
-from autoclipper.director_poc.core import Clock
+from autoclipper.director_notes import NotesCatalog
+from autoclipper.director_poc.__main__ import initialize_fkb, main
+from autoclipper.director_poc.core import Capture, Clock
+from autoclipper.fkb import FKBStore
 from autoclipper.models import Part, POV, Session
 
 
@@ -64,3 +67,30 @@ class DirectorPrepareTests(unittest.TestCase):
                 clock.session_range(59, 121)
             self.assertEqual((scratch / "session.json").read_bytes(), originals[source])
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+            built = {"mode": "director_review", "reopened": True, "review_session_frames": [60, 240],
+                     "project_id": "project", "timeline_id": "timeline"}
+            for unverified_manifest, unverified_result in (
+                    (manifest, {key: value for key, value in built.items() if key != "review_session_frames"}),
+                    ({key: value for key, value in manifest.items() if key != "review_session_frames"}, built),
+                    (manifest, {**built, "review_session_frames": [0, 180]}),
+                    (manifest, {**built, "reopened": False})):
+                with self.subTest(manifest=unverified_manifest.get("review_session_frames"),
+                                  result=unverified_result):
+                    with self.assertRaisesRegex(ValueError, "verified build"):
+                        initialize_fkb(scratch, session, unverified_manifest, unverified_result)
+                    self.assertFalse(FKBStore(scratch).path.exists())
+
+            initialize_fkb(scratch, session, manifest, built)
+            store = FKBStore(scratch)
+            self.assertEqual(store.load().session.review_session_start_frame, 60)
+            catalog = NotesCatalog(store)
+            capture = Capture("Scratch", "project", "Review", "timeline", 120, 125,
+                              "01:00:02:00", "01:00:02:05", 180, 185, 60,
+                              "01:00:02:00", "fixture")
+            note = catalog.create(capture, "Verified rebased range", playback="paused")
+            self.assertEqual(note.frames, {"start": 180, "end": 185})
+            with self.assertRaisesRegex(ValueError, "bound session frame origin"):
+                catalog.create(replace(capture, session_in=181, session_out_exclusive=186),
+                               "Shifted range", playback="paused")
+            self.assertEqual(len(store.load().director_notes), 1)

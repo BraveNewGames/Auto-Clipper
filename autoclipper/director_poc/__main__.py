@@ -11,7 +11,7 @@ from tempfile import gettempdir, mkdtemp
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, START_TIMECODE, build_export, validate_manifest
 from ..resolve_manifest import build_review_manifest
 from ..store import _write_json, load_session
-from .core import NoteStore, connect_review, tc_frame
+from .core import Clock, NoteStore, connect_review, tc_frame
 
 
 def read(path):
@@ -53,6 +53,27 @@ def prepare(args):
     print(f"Verified {len(manifest['segments'])} planned segments at {args.fps} fps")
 
 
+def verified_review_origin(manifest, built):
+    """Use reopened builder readback for a rebased review; legacy reviews must map to zero."""
+    bounds = manifest.get("review_session_frames")
+    if (manifest.get("mode") == "director_review" or built.get("mode") == "director_review"
+            or bounds is not None or built.get("review_session_frames") is not None):
+        if (manifest.get("mode") != "director_review" or built.get("mode") != "director_review"
+                or built.get("reopened") is not True
+                or not isinstance(bounds, list) or len(bounds) != 2
+                or any(type(frame) is not int for frame in bounds)
+                or bounds[0] >= bounds[1] or bounds != built.get("review_session_frames")):
+            raise ValueError("Review session origin is missing or disagrees with the verified build")
+        validate_manifest(manifest)
+        return bounds[0]
+    fps = manifest["fps"]
+    clock = Clock(manifest, START_TIMECODE, tc_frame(START_TIMECODE, fps))
+    if not clock.segments or any(record != session for record, session, _ in
+                                 (clock.intervals(segment) for segment in clock.segments)):
+        raise ValueError("Legacy review has no verified session origin")
+    return 0
+
+
 def initialize_fkb(scratch, source, manifest, built):
     from ..fkb import FKBStore
 
@@ -67,6 +88,7 @@ def initialize_fkb(scratch, source, manifest, built):
     store = FKBStore(scratch)
     fps = manifest["fps"]
     store.ingest(source, fps=fps, timeline_start_frame=tc_frame(START_TIMECODE, fps),
+                 review_session_start_frame=verified_review_origin(manifest, built),
                  project_id=built["project_id"], timeline_id=built["timeline_id"],
                  audio_by_part=mappings)
     return store.path
@@ -119,7 +141,8 @@ def main():
 
     from .window import run_window
 
-    connect = partial(connect_review, read(result_path), manifest, not args.out_exclusive)
+    built = read(result_path)
+    connect = partial(connect_review, built, manifest, not args.out_exclusive)
     persistent = None
     if args.persistent_notes:
         from ..director_notes import NotesCatalog
@@ -127,9 +150,8 @@ def main():
 
         store = FKBStore(scratch)
         session = store.load().session
-        built = read(result_path)
-        if (session.project_id, session.timeline_id, session.fps) != (
-                built["project_id"], built["timeline_id"], manifest["fps"]):
+        if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame) != (
+                built["project_id"], built["timeline_id"], manifest["fps"], verified_review_origin(manifest, built)):
             parser.error("The scratch FKB is bound to a different timeline or clock")
         persistent = NotesCatalog(store)
     run_window(connect, NoteStore(scratch / "notes.json"), scratch / "playhead.csv",

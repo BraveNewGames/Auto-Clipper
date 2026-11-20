@@ -45,10 +45,13 @@ class Session(_Model):
     project_id: str | None = None
     timeline_id: str | None = None
     source_manifest: list[str] = field(default_factory=list)
+    review_session_start_frame: int = 0
 
     def __post_init__(self):
         if type(self.fps) is not int or not 1 <= self.fps <= 100:
             raise ValueError("Expected Phase A integer non-drop fps")
+        if type(self.review_session_start_frame) is not int:
+            raise ValueError("Expected an integer review session origin")
 
     def frames(self, start, end):
         return FrameRange(floor(Fraction(str(start)) * self.fps),
@@ -199,9 +202,10 @@ class FKBStore:
                 _write_json(self.path, current)
             return result
 
-    def ingest(self, source, *, fps, timeline_start_frame=0, project_id=None,
+    def ingest(self, source, *, fps, timeline_start_frame=0, review_session_start_frame=0, project_id=None,
                timeline_id=None, cues_by_part=None, audio_by_part=None):
         incoming = ingest_session(source, fps=fps, timeline_start_frame=timeline_start_frame,
+                                  review_session_start_frame=review_session_start_frame,
                                   project_id=project_id, timeline_id=timeline_id,
                                   cues_by_part=cues_by_part, audio_by_part=audio_by_part)
         with self._lock:
@@ -212,9 +216,10 @@ class FKBStore:
             def refresh(data):
                 if data.session.session_id != incoming.session.session_id:
                     raise ValueError("Director FKB belongs to another session")
-                if (data.session.fps, data.session.timeline_start_frame,
+                if (data.session.fps, data.session.timeline_start_frame, data.session.review_session_start_frame,
                     data.session.project_id, data.session.timeline_id) != (
                     incoming.session.fps, incoming.session.timeline_start_frame,
+                    incoming.session.review_session_start_frame,
                     incoming.session.project_id, incoming.session.timeline_id):
                     raise ValueError("Director FKB clock or Resolve binding changed")
                 has_references = data.director_notes or data.candidate_moments or data.edit_plans
@@ -231,11 +236,12 @@ class FKBStore:
             self.update(refresh)
 
 
-def ingest_session(source, *, fps, timeline_start_frame=0, project_id=None,
+def ingest_session(source, *, fps, timeline_start_frame=0, review_session_start_frame=0, project_id=None,
                    timeline_id=None, cues_by_part=None, audio_by_part=None):
     if not source.session_id:
         raise ValueError("Auto-Clipper session requires a stable session ID")
-    session = Session(source.session_id, fps, timeline_start_frame, project_id, timeline_id)
+    session = Session(source.session_id, fps, timeline_start_frame, project_id, timeline_id,
+                      review_session_start_frame=review_session_start_frame)
     parts = []
     by_id = {}
     for pov, part in source.all_parts():

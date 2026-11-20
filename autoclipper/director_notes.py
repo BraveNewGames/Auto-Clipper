@@ -62,9 +62,9 @@ class NotesCatalog:
                 or tc_frame(capture.out_timecode_exclusive, session.fps)
                 != session.timeline_start_frame + timeline.end):
             raise ValueError("Capture timecodes disagree with the session timeline origin")
-        # A persistent catalog is bound to a full-session timeline. Its Resolve
-        # start frame represents session frame zero, regardless of the manifest.
-        if frames != timeline:
+        # Coverage-aware reviews can start after zero or include negative pre-roll.
+        origin = session.review_session_start_frame
+        if frames != FrameRange(origin + timeline.start, origin + timeline.end):
             raise ValueError("Capture session range disagrees with the bound session frame origin")
         return frames, {**asdict(capture), "playback": "operator_confirmed_paused",
                         "playback_api_verified": False, "delayed": False}
