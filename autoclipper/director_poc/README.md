@@ -57,3 +57,21 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
 - Paused jumps to 01:00:52:24 and 01:00:58:28 read back with zero frame error. The first note's marker read back with its UUID and 3231-frame duration, survived project reopen, and was then deleted. A same-start marker was refused while both notes remained. The marker uses a generic display label and the note store retains the text.
 - During the first playback capture, the owner could type while playback continued and the companion stayed responsive. The request was pending at 750 ms and returned after 22.140 seconds. The owner reported a range mismatch without frame-level endpoints. A controlled repeat returned after 4.388 seconds and retained the original displayed range after the owner changed Out; the owner could not place the response relative to pause. A third request took 9.399 seconds and the owner saw the range appear only after playback stopped. All three test captures stayed unsaved. The companion is responsive during playback, and exact keypress-time range capture remains unverified.
 - The native script and Workflow Integration alternatives were documented only. No live disconnect test was run. For a later authorized phase, treat full-session edges and short media tails as unavailable coverage, and use paused capture or explicit confirmation of a delayed range until exact playback-time sampling is independently demonstrated.
+
+## Coverage-aware review planner
+
+`python -m autoclipper.resolve_manifest <session-folder> --full-session --dry-run`
+plans a review without contacting Resolve or writing outputs. Omit `--dry-run` and
+provide `--out <scratch-dir>` to save the manifest when authorized. The existing
+`resolve_builder` accepts this manifest. Ordinary reviewed Keep exports still use
+the existing strict Stage 2 planning path.
+
+The review anchors each part at its nearest session frame and uses the verified
+MP4 frame count or a conservative count from video-stream duration. The requested
+session extent includes estimated bounds, while the playable review clips edges
+with no usable footage. The manifest reports those edges, preserves blank interior
+spans at their original session positions, and omits a POV wherever its parts
+overlap ambiguously. Missing or unverified media and microphone mappings still
+block the build. Review gap and placement handling have synthetic and mocked
+coverage. A later authorized Resolve session must verify native blank spans,
+one-angle and changing-angle multicams, and reopen behavior.

@@ -2,7 +2,7 @@
 
 import argparse
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fractions import Fraction
 import json
@@ -190,7 +190,21 @@ def _positive_duration(value):
     return duration if isfinite(duration) and duration > 0 else None
 
 
-def _part_media(folder, roots, pov, part, confirmations, fps):
+def _video_frames(stream, fps):
+    try:
+        count = int(stream["nb_frames"])
+    except (KeyError, TypeError, ValueError):
+        count = 0
+    if count > 0:
+        return count
+    try:
+        duration = Fraction(stream["duration_ts"]) * Fraction(stream["time_base"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        duration = Fraction(str(_positive_duration(stream.get("duration")) or 0))
+    return max(0, floor(duration * fps))
+
+
+def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=False):
     source = folder / part.video_path if part.video_path else None
     mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
     if not mp4 or mp4.suffix.lower() != ".mp4" or not mp4.is_file():
@@ -201,7 +215,8 @@ def _part_media(folder, roots, pov, part, confirmations, fps):
     if len(video) != 1:
         return None, part, "fps_mismatch", False
     duration = _positive_duration(video[0].get("duration"))
-    if duration is None:
+    frames = _video_frames(video[0], fps) if frame_count else None
+    if duration is None and not frames:
         return None, part, "duration_unverified", False
     source_part = replace(part, duration=duration, duration_source="ffprobe")
     if _rate(video[0]) != Fraction(str(fps)):
@@ -213,7 +228,10 @@ def _part_media(folder, roots, pov, part, confirmations, fps):
     mic, problem = _mic(metadata, streams, part.part_id, pov.name, confirmations)
     game = any(_normalized(track.get("speaker")).strip("[]") == "game audio"
                for track in _tracks(metadata))
-    return {"mp4_path": str(mp4.resolve()), "mic": mic}, source_part, problem, game
+    media = {"mp4_path": str(mp4.resolve()), "mic": mic}
+    if frame_count:
+        media["source_frame_count"] = frames
+    return media, source_part, problem, game
 
 
 def _selections(session, manifest):
@@ -279,7 +297,7 @@ def _angle(pov, part, media, placement, first_frame, last_frame, rate):
         "handle_after_frames": limit - source_out,
     }
 
-def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) -> dict:
+def _manifest_inputs(session, transcripts_dir, confirmations, fps):
     folder = Path(session.folder).resolve()
     roots = ([Path(transcripts_dir)] if transcripts_dir is not None else [])
     roots += [folder / "_Transcripts", folder.parent / "_Transcripts"]
@@ -300,6 +318,12 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
         "fps": fps, "created_at": datetime.now(timezone.utc).isoformat(),
         "blockers": [], "warnings": [], "segments": [],
     }
+    return folder, roots, confirmations, rate, manifest
+
+
+def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) -> dict:
+    folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
+    fps = manifest["fps"]
     selected, counts = _selections(session, manifest)
     if not selected:
         manifest["blockers"].append({"code": "no_selection", "part_id": None, "pov_name": None,
@@ -419,16 +443,136 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
     return manifest
 
 
+@dataclass(frozen=True)
+class _CoveredPart:
+    part_id: str
+    index: int
+    first: int
+    end: int
+    media: dict
+
+
+def _review_coverage(session, transcripts_dir, confirmations, fps):
+    folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
+    fps = manifest["fps"]
+    if type(fps) is not int:
+        raise ValueError("Director timelines require integer fps")
+    coverage = {pov.pov_id: [] for pov in session.povs}
+    first, end = 0, 0
+    game_identified = False
+    for pov, part in session.all_parts():
+        start = _record_frame(part.offset, 0, rate)
+        first = min(first, start)
+        media, _, problem, game = _part_media(folder, roots, pov, part, confirmations, fps,
+                                             frame_count=True)
+        estimated = _positive_duration(part.duration)
+        if estimated:
+            end = max(end, start + _record_frame(estimated, 0, rate))
+        if not problem and not media["source_frame_count"]:
+            problem = "duration_unverified"
+        if problem:
+            manifest["blockers"].append({"code": problem, "part_id": part.part_id, "pov_name": pov.name,
+                                         "message": _PROBLEMS[problem]})
+            continue
+        frames = media["source_frame_count"]
+        end = max(end, start + frames)
+        coverage[pov.pov_id].append(_CoveredPart(part.part_id, part.index, start, start + frames, media))
+        game_identified |= game
+        if conflict := media["mic"].get("metadata_conflict"):
+            manifest["warnings"].append({"code": "mic_metadata_conflict", "part_id": part.part_id,
+                                         "pov_name": pov.name, "message": conflict})
+    if not game_identified:
+        manifest["warnings"].append({"code": "game_audio_unidentified", "message": "Game audio not identified."})
+    return manifest, coverage, first, end
+
+
+def _coverage_spans(povs, coverage, first, end):
+    boundaries = {first, end}
+    for parts in coverage.values():
+        boundaries.update(frame for part in parts for frame in (part.first, part.end) if first < frame < end)
+    cuts = sorted(boundaries)
+    for left, right in zip(cuts, cuts[1:]):
+        angles, unavailable = [], []
+        for pov in povs:
+            parts = coverage[pov.pov_id]
+            active = [part for part in parts if part.first <= left and right <= part.end]
+            if len(active) == 1:
+                part, = active
+                angles.append({
+                    "pov_id": pov.pov_id, "pov_name": pov.name, "part_id": part.part_id,
+                    "part_index": part.index, **part.media,
+                    "source_in_frame": left - part.first, "source_out_frame": right - part.first,
+                    "handle_before_frames": left - part.first, "handle_after_frames": part.end - right,
+                })
+                continue
+            if active:
+                reason = "overlapping_parts"
+            elif any(part.end <= left for part in parts) and any(part.first >= right for part in parts):
+                reason = "recording_gap"
+            else:
+                reason = "no_coverage"
+            unavailable.append({"pov_id": pov.pov_id, "pov_name": pov.name, "reason": reason})
+        yield left, right, angles, unavailable
+
+
+def _frame_segment(fps, first, end, record, angles, unavailable, *, entry_id, title, kind, range_source):
+    return {
+        "event_id": entry_id, "suggestion_id": entry_id, "title": title,
+        "range_source": range_source, "kind": kind,
+        "session_start_frame": first, "session_end_frame": end,
+        "session_start": first / fps, "session_end": end / fps,
+        "record_start_frame": record, "duration_frames": end - first,
+        "angles": angles, "unavailable": unavailable,
+    }
+
+
+def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps=None):
+    """Build a frame-grid review without compressing interior gaps or trusting estimated tails."""
+    manifest, coverage, first, end = _review_coverage(session, transcripts_dir, confirmations, fps)
+    manifest.update(mode="director_review", requested_session_frames=[first, end])
+    spans = list(_coverage_spans(session.povs, coverage, first, end))
+    playable = [index for index, span in enumerate(spans) if span[2]]
+    if not playable:
+        manifest["blockers"].append({"code": "no_angles", "message": "Review has no usable coverage."})
+        return manifest
+
+    start_idx, end_idx = playable[0], playable[-1]
+    origin, last = spans[start_idx][0], spans[end_idx][1]
+    manifest["review_session_frames"] = [origin, last]
+    manifest["uncovered_edges"] = [
+        {"session_start_frame": left, "session_end_frame": right, "unavailable": unavailable}
+        for left, right, _, unavailable in spans[:start_idx] + spans[end_idx + 1:]
+    ]
+    if manifest["uncovered_edges"]:
+        manifest["warnings"].append({"code": "uncovered_edges",
+                                     "message": "Review clips to the first and last usable source frames."})
+
+    for number, (left, right, angles, unavailable) in enumerate(spans[start_idx:end_idx + 1], 1):
+        for missing in unavailable:
+            if missing["reason"] == "overlapping_parts":
+                manifest["warnings"].append({"code": "overlapping_parts", "pov_name": missing["pov_name"],
+                                             "message": f"Ambiguous coverage at session frames [{left}, {right})."})
+        segment = _frame_segment(manifest["fps"], left, right, left - origin, angles, unavailable,
+                                 entry_id="review", title="Full session review",
+                                 kind="media" if angles else "coverage_gap", range_source="session")
+        segment.update(segment_id=f"review-{number}", piece=number, pieces=end_idx - start_idx + 1)
+        manifest["segments"].append(segment)
+    return manifest
+
+
 def render_report(manifest) -> str:
     def cell(value):
         return str(value).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
     segments = manifest["segments"]
     selected = {segment["suggestion_id"] for segment in segments}
+    summary = (f"Full-session review, {len(segments)} segments, {manifest['fps']} fps."
+               if manifest.get("mode") == "director_review"
+               else f"{len(selected)} timed Keep selections, {len(segments)} segments, {manifest['fps']} fps.")
     lines = [
         "# Resolve timeline manifest",
         "",
-        f"{len(selected)} timed Keep selections, {len(segments)} segments, {manifest['fps']} fps.",
+        summary,
         "",
         "Multicam audio uses Resolve Source mode with one switchable owner-mic pair.",
         "",
@@ -462,6 +606,7 @@ def main(argv=None):
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--full-session", action="store_true", help="Plan a coverage-aware Director review")
     parser.add_argument("--confirm-mic", action="append", nargs=3, metavar=("PART_ID", "TRACK", "SPEAKER"))
     args = parser.parse_args(argv)
     try:
@@ -478,7 +623,8 @@ def main(argv=None):
                        or item.get("transcriber_track") != track]
             rows.append({"part_id": part_id, "transcriber_track": track, "speaker": speaker,
                          "confirmed_by": "owner", "confirmed_at": datetime.now(timezone.utc).isoformat()})
-        manifest = build_manifest(session, args.transcripts, confirmations)
+        plan = build_review_manifest if args.full_session else build_manifest
+        manifest = plan(session, args.transcripts, confirmations)
         report = render_report(manifest)
         if not args.dry_run:
             out = args.out or (Path(session.folder) / "autoclipper_exports" / "resolve"

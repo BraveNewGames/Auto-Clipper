@@ -30,13 +30,26 @@ def validate_manifest(manifest):
     if not isinstance(manifest["session_id"], str) or not manifest["session_id"].strip():
         raise ValueError("Expected a nonempty session ID")
 
+    review = manifest.get("mode") == "director_review"
+    if review:
+        origin, review_end = manifest["review_session_frames"]
+        if (type(origin) is not int or type(review_end) is not int or origin >= review_end
+                or not manifest["segments"][0]["angles"] or not manifest["segments"][-1]["angles"]):
+            raise ValueError("Review needs covered first and last segments")
     media = {}
     record = 0
     for segment in manifest["segments"]:
         length = segment["duration_frames"]
         if (type(length) is not int or type(segment["record_start_frame"]) is not int
-                or length <= 0 or segment["record_start_frame"] != record or not segment["angles"]):
-            raise ValueError("Segments need adjacent record ranges and at least one angle")
+                or length <= 0 or segment["record_start_frame"] != record):
+            raise ValueError("Segments need adjacent record ranges")
+        if review:
+            if (origin + record != segment["session_start_frame"]
+                    or segment["session_end_frame"] - segment["session_start_frame"] != length
+                    or segment["kind"] != ("media" if segment["angles"] else "coverage_gap")):
+                raise ValueError("Review segment differs from the declared session coverage")
+        elif not segment["angles"]:
+            raise ValueError("Segments need at least one angle")
         # Read marker identity during preflight, before making a project.
         marker_data(segment)
         record += length
@@ -56,6 +69,8 @@ def validate_manifest(manifest):
             first, last = angle["source_in_frame"], angle["source_out_frame"]
             if type(first) is not int or type(last) is not int or first < 0 or last - first != length:
                 raise ValueError("Each angle must cover the whole segment in source frames")
+            if review and (type(angle.get("source_frame_count")) is not int or last > angle["source_frame_count"]):
+                raise ValueError("Review angle exceeds verified source frames")
             mic = angle["mic"]
             track = mic["transcriber_track"]
             expected_track = mic.get("expected_owner_track", track)
@@ -73,6 +88,8 @@ def validate_manifest(manifest):
             binding = (pov, name, expected_track, ordinal, title, tuple(channels))
             if media.setdefault(path, binding) != binding:
                 raise ValueError(f"Conflicting POV or mic mappings for {path}")
+    if review and origin + record != review_end:
+        raise ValueError("Review length differs from the declared session coverage")
     return media
 
 
@@ -253,10 +270,16 @@ def read_export(timeline, segments, names):
     record = timeline.GetStartFrame()
     tracks = {kind: sorted(timeline.GetItemListInTrack(kind, 1) or [], key=lambda item: item.GetStart())
               for kind in ("video", "audio")}
-    require(all(len(items) == len(segments) for items in tracks.values()),
+    expected = sum(bool(segment["angles"]) for segment in segments)
+    require(all(len(items) == expected for items in tracks.values()),
             "Export must have one video and one audio item per segment")
+    items = iter(zip(tracks["video"], tracks["audio"]))
     rows = []
-    for segment, name, video, audio in zip(segments, names, tracks["video"], tracks["audio"]):
+    for segment, name in zip(segments, names):
+        if not segment["angles"]:
+            rows.append({**segment, "record_start_frame": record + segment["record_start_frame"]})
+            continue
+        video, audio = next(items)
         multicam = video.GetMediaPoolItem()
         start = record + segment["record_start_frame"]
         length = segment["duration_frames"]
@@ -272,8 +295,10 @@ def read_export(timeline, segments, names):
         stereo_channels(audio_mapping)
         marker = json.loads(timeline.GetMarkerCustomData(segment["record_start_frame"]))
         require(marker == marker_data(segment), f"Marker readback differs for {name}")
+        timing = {key: segment[key] for key in ("kind", "session_start_frame", "session_end_frame")
+                  if key in segment}
         rows.append({
-            **marker, "multicam": name, "record_start_frame": start, "duration_frames": length,
+            **marker, **timing, "multicam": name, "record_start_frame": start, "duration_frames": length,
             "video": read_item(video), "audio": read_item(audio), "audio_mapping": audio_mapping,
             "angles": read_angles(multicam, segment),
             "planned_angles": segment["angles"], "unavailable": segment["unavailable"],
@@ -315,7 +340,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     segments = manifest["segments"]
     names = [f"{index:03d} {segment['segment_id']}" for index, segment in enumerate(segments, 1)]
     for segment, multicam_name in zip(segments, names):
-        build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps)
+        if segment["angles"]:
+            build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps)
     read_export(timeline, segments, names)
     require(project_is_active(manager, project, name), "Export project is no longer active")
     require(manager.SaveProject(), f"Could not save {name}")
@@ -356,7 +382,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     if name.startswith(DIRECTOR_TEST_PREFIX):
         identity = {"project_id": require(reopened.GetUniqueId(), "Missing project ID"),
                     "timeline_id": require(timeline.GetUniqueId(), "Missing timeline ID")}
-    return {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity,
+    review = {key: manifest[key] for key in ("mode", "review_session_frames", "uncovered_edges") if key in manifest}
+    return {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity, **review,
             "sources": list(persisted.values()), "segments": rows,
             "warnings": warnings, "limitations": limitations}
 

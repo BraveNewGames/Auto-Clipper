@@ -268,6 +268,31 @@ class ResolveBuilderTests(unittest.TestCase):
                     main([str(path), "--dry-run", "--result-file", str(failed)])
                 self.assertFalse(failed.exists())
 
+    def test_director_review_preserves_blank_interior_frames_after_reopen(self):
+        sdk, _, _, project, _ = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            segments = manifest["segments"]
+            manifest.update(mode="director_review", review_session_frames=[120, 360], uncovered_edges=[])
+            for segment in segments:
+                start = 120 + segment["record_start_frame"]
+                segment.update(kind="media", session_start_frame=start,
+                               session_end_frame=start + segment["duration_frames"])
+                for angle in segment["angles"]:
+                    angle["source_frame_count"] = 600
+            segments[1].update(kind="coverage_gap", angles=[])
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                result = build_export(manifest)
+            self.assertEqual(result["review_session_frames"], [120, 360])
+            self.assertEqual([r["record_start_frame"] for r in result["segments"]],
+                             [216000, 216060, 216120, 216180])
+            self.assertEqual(result["segments"][1]["kind"], "coverage_gap")
+            self.assertEqual(project.GetMediaPool.return_value.AppendToTimeline.call_count, 3)
+
     def test_director_build_records_reopened_scratch_identity(self):
         sdk, _, _, _, reopened = fake_resolve()
         reopened.GetUniqueId.return_value = "scratch-project-id"
