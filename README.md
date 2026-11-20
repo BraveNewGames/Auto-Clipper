@@ -59,15 +59,18 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
 
 **Prerequisites**
 
-- OBS-remuxed `.mp4` recordings next to the SRTs (same stem as the session's `.mkv`, if the
-  session was scanned from MKVs). MKVs are never imported or substituted.
+- OBS-remuxed `.mp4` recordings. Each part's recording must be an `.mp4`; for a part the session
+  lists as an `.mkv` (older sessions), the `.mp4` with the same name in the same folder as that
+  `.mkv` is used. If that `.mp4` is missing, the export is blocked; MKVs are never imported or
+  substituted.
 - Transcriber JSON in `_Transcripts\<stem>\<stem>.json`, in the session folder or next to it.
   It tells Auto-Clipper which audio track is each player's own microphone.
 - DaVinci Resolve **Studio** running, with Preferences → General → *External scripting using* =
   **Local**. Resolve's standard scripting `Modules` folder is added to the builder's
   `PYTHONPATH` automatically if it is installed in the default location.
 - Before exporting: save and close your own project and leave the **Project Manager** open.
-  The export refuses to run if another project is open.
+  The export runs only from the Project Manager (no project open), an empty *Untitled Project*,
+  or a project Auto-Clipper created itself (*AutoClipper Export …*); otherwise it refuses.
 
 **Steps**
 
