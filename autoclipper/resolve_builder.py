@@ -5,11 +5,13 @@ import json
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 from textwrap import fill
+from urllib.parse import unquote, urlsplit
 
 from .media import FFMPEG_BIN
 from .resolve_manifest import verify_source_media_identity
@@ -435,6 +437,45 @@ def read_angles(multicam, segment):
     return rows
 
 
+def reference_xml_matches(timeline, ref, record_start, length):
+    """Confirm a one-frame source-start getter discrepancy via FCP 7 XML."""
+    import DaVinciResolveScript
+
+    resolve = DaVinciResolveScript.scriptapp("Resolve")
+    with TemporaryDirectory(prefix="autoclipper-reference-readback-") as folder:
+        path = Path(folder) / "timeline.xml"
+        if not timeline.Export(str(path), resolve.EXPORT_FCP_7_XML, resolve.EXPORT_NONE):
+            return False
+        try:
+            root = ET.parse(path).getroot()
+            audio = root.find("./sequence/media/audio")
+            tracks = audio.findall("track") if audio is not None else []
+            if len(tracks) < 2:
+                return False
+            offset = record_start - timeline.GetStartFrame()
+            matching = [item for item in tracks[1].findall("clipitem")
+                        if int(item.findtext("start")) == offset
+                        and int(item.findtext("end")) == offset + length]
+            if len(matching) != 1:
+                return False
+            item = matching[0]
+            if (int(item.findtext("in")) != ref["source_in_frame"]
+                    or int(item.findtext("out")) != ref["source_out_frame"]):
+                return False
+            file_ref = item.find("file")
+            file_id = file_ref.get("id") if file_ref is not None else None
+            paths = [file_item.findtext("pathurl") for file_item in root.iter("file")
+                     if file_item.get("id") == file_id and file_item.findtext("pathurl")]
+            if len(paths) != 1:
+                return False
+            source = unquote(urlsplit(paths[0]).path)
+            if re.match(r"^/[A-Za-z]:/", source):
+                source = source[1:]
+            return Path(source).resolve() == Path(ref["mp4_path"]).resolve()
+        except (OSError, ET.ParseError, TypeError, ValueError):
+            return False
+
+
 def read_export(timeline, segments, names, placeholders=None):
     placeholders = placeholders or {}
     record = timeline.GetStartFrame()
@@ -486,10 +527,18 @@ def read_export(timeline, segments, names, placeholders=None):
                     f"Parent media or record range differs for {name}")
         if selected_audio is not None:
             actual = read_item(audio)
+            media_item = audio.GetMediaPoolItem()
+            expected = {"path": selected_audio["mp4_path"],
+                        "source_start": selected_audio["source_in_frame"],
+                        "record_start": start, "record_end": start + length,
+                        "duration": length, "name": "not checked", "type": "not checked"}
+            observed = {key: actual[key] for key in expected if key != "type"}
+            observed["type"] = media_item.GetClipProperty("Type") if media_item else None
             require(Path(actual["path"]).resolve() == Path(selected_audio["mp4_path"]).resolve()
                     and actual["record_start"] == start and actual["record_end"] == start + length
                     and actual["duration"] == length and actual["source_start"] == selected_audio["source_in_frame"],
-                    f"Selected microphone source or placement differs for {name}")
+                    f"Selected microphone source or placement differs for {name}: "
+                    f"expected={expected}, actual={observed}")
         audio_mapping = json.loads(audio.GetSourceAudioChannelMapping())
         stereo_channels(audio_mapping)
         marker = json.loads(timeline.GetMarkerCustomData(segment["record_start_frame"]))
@@ -501,14 +550,25 @@ def read_export(timeline, segments, names, placeholders=None):
             item = next(reference_items)
             media_item = item.GetMediaPoolItem()
             reference_row = read_item(item)
-            require(media_item and media_item.GetClipProperty("Type") != "Multicam"
-                    and media_item.GetName() == REFERENCE_TRACK_NAME
-                    and Path(reference_row["path"]).resolve() == Path(ref["mp4_path"]).resolve()
-                    and reference_row["source_start"] == ref["source_in_frame"]
-                    and reference_row["record_start"] == start
-                    and reference_row["record_end"] == start + length
-                    and reference_row["duration"] == length,
-                    f"Reference audio source or placement differs for {name}")
+            expected = {"path": ref["mp4_path"], "source_start": ref["source_in_frame"],
+                        "record_start": start, "record_end": start + length,
+                        "duration": length, "name": REFERENCE_TRACK_NAME, "type": "not Multicam"}
+            observed = {key: reference_row[key] for key in expected if key != "type"}
+            observed["type"] = media_item.GetClipProperty("Type") if media_item else None
+            identity_and_record = (media_item and media_item.GetClipProperty("Type") != "Multicam"
+                                   and media_item.GetName() == REFERENCE_TRACK_NAME
+                                   and Path(reference_row["path"]).resolve() == Path(ref["mp4_path"]).resolve()
+                                   and reference_row["record_start"] == start
+                                   and reference_row["record_end"] == start + length
+                                   and reference_row["duration"] == length)
+            source_matches = reference_row["source_start"] == ref["source_in_frame"]
+            if (identity_and_record and not source_matches
+                    and reference_row["source_start"] == ref["source_in_frame"] - 1
+                    and reference_row["source_end"] == ref["source_out_frame"]):
+                source_matches = reference_xml_matches(timeline, ref, start, length)
+            require(identity_and_record and source_matches,
+                    f"Reference audio source or placement differs for {name}: "
+                    f"expected={expected}, actual={observed}")
             channels = ref["track"]["resolve_channels"]
             require(stereo_channels(json.loads(media_item.GetAudioMapping())) == channels
                     and stereo_channels(json.loads(item.GetSourceAudioChannelMapping())) == channels,
