@@ -237,11 +237,61 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual(len({s["segment_id"] for s in manifest["segments"]}), 3)
         codes = {w["code"] for w in manifest["warnings"]}
         self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection",
-                                 "game_audio_unidentified", "stale_mkv_reference"})
+                                 "game_audio_unidentified", "stale_mkv_reference",
+                                 "reference_track_unverified", "reference_audio_gap"})
         report = render_report(manifest)
         for value in ("3 timed Keep selections", "Alpha P1 (verified, expected ch 2, 3)",
                       r"Test \| Clip (approved)", "Game audio not identified", "Source mode"):
             self.assertIn(value, report)
+
+    def test_reference_mix_selection_split_and_fallback(self):
+        self.streams[1]["channels"] = 2
+        self.add_part("Alpha", offset=0, duration=2)
+        self.add_part("Alpha", 2, offset=2, duration=3)
+        self.add_part("Bravo", offset=0, duration=5)
+        self.select("pick", "EV-01", 1, 3)
+        manifest = build_manifest(self.session)
+        left, right = manifest["segments"]
+        self.assertEqual([s["reference_audio"]["part_id"] for s in (left, right)],
+                         ["alpha-1", "alpha-2"])
+        for segment in (left, right):
+            ref = segment["reference_audio"]
+            angle = next(a for a in segment["angles"] if a["part_id"] == ref["part_id"])
+            self.assertEqual((ref["source_in_frame"], ref["source_out_frame"],
+                              ref["record_start_frame"], ref["duration_frames"]),
+                             (angle["source_in_frame"], angle["source_out_frame"],
+                              segment["record_start_frame"], segment["duration_frames"]))
+        self.assertEqual(left["reference_audio"]["track"]["resolve_channels"], [1, 2])
+        metadata_path = self.transcripts / "alpha-2" / "alpha-2.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["speaker_tracks"].append({"track": 1, "speaker": "Other player"})
+        self.write_metadata("alpha-2", metadata)
+        fallback = build_manifest(self.session)["segments"]
+        self.assertEqual([s["reference_audio"]["pov_name"] for s in fallback], ["Alpha", "Bravo"])
+
+    def test_reference_rejects_mic_label_and_ambiguous_stream(self):
+        self.streams[1]["channels"] = 2
+        part = self.add_part("Alpha")
+        self.select("pick", "EV-01", 1, 2)
+        metadata = {"speaker_tracks": [
+            {"track": 1, "speaker": "Other player"},
+            {"track": 2, "speaker": "Alpha", "speaker_template": "{Recorder}",
+             "index": 7, "title": "Track2"}],
+            "recorder": {"name": "Alpha", "source": "filename", "tracks": [2]}}
+        self.write_metadata(part, metadata)
+        manifest = build_manifest(self.session)
+        self.assertIsNone(manifest["segments"][0]["reference_audio"])
+        self.assertIn("player mic", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        metadata["speaker_tracks"] = metadata["speaker_tracks"][1:]
+        self.write_metadata(part, metadata)
+        self.streams.append({"index": 8, "codec_type": "audio", "channels": 2,
+                             "tags": {"title": "Track1"}})
+        manifest = build_manifest(self.session)
+        self.assertIn("ambiguous", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        self.streams[1]["tags"] = {}
+        self.streams.pop()
+        manifest = build_manifest(self.session)
+        self.assertIn("missing", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
 
     def test_inferred_requires_matching_owner_confirmation(self):
         part_id = self.add_part("Alpha", inferred=True)

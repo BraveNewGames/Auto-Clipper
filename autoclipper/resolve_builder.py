@@ -20,6 +20,7 @@ EXPORT_PREFIX = "AutoClipper Export "
 TEST_PROJECT_PREFIX = "AutoClipper Stage2 Test "
 DIRECTOR_TEST_PREFIX = "AutoClipper DirectorA Test "
 START_TIMECODE = "01:00:00:00"
+REFERENCE_TRACK_NAME = "GROUP REFERENCE AUDIO"
 
 
 def validate_manifest(manifest):
@@ -81,6 +82,24 @@ def validate_manifest(manifest):
                 raise ValueError("Edit segment IDs must be unique")
             segment_ids.add(segment["segment_id"])
         record += length
+        reference = segment.get("reference_audio")
+        if reference is not None:
+            if mode in {"director_review", "director_edit_plan"} or not any(
+                    angle["pov_id"] == reference.get("pov_id")
+                    and angle["part_id"] == reference.get("part_id")
+                    and angle["mp4_path"] == reference.get("mp4_path")
+                    and angle["source_in_frame"] == reference.get("source_in_frame")
+                    and angle["source_out_frame"] == reference.get("source_out_frame")
+                    and angle.get("reference_track") == reference.get("track") for angle in segment["angles"]):
+                raise ValueError("Reference audio must match a covered verified angle")
+            track = reference["track"]
+            if (reference.get("record_start_frame") != segment["record_start_frame"]
+                    or reference.get("duration_frames") != length or track.get("status") != "verified"
+                    or track.get("mp4_audio_title") != "Track1"
+                    or track.get("resolve_channels_status") != "expected"
+                    or type(track.get("mp4_audio_ordinal")) is not int
+                    or len(track.get("resolve_channels", [])) != 2):
+                raise ValueError("Reference audio placement or mix mapping is unverified")
         povs = set()
         paths = set()
         angles = segment["angles"]
@@ -236,6 +255,54 @@ def import_sources(pool, media, fps):
     return clips
 
 
+def import_reference_sources(pool, segments, mic_clips, fps):
+    references = {Path(ref["mp4_path"]).resolve(): ref["track"]
+                  for segment in segments if (ref := segment.get("reference_audio"))}
+    if not references:
+        return {}
+    root = require(pool.GetRootFolder(), "Export media pool root is unavailable")
+    folder = require(pool.AddSubFolder(root, REFERENCE_TRACK_NAME), "Could not create reference audio bin")
+    require(pool.SetCurrentFolder(folder), "Could not select reference audio bin")
+    clips = {}
+    try:
+        for path, track in references.items():
+            items = pool.ImportMedia([str(path)])
+            require(items and len(items) == 1, f"Could not import separate reference item for {path}")
+            clip = items[0]
+            require(clip.GetUniqueId() != mic_clips[path].GetUniqueId(),
+                    f"Resolve reused the mic-mapped item for reference audio: {path}")
+            require(Path(clip.GetClipProperty("File Path")).resolve() == path
+                    and Fraction(clip.GetClipProperty("FPS")) == fps,
+                    f"Reference media path or rate differs for {path}")
+            mapping = json.loads(clip.GetAudioMapping())
+            ordinal = str(track["mp4_audio_ordinal"])
+            channels = track["resolve_channels"]
+            matches = [key for key, value in mapping["track_mapping"].items()
+                       if value.get("channel_idx") == channels]
+            require(matches == [ordinal] and mapping["track_mapping"][ordinal].get("type") == "stereo"
+                    and not mapping.get("linked_audio")
+                    and mapping.get("embedded_audio_channels", max(channels)) >= max(channels),
+                    f"Reference mix stream or channel mapping differs for {path}")
+            isolate_mic(clip, track["mp4_audio_ordinal"], channels)
+            require(clip.SetName(REFERENCE_TRACK_NAME) and clip.GetName() == REFERENCE_TRACK_NAME,
+                    f"Could not label reference item for {path}")
+            clips[path] = clip
+    finally:
+        require(pool.SetCurrentFolder(root), "Could not restore source media bin")
+    return clips
+
+
+def append_reference(pool, timeline, segment, clips):
+    ref = segment.get("reference_audio")
+    if ref is None:
+        return
+    clip = clips[Path(ref["mp4_path"]).resolve()]
+    require(int(clip.GetClipProperty("Frames")) >= ref["source_out_frame"],
+            f"Reference source range exceeds media for {ref['part_id']}")
+    append_clip(pool, clip, ref["source_in_frame"], ref["source_out_frame"],
+                timeline.GetStartFrame() + ref["record_start_frame"], 2, audio_only=True)
+
+
 def build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps):
     sources = []
     for angle in segment["angles"]:
@@ -376,6 +443,17 @@ def read_export(timeline, segments, names, placeholders=None):
     expected_audio = sum(bool(segment["angles"]) for segment in segments)
     require(len(tracks["video"]) == expected_audio + len(placeholders) and len(tracks["audio"]) == expected_audio,
             "Export must have one video and one audio item per segment")
+    has_reference = any("reference_audio" in segment for segment in segments)
+    references = []
+    if has_reference:
+        require(timeline.GetTrackCount("audio") >= 2
+                and timeline.GetTrackName("audio", 2) == REFERENCE_TRACK_NAME
+                and timeline.GetIsTrackEnabled("audio", 2),
+                "GROUP REFERENCE AUDIO track name, presence or enabled state differs")
+        references = sorted(timeline.GetItemListInTrack("audio", 2) or [], key=lambda item: item.GetStart())
+        require(len(references) == sum(segment.get("reference_audio") is not None for segment in segments),
+                "Reference audio item count differs from the manifest")
+    reference_items = iter(references)
     videos, audios = iter(tracks["video"]), iter(tracks["audio"])
     rows = []
     for segment, name in zip(segments, names):
@@ -417,11 +495,31 @@ def read_export(timeline, segments, names, placeholders=None):
         require(marker == marker_data(segment), f"Marker readback differs for {name}")
         timing = {key: segment[key] for key in ("kind", "session_start_frame", "session_end_frame", "audio_angle")
                   if key in segment}
+        reference_row = None
+        if ref := segment.get("reference_audio"):
+            item = next(reference_items)
+            media_item = item.GetMediaPoolItem()
+            reference_row = read_item(item)
+            require(media_item and media_item.GetClipProperty("Type") != "Multicam"
+                    and media_item.GetName() == REFERENCE_TRACK_NAME
+                    and Path(reference_row["path"]).resolve() == Path(ref["mp4_path"]).resolve()
+                    and reference_row["source_start"] == ref["source_in_frame"]
+                    and reference_row["record_start"] == start
+                    and reference_row["record_end"] == start + length
+                    and reference_row["duration"] == length,
+                    f"Reference audio source or placement differs for {name}")
+            channels = ref["track"]["resolve_channels"]
+            require(stereo_channels(json.loads(media_item.GetAudioMapping())) == channels
+                    and stereo_channels(json.loads(item.GetSourceAudioChannelMapping())) == channels,
+                    f"Reference audio channel mapping differs for {name}")
+            reference_row.update(pov_id=ref["pov_id"], part_id=ref["part_id"],
+                                 channels=channels, track_name=REFERENCE_TRACK_NAME)
         rows.append({
             **marker, **timing, "multicam": name, "record_start_frame": start, "duration_frames": length,
             "video": read_item(video), "audio": read_item(audio), "audio_mapping": audio_mapping,
             "angles": read_angles(multicam, segment),
             "planned_angles": segment["angles"], "unavailable": segment["unavailable"],
+            **({"reference_audio": reference_row} if has_reference else {}),
         })
     return rows
 
@@ -478,10 +576,20 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     require(Fraction(timeline.GetSettings()["timelineFrameRate"]) == fps, "Export timeline rate differs")
     clips = import_sources(pool, media, fps)
     segments = manifest["segments"]
+    reference_clips = import_reference_sources(pool, segments, clips, fps) if not mapped_director else {}
+    if any("reference_audio" in segment for segment in segments):
+        require(timeline.AddTrack("audio"), "Could not add GROUP REFERENCE AUDIO track")
+        require(timeline.SetTrackName("audio", 2, REFERENCE_TRACK_NAME)
+                and timeline.GetTrackName("audio", 2) == REFERENCE_TRACK_NAME,
+                "Could not label GROUP REFERENCE AUDIO track")
+        require(timeline.SetTrackEnable("audio", 2, True)
+                and timeline.GetIsTrackEnabled("audio", 2),
+                "Could not enable GROUP REFERENCE AUDIO track")
     names = [f"{index:03d} {segment['segment_id']}" for index, segment in enumerate(segments, 1)]
     for segment, multicam_name in zip(segments, names):
         if segment["angles"]:
             build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps)
+            append_reference(pool, timeline, segment, reference_clips)
         elif segment.get("kind") == "placeholder":
             build_placeholder(project, pool, timeline, segment, slates[segment["segment_id"]])
     read_export(timeline, segments, names, slates)
@@ -516,6 +624,19 @@ def build_export(manifest, *, dry_run=False, project_name=None):
                     f"Reopened mic mapping differs for {key}")
             persisted[key] = {"path": str(key), "pov_name": pov_name, "mic_channels": list(channels)}
     require(persisted.keys() == media.keys(), "Reopened export is missing source media")
+    if reference_clips:
+        folder = next((item for item in root.GetSubFolderList() or []
+                       if item.GetName() == REFERENCE_TRACK_NAME), None)
+        require(folder, "Reopened reference audio bin is missing")
+        reference_paths = {Path(clip.GetClipProperty("File Path")).resolve() for clip in folder.GetClipList() or []}
+        require(reference_paths == reference_clips.keys(), "Reopened reference media differs")
+        for clip in folder.GetClipList() or []:
+            path = Path(clip.GetClipProperty("File Path")).resolve()
+            track = next(segment["reference_audio"]["track"] for segment in segments
+                         if segment.get("reference_audio") and Path(segment["reference_audio"]["mp4_path"]).resolve() == path)
+            require(clip.GetName() == REFERENCE_TRACK_NAME
+                    and stereo_channels(json.loads(clip.GetAudioMapping())) == track["resolve_channels"],
+                    f"Reopened reference mapping differs for {path}")
     rows = read_export(timeline, segments, names, slates)
     limitations = [
         "Source audio provides one switchable owner-mic pair. Game audio is not identified by manifest v1.",

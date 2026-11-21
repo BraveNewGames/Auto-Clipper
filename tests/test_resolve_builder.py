@@ -71,7 +71,8 @@ def fake_resolve():
     project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = "scratch-project-id"
     pool = project.GetMediaPool.return_value
     timeline, reopened_timeline = pool.CreateEmptyTimeline.return_value, Mock()
-    state = {"current": None, "media": [], "video": [], "audio": [], "markers": {}}
+    state = {"current": None, "media": [], "reference_media": [], "video": [], "audio": [],
+             "audio2": [], "markers": {}, "reference_folder": None, "current_folder": "root"}
     manager.GetCurrentProject.side_effect = lambda: state["current"]
     manager.GetProjectListInCurrentFolder.return_value = []
     project.GetTimelineCount.return_value = 0
@@ -80,14 +81,33 @@ def fake_resolve():
     reopened.GetMediaPool.return_value.GetRootFolder.return_value.GetClipList.side_effect = (
         lambda: list(state["media"])
     )
+    root_folder = pool.GetRootFolder.return_value
+    root_folder.GetClipList.side_effect = lambda: list(state["media"])
+    root_folder.GetSubFolderList.side_effect = lambda: ([state["reference_folder"]]
+                                                        if state["reference_folder"] else [])
+    reopened.GetMediaPool.return_value.GetRootFolder.return_value = root_folder
+    def add_folder(_root, name):
+        folder = Mock()
+        folder.GetName.return_value = name
+        folder.GetClipList.side_effect = lambda: list(state["reference_media"])
+        state["reference_folder"] = folder
+        return folder
+    pool.AddSubFolder.side_effect = add_folder
+    pool.SetCurrentFolder.side_effect = lambda folder: state.update(
+        current_folder="root" if folder is root_folder else "reference") or True
     for item in (timeline, reopened_timeline):
         item.GetName.return_value = "synthetic-session"
         item.GetUniqueId.return_value = "review-timeline-id"
         item.GetSettings.return_value = {"timelineFrameRate": "60"}
         item.GetStartFrame.return_value = 216000
         item.GetStartTimecode.return_value = "01:00:00:00"
-        item.GetItemListInTrack.side_effect = lambda kind, index: list(state[kind])
+        item.GetItemListInTrack.side_effect = lambda kind, index: list(
+            state["audio2"] if kind == "audio" and index == 2 else state[kind])
         item.GetMarkerCustomData.side_effect = lambda offset: state["markers"][offset]
+        item.GetTrackCount.side_effect = lambda kind: 2 if kind == "audio" and state["reference_folder"] else 1
+        item.SetTrackName.side_effect = lambda kind, index, name: state.update(track_name=name) or True
+        item.GetTrackName.side_effect = lambda kind, index: state.get("track_name", "")
+        item.GetIsTrackEnabled.return_value = True
 
     def create_project(name, _):
         project.GetName.return_value = reopened.GetName.return_value = name
@@ -141,7 +161,7 @@ def fake_resolve():
         clip.SetAudioMapping.side_effect = set_mapping
         clip.SetMarkInOut.side_effect = set_marks
         clip.ClearMarkInOut.side_effect = clear_marks
-        state["media"].append(clip)
+        state["reference_media" if state["current_folder"] == "reference" else "media"].append(clip)
         return [clip]
 
     def create_multicam(sources, options):
@@ -171,7 +191,7 @@ def fake_resolve():
             item.GetSourceAudioChannelMapping.return_value = json.dumps({
                 "track_mapping": {"1": {"channel_idx": [1, 2], "mute": False, "type": "stereo"}},
             })
-            state[kind].append(item)
+            state["audio2" if kind == "audio" and info["trackIndex"] == 2 else kind].append(item)
             items.append(item)
         return items
 
@@ -191,6 +211,38 @@ def fake_resolve():
 
 
 class ResolveBuilderTests(unittest.TestCase):
+    def test_reference_audio_uses_separate_item_and_track_after_reopen(self):
+        sdk, _, state, project, _ = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            manifest["segments"] = manifest["segments"][:1]
+            for angle in manifest["segments"][0]["angles"]:
+                (Path(angle["mp4_path"])).touch()
+            segment = manifest["segments"][0]
+            angle = segment["angles"][0]
+            track = {"status": "verified", "mp4_audio_stream_index": 1,
+                     "mp4_audio_ordinal": 1, "mp4_audio_title": "Track1",
+                     "resolve_channels": [1, 2], "resolve_channels_status": "expected"}
+            angle["reference_track"] = track
+            segment["reference_audio"] = {
+                "pov_id": angle["pov_id"], "pov_name": angle["pov_name"],
+                "part_id": angle["part_id"], "mp4_path": angle["mp4_path"],
+                "source_in_frame": angle["source_in_frame"],
+                "source_out_frame": angle["source_out_frame"],
+                "record_start_frame": 0, "duration_frames": 60, "track": track}
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), patch(
+                    "autoclipper.resolve_builder.mkdtemp", return_value=folder):
+                result = build_export(manifest)
+            self.assertEqual(len(state["audio"]), 1)
+            self.assertEqual(len(state["audio2"]), 1)
+            self.assertEqual(state["track_name"], "GROUP REFERENCE AUDIO")
+            ref = result["segments"][0]["reference_audio"]
+            self.assertEqual((ref["path"], ref["source_start"], ref["record_start"], ref["channels"]),
+                             (angle["mp4_path"], angle["source_in_frame"], 216000, [1, 2]))
+            self.assertEqual(len(state["media"]), 2)
+            self.assertEqual(len(state["reference_media"]), 1)
+
     def test_session_to_manifest_to_builder_dry_run(self):
         sdk = Mock()
         with tempfile.TemporaryDirectory() as folder:

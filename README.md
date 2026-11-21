@@ -104,7 +104,13 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
    Delete that project and export again.
 
 Audio uses Resolve multicam *Source* mode: each angle carries its owner's mic (one switchable
-pair). Game audio is reported as not identified unless the transcriber metadata names it.
+pair). New exports also have an enabled **GROUP REFERENCE AUDIO** track with the verified stereo
+Track1 mix from one covering POV per segment. It stays in place while you switch multicam angles.
+If no safe mix is identified, that segment has a gap and the preview and report show a warning.
+Before the final render, disable **GROUP REFERENCE AUDIO** in the Edit track header or mute it in
+the Edit or Fairlight mixer if you do not want the group conversation in the final mix. A disabled
+or muted track is excluded from the render. Game audio is reported as not identified unless the
+transcriber metadata names it.
 Source MP4s are imported by reference and never modified.
 
 ## Where files go
