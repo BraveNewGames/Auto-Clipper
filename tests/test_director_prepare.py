@@ -1,5 +1,6 @@
 from contextlib import redirect_stdout
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import asdict, replace
 import io
 import json
 from pathlib import Path
@@ -8,27 +9,127 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from autoclipper.director_notes import NotesCatalog
+from autoclipper.director_notes import NotesCatalog, review_payload
 from autoclipper.director_poc.__main__ import initialize_fkb, main
 from autoclipper.director_poc.core import Capture, Clock
-from autoclipper.fkb import FKBStore
+from autoclipper.fkb import DirectorNote, EditPlan, FKBStore
 from autoclipper.models import Part, POV, Session
 from autoclipper.resolve_builder import build_export
+from autoclipper.resolve_manifest import compile_fkb_edit_plan
+from autoclipper.store import load_session
 
 from test_resolve_builder import fake_resolve
+from director_fixtures import confirmed_mics, synthetic_probe, verified_review
 
 
 class DirectorPrepareTests(unittest.TestCase):
+    def test_migrate_legacy_catalog_preserves_notes_and_validates_each_revision(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, new = (root / f"autoclipper-director-a-{stage}" for stage in ("old", "new"))
+            old.mkdir()
+            new.mkdir()
+            media = root / "angle.mp4"
+            media.touch()
+            source = Session(session_id="synthetic-session", folder=directory, povs=[
+                POV("ada", "Ada", [Part("angle", video_path=media.name, duration=10)]),
+            ])
+            source_path = root / "source.json"
+            source_path.write_text(json.dumps(source.to_dict()), encoding="utf-8")
+            current = verified_review(source, 60)
+            legacy = deepcopy(current)
+            for key in ("mode", "review_session_frames", "source_mapping", "source_mapping_digest"):
+                del legacy[key]
+            first, = legacy["segments"]
+            first.update(session_end=1, session_end_frame=60, duration_frames=60)
+            first["angles"][0]["source_out_frame"] = 60
+            second = deepcopy(first)
+            second.update(segment_id="legacy-second", record_start_frame=60,
+                          session_start=1, session_end=2, session_start_frame=60, session_end_frame=120)
+            second["angles"][0].update(source_in_frame=60, source_out_frame=120)
+            legacy["segments"].append(second)
+
+            def receipt(manifest, suffix):
+                sdk, _, _, project, reopened = fake_resolve()
+                project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = f"project-{suffix}"
+                reopened.GetTimelineByIndex.return_value.GetUniqueId.return_value = f"timeline-{suffix}"
+                with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                      patch("autoclipper.resolve_builder.mkdtemp", return_value=directory)):
+                    return build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")
+
+            old_built, new_built = receipt(legacy, "old"), receipt(current, "new")
+            with self.assertRaisesRegex(ValueError, "Persistent notes require verified source mapping"):
+                initialize_fkb(old, source, legacy, old_built)
+            old_store = FKBStore(old)
+            old_store.ingest(source, fps=60, timeline_start_frame=216000,
+                             project_id="project-old", timeline_id="timeline-old")
+            capture = Capture(old_built["project"], "project-old", old_built["timeline"], "timeline-old",
+                              10, 15, "01:00:00:10", "01:00:00:15", 10, 15, 60, "01:00:00:12", "then")
+            note = DirectorNote("stable-note-id", {"start": 10, "end": 15}, "Original", "Original",
+                                "then", "then", asdict(capture), marker_id="stable-note-id")
+            snapshot = note.to_dict()
+            del snapshot["revisions"]
+            note.revisions.append(snapshot)
+            note.text = "Revised"
+            note.revision = 1
+            note.frames = {"start": 70, "end": 75}
+            note.capture = asdict(replace(capture, timeline_in=70, timeline_out_exclusive=75,
+                                          in_timecode="01:00:01:10", out_timecode_exclusive="01:00:01:15",
+                                          session_in=70, session_out_exclusive=75, playhead="01:00:01:12"))
+            old_store.update(lambda data: data.director_notes.append(note))
+            original = old_store.path.read_bytes()
+
+            def write_review(scratch, manifest, built):
+                for name, value in (("manifest.json", manifest), ("build.json", built)):
+                    (scratch / name).write_text(json.dumps(value), encoding="utf-8")
+
+            changed = deepcopy(legacy)
+            for key in ("source_in_frame", "source_out_frame"):
+                changed["segments"][0]["angles"][0][key] += 1
+            write_review(old, changed, receipt(changed, "old"))
+            with self.assertRaisesRegex(ValueError, "Cannot verify the same footage for note.*revision 0"):
+                initialize_fkb(new, source, current, new_built, migrate_from=old)
+            self.assertFalse(FKBStore(new).path.exists())
+
+            write_review(old, legacy, old_built)
+            write_review(new, current, new_built)
+            with (patch.object(sys, "argv", ["director", "index-notes", str(new), str(source_path),
+                                             "--migrate-from", str(old)]),
+                  redirect_stdout(io.StringIO())):
+                main()
+            self.assertEqual(old_store.path.read_bytes(), original)
+            new_store = FKBStore(new)
+            migrated, = new_store.load().director_notes
+            self.assertEqual((migrated.note_id, migrated.marker_id), (note.note_id, note.marker_id))
+            self.assertEqual((migrated.original_text, migrated.text, migrated.revision), ("Original", "Revised", 1))
+            self.assertEqual(migrated.revisions[0]["text"], "Original")
+            self.assertEqual(migrated.capture["migrated_from"], note.capture)
+            self.assertEqual(migrated.pov_ids, ["ada"])
+            self.assertEqual(review_payload(migrated)["timeline_id"], "timeline-new")
+            restored = NotesCatalog(new_store).restore_revision(migrated.note_id, 0)
+            self.assertEqual(restored.source_mapping_digest, current["source_mapping_digest"])
+            self.assertEqual(review_payload(restored)["timeline_id"], "timeline-new")
+            new_store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                {"entry_id": "cut", "kind": "source", "title": "Migrated",
+                 "frames": restored.frames, "note_ids": [restored.note_id]},
+            ])))
+            with synthetic_probe(source, 60):
+                edit = compile_fkb_edit_plan(source, new_store.load(), "draft", revision_id="r1",
+                                             confirmations=confirmed_mics(source))
+            self.assertEqual(edit["segments"][0]["angles"][0]["source_in_frame"], 10)
+
     def test_scratch_prepare_uses_verified_coverage_without_resolve(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             media = root / "media"
             media.mkdir()
+            original_root = root / "original"
+            original_root.mkdir()
             scratch = root / "autoclipper-director-a-test"
             scratch.mkdir()
             source = root / "session.json"
             confirmations = root / "mic_confirmations.json"
-            session = Session(session_id="source", folder=str(media), povs=[
+            session = Session(session_id="source", folder=str(original_root), povs=[
                 POV("ada", "Ada", [
                     Part("first", video_path="first.mkv", duration=3, offset=1),
                     Part("second", index=2, video_path="second.mkv", duration=4, offset=3),
@@ -91,7 +192,10 @@ class DirectorPrepareTests(unittest.TestCase):
                         initialize_fkb(scratch, session, unverified_manifest, unverified_result)
                     self.assertFalse(FKBStore(scratch).path.exists())
 
-            initialize_fkb(scratch, session, manifest, built)
+            (scratch / "build.json").write_text(json.dumps(built), encoding="utf-8")
+            with (patch.object(sys, "argv", ["director", "index-notes", str(scratch), str(source)]),
+                  redirect_stdout(io.StringIO())):
+                main()
             store = FKBStore(scratch)
             self.assertEqual(store.load().session.review_session_start_frame, 60)
             catalog = NotesCatalog(store)
@@ -104,3 +208,18 @@ class DirectorPrepareTests(unittest.TestCase):
                 catalog.create(replace(capture, session_in=181, session_out_exclusive=186),
                                "Shifted range", playback="paused")
             self.assertEqual(len(store.load().director_notes), 1)
+            store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                {"entry_id": "selected", "kind": "source", "title": "Verified take",
+                 "frames": note.frames, "note_ids": [note.note_id]},
+            ])))
+            live = load_session(source)
+            with patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory) as probe:
+                edit = compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1",
+                                             confirmations=confirmations)
+            self.assertEqual(edit["source_mapping_digest"], manifest["source_mapping_digest"])
+            angle, = edit["segments"][0]["angles"]
+            self.assertEqual(angle["mp4_path"], str(media / "second.mp4"))
+            self.assertEqual((angle["source_in_frame"], angle["source_out_frame"]), (0, 5))
+            self.assertEqual([call.args[0] for call in probe.call_args_list], media_files)
+            self.assertEqual((live.folder, live.povs[0].parts[1].video_path),
+                             (str(original_root), "second.mkv"))

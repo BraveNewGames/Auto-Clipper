@@ -14,6 +14,7 @@ class NotesTests(unittest.TestCase):
         self.store = FKBStore(folder)
         self.store.initialize(FootageKnowledgeBase(
             Session("test", 24, 86400, "project", "timeline"),
+            source_mapping_digest="fixture",
             transcript_spans=[TranscriptSpan(
                 "cue", "Move the truck", "Ada", "high", False, {"start": 16, "end": 20}, [])]))
         self.capture = Capture("Project", "project", "Timeline", "timeline", 10, 20,
@@ -68,6 +69,12 @@ class NotesTests(unittest.TestCase):
             self.catalog.create(replace(self.capture, timeline_id="wrong"), "Note", playback="paused")
         self.assertFalse(self.catalog.search())
         self.assertFalse(self.create("Good").capture["playback_api_verified"])
+
+    def test_unverified_legacy_catalog_can_be_read_but_cannot_capture(self):
+        self.store.update(lambda data: setattr(data, "source_mapping_digest", None))
+        self.assertEqual(self.catalog.search(), [])
+        with self.assertRaisesRegex(ValueError, "require verified source mapping"):
+            self.create("Unverified")
 
     def test_rejects_consistently_shifted_session_ranges(self):
         note = self.create("Original")

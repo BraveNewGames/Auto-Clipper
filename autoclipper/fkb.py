@@ -161,6 +161,7 @@ class FootageKnowledgeBase(_Model):
     mapping_stale: bool = False
     schema_version: int = 1
     source_mapping_digest: str | None = None
+    source_resolution: dict | None = None
 
     @classmethod
     def from_dict(cls, data):
@@ -263,11 +264,14 @@ class FKBStore:
                     data.mapping_stale = (data.recording_parts != incoming.recording_parts
                                           or data.transcript_spans != incoming.transcript_spans
                                           or data.source_mapping_digest != incoming.source_mapping_digest)
+                    if not data.mapping_stale:
+                        data.source_resolution = incoming.source_resolution
                     return
                 data.recording_parts = incoming.recording_parts
                 data.transcript_spans = incoming.transcript_spans
                 data.session.source_manifest = incoming.session.source_manifest
                 data.source_mapping_digest = incoming.source_mapping_digest
+                data.source_resolution = incoming.source_resolution
                 data.mapping_stale = False
 
             self.update(refresh)
@@ -319,5 +323,12 @@ def ingest_session(source, *, fps, timeline_start_frame=0, review_session_start_
             stable_id(source.session_id, "span", identity), line.text, line.speaker,
             line.confidence, line.uncertain,
             session.frames(line.session_start, line.session_end).to_dict(), sources))
-    return FootageKnowledgeBase(session, parts, spans, source_mapping_digest=digest)
+    resolution = None
+    if digest:
+        resolution = {
+            "catalog_source": review_manifest["catalog_source"],
+            "paths": {part_id: row["source_path"] for part_id, row in mapping_parts.items()},
+        }
+    return FootageKnowledgeBase(session, parts, spans, source_mapping_digest=digest,
+                                source_resolution=resolution)
 

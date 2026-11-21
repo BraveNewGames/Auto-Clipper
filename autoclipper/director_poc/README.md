@@ -138,6 +138,19 @@ edit its clock, coverage digest, or receipt by hand.
    and the approved read-only media root.
 2. In a separately approved Resolve window, run `build` in the new scratch
    directory. Keep the generated `manifest.json` and `build.json` together.
-3. Run `index-notes` against that new scratch directory and the original
-   approved session copy. Use the old catalog as a reference when reviewing
-   and re-capturing ranges whose source mapping cannot be verified.
+3. If the old zero-origin review has its original manifest and verified
+   build receipt, run the following before indexing the new scratch catalog.
+
+   ```powershell
+   python -m autoclipper.director_poc index-notes <new-scratch> <approved-session-copy> --migrate-from <old-scratch>
+   ```
+
+   Migration verifies the recorded source placement of every note and
+   revision. It preserves note UUIDs, text and history in the new catalog and
+   leaves the old snapshot untouched. A legacy receipt verifies recorded
+   placement and provides no historical file-identity check.
+4. If the old receipt is missing or any range cannot be verified, omit
+   `--migrate-from` to create a fresh catalog. Keep the old catalog as a
+   reference and reselect any ranges needed in the new verified review.
+   Persistent capture requires the new verified source mapping. A receipted,
+   zero-origin legacy review can still open in disposable mode.

@@ -802,6 +802,15 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
         "revision_history": plan.revisions, "entries": entries,
         "source_mapping_digest": digest,
     }
+    resolution = getattr(knowledge_base, "source_resolution", None)
+    if resolution and any(entry["kind"] == "source" for entry in entries):
+        if resolution["catalog_source"] != catalog_source_identity(session):
+            raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
+        paths = resolution["paths"]
+        session = replace(session, povs=[
+            replace(pov, parts=[replace(part, video_path=paths[part.part_id]) for part in pov.parts])
+            for pov in session.povs
+        ])
     return compile_edit_plan(session, projection, transcripts_dir, confirmations)
 
 

@@ -147,7 +147,7 @@ class DirectorCaptureTests(unittest.TestCase):
             store.initialize(FootageKnowledgeBase(FKBSession("synthetic", 60, 216000, "p1", "t1"), recording_parts=[
                 RecordingPart("one", "pov", "Player", None, None, 2, "fixture", 0, "fixture", None,
                               {"start": 0, "end": 120}, {"start": 0, "end": 120}, {"transcriber_track": 2}, True),
-            ]))
+            ], source_mapping_digest="fixture"))
             catalog = NotesCatalog(store)
             note = catalog.create(capture, "Observation", playback="paused")
             self.assertEqual(note.frames, {"start": 10, "end": 40})
@@ -170,7 +170,8 @@ class DirectorCaptureTests(unittest.TestCase):
         self.assertEqual((shifted.timeline_in, shifted.session_in), (10, 310))
         with TemporaryDirectory() as folder:
             store = FKBStore(folder)
-            store.initialize(FootageKnowledgeBase(Session("test", 60, 216000, "p1", "t1")))
+            store.initialize(FootageKnowledgeBase(Session("test", 60, 216000, "p1", "t1"),
+                                                  source_mapping_digest="fixture"))
             catalog = NotesCatalog(store)
             with self.assertRaisesRegex(ValueError, "bound session frame origin"):
                 catalog.create(shifted, "Shifted marks", playback="paused")

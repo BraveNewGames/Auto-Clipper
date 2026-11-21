@@ -50,6 +50,8 @@ class NotesCatalog:
         session = data.session
         if data.mapping_stale:
             raise ValueError("Resolve the stale footage mapping before capturing")
+        if not data.source_mapping_digest:
+            raise ValueError("Persistent notes require verified source mapping. Re-index or migrate the catalog.")
         if not session.project_id or not session.timeline_id or (
             capture.project_id, capture.timeline_id, capture.fps
         ) != (session.project_id, session.timeline_id, session.fps):
