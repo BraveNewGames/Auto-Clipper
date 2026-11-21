@@ -108,6 +108,12 @@ Phase B verification.
 
 ## Known limitations / deferred
 
+- **Historical review receipt.** The receipt binds the saved and reopened
+  segment map. An in-place edit to the same timeline can change its contents
+  while leaving its project ID, timeline ID and start clock intact. In a
+  future authorized disposable project, build and reopen a review, edit one
+  segment in place, then check what the companion can still detect. Rebuild
+  into a new disposable project after changing a review used for capture.
 - **Independent mic coverage (Medium 4).** Video coverage currently stands in
   for mic availability. A delayed or truncated mic can yield silence, shifted
   audio, or a rejected append. Test a delayed and short mic stream, comparing
@@ -120,3 +126,18 @@ Phase B verification.
   another repetition of the same quote. Test a stale explicit line with no
   timestamp or span ID and a single repeated hit in range. Require unresolved
   or explicitly weaker attribution.
+
+## Legacy scratch recovery
+
+If `index-notes` or `companion` refuses an old receipt or catalog binding,
+keep the old scratch directory, `.autoclipper/director-fkb.json`, and
+`director-fkb.json.bak` intact. Do not copy the old catalog over a new one or
+edit its clock, coverage digest, or receipt by hand.
+
+1. Run the current `prepare` using the approved session and microphone copies
+   and the approved read-only media root.
+2. In a separately approved Resolve window, run `build` in the new scratch
+   directory. Keep the generated `manifest.json` and `build.json` together.
+3. Run `index-notes` against that new scratch directory and the original
+   approved session copy. Use the old catalog as a reference when reviewing
+   and re-capturing ranges whose source mapping cannot be verified.

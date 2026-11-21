@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,9 @@ from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
 from autoclipper.resolve_builder import build_export, describe_failure, import_sources, main
-from autoclipper.resolve_manifest import build_manifest
+from autoclipper.resolve_manifest import build_manifest, build_review_manifest, compile_edit_plan, source_mapping_digest
+
+from director_fixtures import confirmed_mics, synthetic_probe
 
 
 def make_manifest(root):
@@ -44,6 +47,17 @@ def make_manifest(root):
         "created_at": "2026-01-01T00:00:00Z", "fps": 60, "blockers": [], "warnings": [],
         "segments": segments,
     }
+
+
+def add_fixture_media_mapping(manifest):
+    paths = {angle["mp4_path"] for segment in manifest["segments"]
+             for angle in (*segment["angles"], *([segment["audio_angle"]] if segment.get("audio_angle") else []))}
+    rows = []
+    for path in sorted(paths):
+        stat = Path(path).stat()
+        rows.append({"media": {"mp4_path": path}, "file_identity": [stat.st_size, stat.st_mtime_ns]})
+    manifest["source_mapping"] = {"version": 1, "parts": rows}
+    manifest["source_mapping_digest"] = source_mapping_digest(manifest)
 
 
 def fake_resolve():
@@ -296,6 +310,7 @@ class ResolveBuilderTests(unittest.TestCase):
             for field in ("session_start", "session_end", "session_start_frame", "session_end_frame"):
                 del slate[field]
             slate.update(kind="placeholder", angles=[], placeholder_reason="planned_missing_beat", candidate_ids=[])
+            add_fixture_media_mapping(manifest)
 
             def import_with_slate(paths):
                 clips = import_media(paths)
@@ -337,6 +352,7 @@ class ResolveBuilderTests(unittest.TestCase):
                 for angle in segment["angles"]:
                     angle["source_frame_count"] = 600
             segments[1].update(kind="coverage_gap", angles=[])
+            add_fixture_media_mapping(manifest)
             with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
                   patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
                 result = build_export(manifest)
@@ -360,6 +376,62 @@ class ResolveBuilderTests(unittest.TestCase):
                 result = build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")
         self.assertEqual(result["project_id"], "scratch-project-id")
         self.assertEqual(result["timeline_id"], "review-timeline-id")
+
+    def test_director_media_size_or_mtime_change_stops_both_build_modes_before_sdk_import(self):
+        for mode in ("review", "edit"):
+            for change in ("size", "mtime"):
+                with self.subTest(mode=mode, change=change), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    mp4 = root / "a1.mp4"
+                    mp4.write_bytes(b"fixture")
+                    source = Session(session_id="synthetic-session", folder=folder, povs=[
+                        POV("alpha", "Alpha", [Part("a1", video_path=mp4.name, duration=2)])
+                    ])
+                    confirmations = confirmed_mics(source)
+                    with synthetic_probe(source, 60):
+                        if mode == "review":
+                            manifest = build_review_manifest(source, confirmations=confirmations)
+                        else:
+                            manifest = compile_edit_plan(source, {
+                                "plan_id": "draft", "session_id": source.session_id, "fps": 60,
+                                "revision_id": "r1", "revision_history": [],
+                                "entries": [{"entry_id": "cut", "kind": "source", "title": "Fixture",
+                                             "session_in": 12, "session_out_exclusive": 24}],
+                            }, confirmations=confirmations)
+                    previous = mp4.stat()
+                    if change == "size":
+                        mp4.write_bytes(b"different size")
+                        os.utime(mp4, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+                    else:
+                        os.utime(mp4, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+                    sdk = Mock()
+                    with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                          patch("builtins.__import__", wraps=__import__) as imports,
+                          self.assertRaisesRegex(ValueError, "source media changed.*Rebuild.*recompile")):
+                        build_export(manifest)
+                    self.assertNotIn("DaVinciResolveScript", [call.args[0] for call in imports.call_args_list])
+                    sdk.scriptapp.assert_not_called()
+
+    def test_director_refuses_same_name_reopened_project_with_another_id(self):
+        sdk, manager, _, project, reopened = fake_resolve()
+        reopened.GetUniqueId.return_value = "different-project-id"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for stem in ("a1", "a2", "b1"):
+                (root / f"{stem}.mp4").touch()
+            name = "AutoClipper DirectorA Test 20261120-010203"
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder),
+                  patch("autoclipper.director_poc.receipt.record_review_receipt") as record_receipt,
+                  self.assertRaisesRegex(RuntimeError, "Reopened Director project ID differs")):
+                build_export(manifest, project_name=name)
+        self.assertEqual(reopened.GetName(), name)
+        self.assertNotEqual(reopened.GetUniqueId(), project.GetUniqueId())
+        manager.LoadProject.assert_called_once_with(name)
+        reopened.GetTimelineByIndex.assert_not_called()
+        reopened.SetCurrentTimeline.assert_not_called()
+        record_receipt.assert_not_called()
 
     def test_multicam_compilation_saves_and_verifies_after_reopen(self):
         sdk, manager, state, project, reopened = fake_resolve()

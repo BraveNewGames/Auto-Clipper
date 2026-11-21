@@ -12,6 +12,7 @@ from tempfile import mkdtemp
 from textwrap import fill
 
 from .media import FFMPEG_BIN
+from .resolve_manifest import verify_source_media_identity
 from .resolve_stage1 import append_clip, isolate_mic, read_item, require
 
 
@@ -439,9 +440,11 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     ]
     if dry_run:
         return {"mode": "dry-run", "manifest": manifest, "warnings": warnings}
-    for path in media:
-        if not path.is_file():
-            raise ValueError(f"MP4 is missing: {path}")
+    mapped_director = manifest.get("mode") in {"director_review", "director_edit_plan"}
+    if not mapped_director:
+        for path in media:
+            if not path.is_file():
+                raise ValueError(f"MP4 is missing: {path}")
 
     slates = {}
     for segment in manifest["segments"]:
@@ -449,14 +452,16 @@ def build_export(manifest, *, dry_run=False, project_name=None):
             folder = Path(mkdtemp(prefix="autoclipper-missing-footage-"))
             slates[segment["segment_id"]] = render_placeholder(folder, segment, manifest["fps"]).resolve()
 
+    if mapped_director:
+        verify_source_media_identity(manifest, media)
+
     import DaVinciResolveScript
 
     resolve = require(DaVinciResolveScript.scriptapp("Resolve"), "Resolve is unavailable")
     manager = require(resolve.GetProjectManager(), "Resolve project manager is unavailable")
     session = manifest["session_id"]
     name = project_name or f"{EXPORT_PREFIX}{session} {datetime.now():%Y%m%d-%H%M%S}"
-    director = (manifest.get("mode") in {"director_review", "director_edit_plan"}
-                or name.startswith(DIRECTOR_TEST_PREFIX))
+    director = mapped_director or name.startswith(DIRECTOR_TEST_PREFIX)
     project_id = None
     if director:
         project = create_director_project(manager, name)

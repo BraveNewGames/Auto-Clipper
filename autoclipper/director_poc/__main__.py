@@ -15,6 +15,10 @@ from .core import NoteStore, connect_review
 from .receipt import validate_review_receipt
 
 
+_SCRATCH_RECOVERY = ("Keep the existing catalog and its backup. See the legacy recovery steps in "
+                     "autoclipper/director_poc/README.md.")
+
+
 def read(path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
@@ -108,52 +112,57 @@ def main():
     if args.command == "prepare":
         prepare(args)
         return
-    scratch = temp_copy(args.scratch)
-    if not scratch.name.startswith("autoclipper-director-a-"):
-        parser.error("Use the scratch directory printed by prepare")
-    manifest = read(scratch / "manifest.json")
+    try:
+        scratch = temp_copy(args.scratch)
+        if not scratch.name.startswith("autoclipper-director-a-"):
+            raise ValueError("Use the scratch directory printed by prepare")
+        manifest = read(scratch / "manifest.json")
+    except (OSError, TypeError, ValueError) as exc:
+        parser.error(f"Cannot open the scratch review. {exc} {_SCRATCH_RECOVERY}")
     result_path = scratch / "build.json"
     if args.command == "build":
         if result_path.exists():
             parser.error("This scratch directory already has a built project")
         name = f"{DIRECTOR_TEST_PREFIX}{datetime.now():%Y%m%d-%H%M%S}"
-        result = build_export(manifest, project_name=name)
+        try:
+            result = build_export(manifest, project_name=name)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
         _write_json(result_path, result)
         print(f"Reopened {name} / {result['timeline']}")
         return
 
+    persistent = None
     try:
         built = read(result_path)
-        if args.command == "companion":
-            binding = validate_review_receipt(manifest, built)
-    except (OSError, KeyError, TypeError, ValueError) as exc:
-        parser.error(f"Cannot verify the scratch review build receipt. Keep manifest.json and build.json from "
-                     f"the same new disposable build. {exc}")
+        if args.command == "index-notes":
+            source = load_session(temp_copy(args.session))
+            print(initialize_fkb(scratch, source, manifest, built))
+            return
 
-    if args.command == "index-notes":
-        source = load_session(temp_copy(args.session))
-        print(initialize_fkb(scratch, source, manifest, built))
-        return
+        binding = validate_review_receipt(manifest, built)
+        if args.persistent_notes:
+            from ..director_notes import NotesCatalog
+            from ..fkb import FKBStore
+
+            store = FKBStore(scratch)
+            catalog = store.load()
+            session = catalog.session
+            if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame,
+                    session.timeline_start_frame) != (
+                    built["project_id"], built["timeline_id"], manifest["fps"], binding.session_origin,
+                    binding.start_frame):
+                raise ValueError("The scratch FKB is bound to a different timeline or clock")
+            if catalog.source_mapping_digest != manifest.get("source_mapping_digest"):
+                raise ValueError("The scratch FKB source mapping differs from the verified review")
+            persistent = NotesCatalog(store)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        parser.error(f"Cannot verify the scratch review build receipt or catalog. Keep manifest.json and "
+                     f"build.json from the same new disposable build. {exc} {_SCRATCH_RECOVERY}")
 
     from .window import run_window
 
     connect = partial(connect_review, built, manifest, not args.out_exclusive)
-    persistent = None
-    if args.persistent_notes:
-        from ..director_notes import NotesCatalog
-        from ..fkb import FKBStore
-
-        store = FKBStore(scratch)
-        catalog = store.load()
-        session = catalog.session
-        if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame,
-                session.timeline_start_frame) != (
-                built["project_id"], built["timeline_id"], manifest["fps"], binding.session_origin,
-                binding.start_frame):
-            parser.error("The scratch FKB is bound to a different timeline or clock")
-        if catalog.source_mapping_digest != manifest.get("source_mapping_digest"):
-            parser.error("The scratch FKB source mapping differs from the verified review. Reconcile the catalog.")
-        persistent = NotesCatalog(store)
     run_window(connect, NoteStore(scratch / "notes.json"), scratch / "playhead.csv",
                args.hz, args.key, persistent=persistent)
 

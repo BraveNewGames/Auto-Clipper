@@ -14,7 +14,7 @@ from autoclipper.director_poc.core import connect_review
 from autoclipper.director_poc.receipt import validate_review_receipt
 from autoclipper.resolve_builder import build_export
 
-from test_resolve_builder import fake_resolve, make_manifest
+from test_resolve_builder import add_fixture_media_mapping, fake_resolve, make_manifest
 
 
 PROJECT = "AutoClipper DirectorA Test 20261120-010203"
@@ -42,6 +42,7 @@ class DirectorReceiptTests(unittest.TestCase):
             for angle in segment["angles"]:
                 angle["source_frame_count"] = 600
         manifest["segments"][1].update(kind="coverage_gap", angles=[])
+        add_fixture_media_mapping(manifest)
         return manifest
 
     def build(self, manifest):
@@ -70,6 +71,24 @@ class DirectorReceiptTests(unittest.TestCase):
         receipt = self.build(self.manifest)
         del receipt["review_receipt"]
         self.assert_preflight_refuses(self.manifest, receipt, "Missing or unsupported")
+
+    def test_legacy_index_notes_refusal_preserves_catalog_and_has_cli_recovery_message(self):
+        session = self.root / "session.json"
+        session.write_text(json.dumps({"session_id": "synthetic-session"}), encoding="utf-8")
+        (self.root / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        (self.root / "build.json").write_text('{"reopened": true}', encoding="utf-8")
+        catalog = self.root / ".autoclipper" / "director-fkb.json"
+        catalog.parent.mkdir()
+        catalog.write_bytes(b'{"legacy": true}')
+        stderr = io.StringIO()
+        with (patch.object(sys, "argv", ["director", "index-notes", str(self.root), str(session)]),
+              redirect_stderr(stderr), self.assertRaises(SystemExit) as exit_status):
+            main()
+        self.assertEqual(exit_status.exception.code, 2)
+        self.assertIn("Build a new disposable review", stderr.getvalue())
+        self.assertIn("Keep the existing catalog and its backup", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(catalog.read_bytes(), b'{"legacy": true}')
 
     def test_replacing_a_blank_with_footage_at_same_bounds_blocks_both_modes(self):
         manifest = self.rebased_review()

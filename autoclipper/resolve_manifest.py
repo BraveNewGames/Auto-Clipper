@@ -10,6 +10,7 @@ from hashlib import sha256
 import json
 from math import floor, isfinite
 from pathlib import Path
+from stat import S_ISREG
 import re
 from tempfile import gettempdir
 
@@ -473,6 +474,49 @@ def source_mapping_digest(manifest: dict) -> str:
                   .encode("utf-8")).hexdigest()
 
 
+def _source_file_identity(path):
+    stat = path.stat()
+    if not S_ISREG(stat.st_mode):
+        raise OSError("Expected a regular source media file")
+    return [stat.st_size, stat.st_mtime_ns]
+
+
+def verify_source_media_identity(manifest, required_paths):
+    """Recheck the verified file identities before a live Director build."""
+    retry = "Rebuild the review manifest or recompile the edit from verified source media."
+    try:
+        digest = source_mapping_digest(manifest)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Cannot verify Director source media. {retry}") from exc
+    if digest != manifest.get("source_mapping_digest"):
+        raise ValueError(f"Verified Director source mapping differs from its digest. {retry}")
+    rows = manifest["source_mapping"].get("parts")
+    if not isinstance(rows, list):
+        raise ValueError(f"Verified Director source mapping has no recording parts. {retry}")
+    verified = set()
+    for row in rows:
+        if not isinstance(row, dict) or "media" not in row:
+            raise ValueError(f"Verified Director source mapping has an invalid recording part. {retry}")
+        media = row["media"]
+        if media is None:
+            continue
+        expected = row.get("file_identity")
+        if (not isinstance(media, dict) or not isinstance(media.get("mp4_path"), str)
+                or not isinstance(expected, list) or len(expected) != 2
+                or any(type(value) is not int for value in expected)):
+            raise ValueError(f"Verified Director source file identity is missing or invalid. {retry}")
+        try:
+            path = Path(media["mp4_path"]).resolve(strict=True)
+            identity = _source_file_identity(path)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Verified Director source media is unavailable. {retry}") from exc
+        if identity != expected:
+            raise ValueError(f"Verified Director source media changed. {retry}")
+        verified.add(path)
+    if not set(required_paths) <= verified:
+        raise ValueError(f"A Director source is missing from the verified media mapping. {retry}")
+
+
 def _review_coverage(session, transcripts_dir, confirmations, fps):
     folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
     fps = manifest["fps"]
@@ -507,8 +551,7 @@ def _review_coverage(session, transcripts_dir, confirmations, fps):
             continue
         frames = media["source_frame_count"]
         row["media"] = media
-        stat = Path(media["mp4_path"]).stat()
-        row["file_identity"] = [stat.st_size, stat.st_mtime_ns]
+        row["file_identity"] = _source_file_identity(Path(media["mp4_path"]))
         end = max(end, start + frames)
         coverage[pov.pov_id].append(_CoveredPart(part.part_id, part.index, start, start + frames, media))
         game_identified |= game
