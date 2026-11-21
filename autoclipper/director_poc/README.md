@@ -47,6 +47,9 @@ Pass the approved unmodified session JSON copy and the same approved media/sessi
 folder as `--session-root` to both offline commands. No hand edit of the JSON
 `folder` is needed. The override affects memory only. An MP4-only session with
 stale same-stem `.mkv` references is supported natively; the JSON is not rewritten.
+When a copied JSON has an empty `folder`, both commands otherwise derive the
+root from that copy's location; use `--session-root` when recordings live elsewhere.
+Absolute SRT paths may lie outside the session root and are still pinned by digest.
 Preparation pins the resolved root and SRT content digests. A missing relative
 SRT refuses before scratch creation with `SRT missing for <part-id>: <srt-path>.
 Supply --session-root with the recording folder.` (For a missing absolute SRT,

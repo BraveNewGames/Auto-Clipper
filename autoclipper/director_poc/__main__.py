@@ -84,7 +84,10 @@ def prepare(args):
     confirmations = temp_copy(args.confirmations)
     metadata = temp_copy(args.metadata) if args.metadata else None
     session = source_session(source, args.session_root)
-    source_identity = source_input_identity(session)
+    try:
+        source_identity = source_input_identity(session)
+    except ValueError as exc:
+        raise SourceSessionError(str(exc)) from exc
     catalog_source = catalog_source_identity(session)
     scratch = Path(mkdtemp(prefix="autoclipper-director-a-"))
     copyfile(source, scratch / "session.json")

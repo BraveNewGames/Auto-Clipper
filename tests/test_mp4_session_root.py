@@ -169,6 +169,51 @@ class Mp4SessionRootTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Recording missing or outside --session-root"):
                 source_session(source, root)
 
+    def test_symlinked_mp4_fallback_outside_root_is_rejected(self):
+        with TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "recordings"
+            root.mkdir()
+            outside = parent / "outside.mp4"
+            outside.touch()
+            try:
+                (root / "angle.mp4").symlink_to(outside)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            source = parent / "session.json"
+            source.write_text(json.dumps(Session(session_id="synthetic", folder=str(parent / "stale"), povs=[
+                POV("p", parts=[Part("part", video_path="angle.mkv")])
+            ]).to_dict()), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Recording missing or outside --session-root"):
+                source_session(source, root)
+
+    def test_symlinked_srt_reports_prepare_error_before_scratch(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "angle.mp4").touch()
+            target = root / "captions.srt"
+            target.write_text("1\n00:00:00,000 --> 00:00:01,000\nSynthetic\n", encoding="utf-8")
+            try:
+                (root / "angle.srt").symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            source = root / "session.json"
+            source.write_text(json.dumps(Session(session_id="synthetic", folder=str(root), povs=[
+                POV("p", parts=[Part("part", video_path="angle.mp4", srt_path="angle.srt")])
+            ]).to_dict()), encoding="utf-8")
+            confirmations = root / "confirmations.json"
+            confirmations.write_text('{"confirmations": []}', encoding="utf-8")
+            error = io.StringIO()
+            with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
+                                             str(root), "--session-root", str(root)]),
+                  patch("autoclipper.director_poc.__main__.mkdtemp") as scratch,
+                  redirect_stderr(error), self.assertRaises(SystemExit)):
+                main()
+            self.assertIn("Cannot prepare the source session. Pinned input contains a link or reparse point",
+                          error.getvalue())
+            self.assertNotIn("Traceback", error.getvalue())
+            scratch.assert_not_called()
+
     def test_empty_folder_uses_explicit_root_for_both_commands_and_old_manifest_warns(self):
         with TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -244,6 +289,15 @@ class Mp4SessionRootTests(unittest.TestCase):
             exported, = export_reviewer(session, "reviewer", root / "exports")
             self.assertEqual(exported.video_path, "angle.mp4")
             self.assertIn("angle.mp4", (Path(exported.csv_path).parent / "README.txt").read_text())
+            csv_bytes = Path(exported.csv_path).read_bytes()
+            (root / "sub").mkdir()
+            (root / "sub" / "angle.mp4").touch()
+            session.povs[0].parts[0].video_path = "sub/angle.mkv"
+            nested, = export_reviewer(session, "reviewer", root / "nested_exports")
+            self.assertEqual(nested.video_path, "sub/angle.mp4")
+            self.assertIn("sub/angle.mp4", (Path(nested.csv_path).parent / "README.txt").read_text())
+            self.assertEqual(Path(nested.csv_path).read_bytes(), csv_bytes)
+            session.povs[0].parts[0].video_path = "angle.mkv"
             (root / "angle.mkv").touch()
             self.assertEqual(resolve_recording(root, "angle.mkv").status, "found")
             self.assertTrue(expected_filenames(session, "reviewer")[0].endswith(".mkv"))

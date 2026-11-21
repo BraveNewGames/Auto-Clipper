@@ -127,7 +127,7 @@ def export_reviewer(session, reviewer, out_dir=None, statuses=None) -> list[Expo
                     handle.write(f'{start:.3f},{end:.3f},"{label}"\r\n')
             resolved = resolve_recording(session.folder, part.video_path)
             source = (part.video_path if resolved.status == "found" else
-                      str(Path(part.video_path).with_suffix(".mp4"))) if resolved.path else (
+                      f"{part.video_path[:-4]}.mp4") if resolved.path else (
                 f"(missing media: {part.video_path})" if part.video_path else
                 f"(no video found; transcript: {part.srt_path})")
             manifest.append(f"{path.name} -> {source}")
