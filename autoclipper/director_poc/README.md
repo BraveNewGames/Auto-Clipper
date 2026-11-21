@@ -38,9 +38,17 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
    $env:PYTHONPATH = "$env:RESOLVE_SCRIPT_API\Modules;$env:PYTHONPATH"
    python -m autoclipper.director_poc prepare $sessionCopy $confirmationsCopy $mediaRoot --fps 60
    # Append --metadata $metadataCopies to prepare when supplied.
+   # If the copied JSON has a stale folder, append --session-root $mediaRoot.
    python -m autoclipper.director_poc build $scratch
    python -m autoclipper.director_poc companion $scratch --hz 10
    ```
+
+Use the same `--session-root` for `index-notes` when it was used for `prepare`.
+The override affects memory only and requires an existing source directory with
+the referenced recordings and SRTs. Missing SRTs stop preparation or indexing
+with a part-specific message. A saved MKV reference uses its same-stem MP4 when
+the MKV is gone; the source JSON is not rewritten. A different recording
+reference changes catalog identity and is rejected during indexing.
 
 3. **Capture (5 min).** Keep automatic polling Off. With playback paused, owner sets known distinct video marks in Resolve and presses the displayed hotkey with Resolve focused. Compare the displayed and saved range with the UI endpoints and duration. Clear both marks, then test equal In and Out. A1 first measured polling stalls in the original `playhead.csv` and isolated the timecode read in `rpc-probe.csv`. The child-process companion uses `rpc-probe.csv` for subsequent capture and diagnostic timings.
 4. **Catalog, markers and jumps (4–5 min).** Owner sets ranges for three test notes, including two identical starts and a partially overlapping range. Worker saves distinct labels and checks UUIDs and boundaries in scratch `notes.json`. With playback stopped, select each note and click **Jump**. Compare target, immediate API readback, and Resolve's settled UI timecode. Record error in frames for each. Add a marker from one note at a frame free of assembler markers, read its custom data, and try adding a marker for a second note at the same start. Verify refusal and continued access to both notes. Leave one marker for the reopen check.

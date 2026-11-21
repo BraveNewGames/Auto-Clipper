@@ -236,7 +236,8 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual([s["range_source"] for s in manifest["segments"]], ["ai", "ai", "approved"])
         self.assertEqual(len({s["segment_id"] for s in manifest["segments"]}), 3)
         codes = {w["code"] for w in manifest["warnings"]}
-        self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection", "game_audio_unidentified"})
+        self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection",
+                                 "game_audio_unidentified", "stale_mkv_reference"})
         report = render_report(manifest)
         for value in ("3 timed Keep selections", "Alpha P1 (verified, expected ch 2, 3)",
                       r"Test \| Clip (approved)", "Game audio not identified", "Source mode"):

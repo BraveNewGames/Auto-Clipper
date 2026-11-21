@@ -10,6 +10,7 @@ from tempfile import gettempdir, mkdtemp
 
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
 from ..resolve_manifest import build_review_manifest, catalog_source_identity, pinned_input_digest
+from ..media import resolve_recording
 from ..store import _write_json, load_session
 from .core import NoteStore, connect_review
 from .receipt import validate_review_receipt
@@ -30,6 +31,30 @@ def temp_copy(path):
     return path
 
 
+def source_session(path, session_root=None):
+    """Load a temp JSON with an optional in-memory source root and SRT preflight."""
+    session = load_session(temp_copy(path))
+    if session_root is not None:
+        root = session_root.resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("--session-root must be an existing directory")
+        session.folder = str(root)
+    root = Path(session.folder).resolve()
+    for _, part in session.all_parts():
+        if part.srt_path:
+            srt = (root / part.srt_path).resolve()
+            if not srt.is_relative_to(root) or not srt.is_file():
+                raise ValueError(f"SRT missing or outside session root for {part.part_id}: "
+                                 f"{part.srt_path}. Supply --session-root with the recording folder.")
+        if session_root is not None and part.video_path:
+            saved = (root / part.video_path).resolve()
+            media = resolve_recording(root, part.video_path)
+            if not saved.is_relative_to(root) or media.path is None or not media.path.resolve().is_relative_to(root):
+                raise ValueError(f"Recording missing or outside --session-root for {part.part_id}: "
+                                 f"{part.video_path}")
+    return session
+
+
 def prepare(args):
     source = temp_copy(args.session)
     confirmations = temp_copy(args.confirmations)
@@ -47,7 +72,7 @@ def prepare(args):
         pinned_inputs["metadata"] = {"path": pinned_metadata.name,
                                      "sha256": pinned_input_digest(pinned_metadata)}
     print(f"Scratch directory: {scratch}", flush=True)
-    session = load_session(scratch / "session.json")
+    session = source_session(scratch / "session.json", args.session_root)
     catalog_source = catalog_source_identity(session)
     if not session.all_parts():
         raise ValueError("The session has no recordings")
@@ -56,8 +81,9 @@ def prepare(args):
         if not part.video_path:
             raise ValueError("A session part has no video path")
         path = (root / part.video_path).resolve()
-        source_path = path.with_suffix(".mp4") if path.suffix.lower() == ".mkv" else path
-        if not path.is_relative_to(root) or not source_path.resolve().is_relative_to(root):
+        source_path = resolve_recording(root, part.video_path, require_mp4=True).path
+        if not path.is_relative_to(root) or (source_path is not None and
+                                             not source_path.resolve().is_relative_to(root)):
             raise ValueError("A recording path lies outside the approved media root")
         part.video_path = str(path)
     confirmed = read(pinned_confirmations)["confirmations"]
@@ -113,6 +139,7 @@ def main():
     plan.add_argument("session", type=Path)
     plan.add_argument("confirmations", type=Path)
     plan.add_argument("media_root", type=Path)
+    plan.add_argument("--session-root", type=Path, help="Existing source folder for relative SRT and video paths")
     plan.add_argument("--metadata", type=Path, help="Temp directory of approved transcriber JSON copies")
     plan.add_argument("--fps", type=int, default=60)
     build = commands.add_parser("build", help="Live, create and reopen a fresh scratch project")
@@ -120,6 +147,7 @@ def main():
     index = commands.add_parser("index-notes", help="Offline, initialize the persistent scratch catalog")
     index.add_argument("scratch", type=Path)
     index.add_argument("session", type=Path, help="Approved session JSON under system temp")
+    index.add_argument("--session-root", type=Path, help="Same source folder used by prepare")
     index.add_argument("--migrate-from", type=Path, help="Copy a verified legacy catalog from this scratch folder")
     run = commands.add_parser("companion", help="Live, attach only to the exact built timeline")
     run.add_argument("scratch", type=Path)
@@ -157,7 +185,7 @@ def main():
     try:
         built = read(result_path)
         if args.command == "index-notes":
-            source = load_session(temp_copy(args.session))
+            source = source_session(args.session, args.session_root)
             print(initialize_fkb(scratch, source, manifest, built, migrate_from=args.migrate_from))
             return
 
