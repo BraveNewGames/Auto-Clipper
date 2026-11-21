@@ -298,11 +298,20 @@ class ResolveBuilderTests(unittest.TestCase):
             timeline.Export.side_effect = export
             with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
                 self.assertTrue(reference_xml_matches(timeline, ref, 266100, 1980))
-                for wrong in ("start", "end", "path", "track", "duplicate"):
+                for wrong in ("in_early", "in_late", "out_early", "out_late",
+                              "start", "end", "path", "track", "duplicate"):
                     with self.subTest(wrong=wrong):
                         xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
                         xml_path, xml_track, xml_copies = source, 2, 1
-                        if wrong == "start":
+                        if wrong == "in_early":
+                            xml_in = 31112
+                        elif wrong == "in_late":
+                            xml_in = 31114
+                        elif wrong == "out_early":
+                            xml_out = 33092
+                        elif wrong == "out_late":
+                            xml_out = 33094
+                        elif wrong == "start":
                             xml_start = 50101
                         elif wrong == "end":
                             xml_end = 52079
