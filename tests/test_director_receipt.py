@@ -12,6 +12,7 @@ from unittest.mock import patch
 from autoclipper.director_poc.__main__ import main
 from autoclipper.director_poc.core import connect_review
 from autoclipper.director_poc.receipt import validate_review_receipt
+from autoclipper.fkb import FKBStore, FootageKnowledgeBase, Session
 from autoclipper.resolve_builder import build_export
 
 from test_resolve_builder import fake_resolve, make_manifest
@@ -109,6 +110,28 @@ class DirectorReceiptTests(unittest.TestCase):
     def test_legacy_zero_origin_accepts_new_verified_receipt(self):
         receipt = self.build(self.manifest)
         self.assertEqual(validate_review_receipt(self.manifest, receipt).session_origin, 0)
+
+    def test_legacy_receipt_with_matching_catalog_clock_is_disposable_only(self):
+        receipt = self.build(self.manifest)
+        store = FKBStore(self.root)
+        store.initialize(FootageKnowledgeBase(Session(
+            self.manifest["session_id"], 60, 216000, receipt["project_id"], receipt["timeline_id"])))
+        previous = store.path.read_bytes()
+        for name, value in (("manifest.json", self.manifest), ("build.json", receipt)):
+            (self.root / name).write_text(json.dumps(value), encoding="utf-8")
+        args = ["director", "companion", str(self.root)]
+        with patch("autoclipper.director_poc.window.run_window") as window:
+            with patch.object(sys, "argv", args):
+                main()
+            self.assertIsNone(window.call_args.kwargs["persistent"])
+            window.reset_mock()
+            stderr = io.StringIO()
+            with (patch.object(sys, "argv", [*args, "--persistent-notes"]),
+                  redirect_stderr(stderr), self.assertRaises(SystemExit)):
+                main()
+            self.assertIn("Persistent notes require verified source mapping", stderr.getvalue())
+            window.assert_not_called()
+        self.assertEqual(store.path.read_bytes(), previous)
 
     def test_legacy_nonzero_origin_cannot_issue_receipt(self):
         shifted = deepcopy(self.manifest)

@@ -60,25 +60,32 @@ def verified_review_origin(manifest, built):
     return validate_review_receipt(manifest, built).session_origin
 
 
-def initialize_fkb(scratch, source, manifest, built):
-    from ..fkb import FKBStore
+def initialize_fkb(scratch, source, manifest, built, *, migrate_from=None):
+    from ..fkb import FKBStore, ingest_session
+    from .catalog_migration import migrate_legacy_catalog, persistent_mapping_digest
 
     binding = validate_review_receipt(manifest, built)
-    legacy_mappings = {}
-    review_manifest = manifest if manifest.get("mode") == "director_review" else None
-    if review_manifest is None:
-        for segment in manifest["segments"]:
-            for angle in segment["angles"]:
-                if "mic" in angle:
-                    mapping = legacy_mappings.setdefault(angle["part_id"], angle["mic"])
-                    if mapping != angle["mic"]:
-                        raise ValueError("Conflicting assembler microphone mappings")
+    persistent_mapping_digest(manifest)
     store = FKBStore(scratch)
-    fps = manifest["fps"]
-    store.ingest(source, fps=fps, timeline_start_frame=binding.start_frame,
-                 review_session_start_frame=binding.session_origin,
-                 project_id=built["project_id"], timeline_id=built["timeline_id"],
-                 audio_by_part=legacy_mappings, review_manifest=review_manifest)
+    options = dict(fps=manifest["fps"], timeline_start_frame=binding.start_frame,
+                   review_session_start_frame=binding.session_origin, project_id=built["project_id"],
+                   timeline_id=built["timeline_id"], review_manifest=manifest)
+    if migrate_from is None:
+        if store.path.exists() and not store.load().source_mapping_digest:
+            raise ValueError("Use a new scratch review and index-notes --migrate-from OLD_SCRATCH.")
+        store.ingest(source, **options)
+    else:
+        try:
+            if store.path.exists():
+                raise ValueError("Migration needs a fresh destination with no catalog")
+            old = temp_copy(migrate_from)
+            incoming = ingest_session(source, **options)
+            store.initialize(migrate_legacy_catalog(
+                FKBStore(old).load(), read(old / "manifest.json"), read(old / "build.json"),
+                incoming, manifest, built, binding))
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Keep the old catalog. Supply its original manifest and receipt, or preserve "
+                             f"the note text and reselect any unverifiable ranges. {exc}") from exc
     return store.path
 
 
@@ -96,6 +103,7 @@ def main():
     index = commands.add_parser("index-notes", help="Offline, initialize the persistent scratch catalog")
     index.add_argument("scratch", type=Path)
     index.add_argument("session", type=Path, help="Approved session JSON under system temp")
+    index.add_argument("--migrate-from", type=Path, help="Copy a verified legacy catalog from this scratch folder")
     run = commands.add_parser("companion", help="Live, attach only to the exact built timeline")
     run.add_argument("scratch", type=Path)
     run.add_argument("--persistent-notes", action="store_true",
@@ -132,18 +140,21 @@ def main():
 
     if args.command == "index-notes":
         source = load_session(temp_copy(args.session))
-        print(initialize_fkb(scratch, source, manifest, built))
+        print(initialize_fkb(scratch, source, manifest, built, migrate_from=args.migrate_from))
         return
-
-    from .window import run_window
 
     connect = partial(connect_review, built, manifest, not args.out_exclusive)
     persistent = None
     if args.persistent_notes:
         from ..director_notes import NotesCatalog
         from ..fkb import FKBStore
+        from .catalog_migration import persistent_mapping_digest
 
         store = FKBStore(scratch)
+        try:
+            digest = persistent_mapping_digest(manifest)
+        except ValueError as exc:
+            parser.error(str(exc))
         catalog = store.load()
         session = catalog.session
         if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame,
@@ -151,9 +162,11 @@ def main():
                 built["project_id"], built["timeline_id"], manifest["fps"], binding.session_origin,
                 binding.start_frame):
             parser.error("The scratch FKB is bound to a different timeline or clock")
-        if catalog.source_mapping_digest != manifest.get("source_mapping_digest"):
-            parser.error("The scratch FKB source mapping differs from the verified review. Reconcile the catalog.")
+        if catalog.mapping_stale or catalog.source_mapping_digest != digest:
+            parser.error("The scratch FKB has no matching verified source mapping. Re-index or migrate the catalog.")
         persistent = NotesCatalog(store)
+    from .window import run_window
+
     run_window(connect, NoteStore(scratch / "notes.json"), scratch / "playhead.csv",
                args.hz, args.key, persistent=persistent)
 
