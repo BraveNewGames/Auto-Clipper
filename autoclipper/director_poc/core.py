@@ -35,6 +35,16 @@ def frame_tc(frame, fps):
     return f"{hours:02}:{minutes:02}:{seconds:02}:{frame:02}"
 
 
+def format_range(in_timecode, out_timecode, duration):
+    unit = "frame" if duration == 1 else "frames"
+    return f"In {in_timecode} | Out {out_timecode} (exclusive) | {duration} {unit}"
+
+
+def marker_name(title, text):
+    label = " ".join((title or "").split()) or " ".join((text or "").split()) or "DirectorA note"
+    return label if len(label) <= 72 else label[:69].rstrip() + "..."
+
+
 class Clock:
     def __init__(self, manifest, start_tc, start_frame):
         self.fps = manifest["fps"]
@@ -177,7 +187,8 @@ class Review:
             if frame in (timeline.GetMarkers() or {}):
                 raise ValueError("This frame already has a marker. The note is still saved.")
             duration = note["session_out_exclusive"] - note["session_in"]
-            if not timeline.AddMarker(frame, "Blue", "DirectorA note", "", duration, key):
+            label = note.get("marker_name") or marker_name(note.get("title", ""), note.get("text", ""))
+            if not timeline.AddMarker(frame, "Blue", label, "", duration, key):
                 raise RuntimeError("Resolve rejected the marker")
         if operation == "delete" and not timeline.DeleteMarkerByCustomData(key):
             raise RuntimeError("Resolve could not delete the note marker")

@@ -4,7 +4,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock
 
-from autoclipper.director_poc.core import Clock, NoteStore, Review
+from autoclipper.director_notes import format_session_range
+from autoclipper.director_poc.core import Clock, NoteStore, Review, marker_name
+from autoclipper.director_poc.window import marker_readback
+from autoclipper.fkb import FrameRange, Session as FKBSession
 
 
 IDENTITY = {"project": "AutoClipper DirectorA Test 20261120-010203", "project_id": "p1",
@@ -21,6 +24,27 @@ def manifest(*segments):
 
 
 class DirectorClockTests(unittest.TestCase):
+    def test_note_timecodes_preserve_exclusive_out_with_zero_or_nonzero_origin(self):
+        for origin in (0, 60):
+            with self.subTest(origin=origin):
+                session = FKBSession("fixture", 60, 216000, review_session_start_frame=origin)
+                self.assertEqual(
+                    format_session_range(session, FrameRange(origin + 59, origin + 60)),
+                    "In 01:00:00:59 | Out 01:00:01:00 (exclusive) | 1 frame",
+                )
+        session = FKBSession("fixture", 60, 216000, review_session_start_frame=60)
+        self.assertEqual(format_session_range(session, FrameRange(130, 150)),
+                         "In 01:00:01:10 | Out 01:00:01:30 (exclusive) | 20 frames")
+
+    def test_marker_labels_and_missing_readback(self):
+        self.assertEqual(marker_name("  Note\n title  ", "Other text"), "Note title")
+        self.assertEqual(marker_name("  ", "\n First\tline \n second line"), "First line second line")
+        self.assertEqual(marker_name("", "x" * 100), "x" * 69 + "...")
+        self.assertEqual(marker_name("", ""), "DirectorA note")
+        self.assertEqual(marker_readback(None), "No marker found for this note.")
+        self.assertEqual(marker_readback({}), "No marker found for this note.")
+        self.assertIn("Renamed", marker_readback({"name": "Renamed"}))
+
     def test_nonzero_origin_and_cross_segment_boundary(self):
         clock = Clock(manifest(segment(0, 5, 60, "one", 120), segment(60, 6, 60, "two")),
                       "01:00:00:00", 216000)
@@ -133,9 +157,10 @@ class DirectorCaptureTests(unittest.TestCase):
             self.timeline.AddMarker.assert_not_called()
             self.timeline.SetCurrentTimecode.assert_not_called()
             self.timeline.GetMarkers.return_value = {}
+            note = catalog.edit_metadata(note.note_id, title="  Reviewed moment  ")
             self.review.marker(review_payload(note), "add")
             self.timeline.AddMarker.assert_called_once_with(
-                10, "Blue", "DirectorA note", "", 30, note.note_id)
+                10, "Blue", "Reviewed moment", "", 30, note.note_id)
 
     def test_persistent_catalog_rejects_shifted_manifest_capture(self):
         from autoclipper.director_notes import NotesCatalog
@@ -176,7 +201,13 @@ class DirectorCaptureTests(unittest.TestCase):
         self.timeline.AddMarker.assert_not_called()
         self.timeline.GetMarkers.return_value = {}
         self.review.marker(note, "add")
-        self.timeline.AddMarker.assert_called_once_with(10, "Blue", "DirectorA note", "", 30,
+        self.timeline.AddMarker.assert_called_once_with(10, "Blue", "Observation", "", 30,
                                                          note["note_id"])
-        self.review.marker(note, "delete")
+        marks = {note["note_id"]: {"name": "Renamed in Resolve", "customData": note["note_id"]}}
+        self.timeline.GetMarkerByCustomData.side_effect = marks.get
+        self.timeline.DeleteMarkerByCustomData.side_effect = lambda key: bool(marks.pop(key))
+        self.assertEqual(self.review.marker(note, "read")["name"], "Renamed in Resolve")
+        self.timeline.GetMarkerByCustomData.assert_called_with(note["note_id"])
+        self.assertIsNone(self.review.marker(note, "delete"))
         self.timeline.DeleteMarkerByCustomData.assert_called_once_with(note["note_id"])
+        self.assertEqual(marker_readback(self.review.marker(note, "read")), "No marker found for this note.")

@@ -10,9 +10,14 @@ from time import perf_counter
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
-from ..director_notes import review_payload
+from ..director_notes import format_session_range, review_payload
+from ..fkb import FrameRange
 
-from .core import now
+from .core import format_range, now
+
+
+def marker_readback(value):
+    return str(value) if value else "No marker found for this note."
 
 
 def listen_for_hotkey(key, stopped, ready, presses):
@@ -77,6 +82,7 @@ def resolve_worker(connect, note_path, jobs, results):
 
 
 def run_window(connect, store, log_path, hz, key, *, persistent=None):
+    review_session = persistent.store.load().session if persistent else None
     root = tk.Tk()
     root.title(f"DirectorA POC | Ctrl+Alt+Shift+F{key}")
     status = tk.StringVar(value="Connecting to the scratch project")
@@ -102,8 +108,11 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
         tk.Checkbutton(root, text="Show deleted notes", variable=trash).pack()
     entry = tk.Text(root, width=70, height=4)
     entry.pack(fill="x")
-    catalog = tk.Listbox(root, width=70, exportselection=False)
+    catalog = tk.Listbox(root, width=90, exportselection=False)
     catalog.pack(fill="both", expand=True)
+    catalog_scroll = tk.Scrollbar(root, orient="horizontal", command=catalog.xview)
+    catalog_scroll.pack(fill="x")
+    catalog.configure(xscrollcommand=catalog_scroll.set)
     pending = None
     notes = []
     stopped, ready, presses = Event(), Queue(), Queue()
@@ -121,12 +130,15 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
         for index, note in enumerate(notes):
             if persistent:
                 title = note.title or note.text.splitlines()[0][:54]
-                catalog.insert("end", f"{note.frames['start']} to {note.frames['end']}  {title}")
+                bounds = format_session_range(review_session, FrameRange.from_dict(note.frames))
+                catalog.insert("end", f"{bounds}  {title}")
                 if selected and selected.note_id == note.note_id:
                     catalog.selection_set(index)
                 continue
             title = note["text"].splitlines()[0][:54]
-            catalog.insert("end", f"{note['in_timecode']}  {title}")
+            bounds = format_range(note["in_timecode"], note["out_timecode_exclusive"],
+                                  note["timeline_out_exclusive"] - note["timeline_in"])
+            catalog.insert("end", f"{bounds}  {title}")
 
     def selected_note():
         indexes = catalog.curselection()
@@ -157,8 +169,8 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
         pending = value
         save_button.configure(state="normal")
         duration = pending.timeline_out_exclusive - pending.timeline_in
-        details.set(f"{pending.in_timecode} to {pending.out_timecode_exclusive} (exclusive)"
-                    f" | {duration} frames | capture playhead {pending.playhead}")
+        bounds = format_range(pending.in_timecode, pending.out_timecode_exclusive, duration)
+        details.set(f"{bounds} | capture playhead {pending.playhead}")
         if elapsed > timeout:
             status.set(f"Range returned after {elapsed:.2f} s. Verify these marks before saving.")
         else:
@@ -212,8 +224,9 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
                 try:
                     if target:
                         adjustment = persistent.preview_range(target.note_id, value, playback="paused")
-                        details.set(f"Old [{adjustment.old.start}, {adjustment.old.end}) to "
-                                    f"New [{adjustment.new.start}, {adjustment.new.end})")
+                        old = format_session_range(review_session, adjustment.old)
+                        new = format_session_range(review_session, adjustment.new)
+                        details.set(f"Old  {old}\nNew  {new}")
                         status.set("Review the range change, then save or discard.")
                         save_button.configure(state="normal")
                     else:
@@ -281,7 +294,8 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
                 status.set("Navigation requires an active note and current mapping.")
                 return
             note = review_payload(note)
-        submit(name, (note,), lambda value: status.set(str(value)))
+        display = marker_readback if name == "Read marker" else str
+        submit(name, (note,), lambda value: status.set(display(value)))
 
     row = tk.Frame(root)
     row.pack(fill="x")
@@ -373,8 +387,9 @@ def run_window(connect, store, log_path, hz, key, *, persistent=None):
                             playhead.set(f"{name} pending after 750 ms. The UI remains usable.")
                     else:
                         elapsed = finished - start
-                        logged = value if complete is None or name in (
-                            "Jump", "Add marker", "Read marker", "Delete marker") else ""
+                        logged = value if complete is None or name == "Jump" else ""
+                        if name in ("Add marker", "Read marker", "Delete marker") and isinstance(value, dict):
+                            logged = {key: value[key] for key in ("customData", "duration") if key in value}
                         writer.writerow((wall, start, name, round(elapsed * 1000, 3), logged, error))
                         inflight = None
                         reported_timeout = False

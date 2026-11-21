@@ -5,7 +5,7 @@ import re
 from typing import Protocol
 from uuid import uuid4
 
-from .director_poc.core import Capture, tc_frame
+from .director_poc.core import Capture, format_range, frame_tc, marker_name, tc_frame
 from .fkb import DirectorNote, FrameRange
 
 
@@ -216,8 +216,16 @@ class NotesCatalog:
         return matches
 
 
+def format_session_range(session, frames):
+    """Display canonical session frames on the bound Resolve review clock."""
+    origin = session.timeline_start_frame - session.review_session_start_frame
+    return format_range(frame_tc(origin + frames.start, session.fps),
+                        frame_tc(origin + frames.end, session.fps), frames.end - frames.start)
+
+
 def review_payload(note):
-    """Supply only marker/navigation identity and timing to the Phase A process."""
+    """Supply marker label, identity and timing to the Resolve worker."""
     keys = ("project", "project_id", "timeline", "timeline_id", "fps")
     return {**{key: note.capture[key] for key in keys}, "note_id": note.note_id,
-            "session_in": note.frames["start"], "session_out_exclusive": note.frames["end"]}
+            "session_in": note.frames["start"], "session_out_exclusive": note.frames["end"],
+            "marker_name": marker_name(note.title, note.text)}
