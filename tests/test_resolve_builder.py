@@ -68,6 +68,7 @@ def fake_resolve():
     )
     for item in (timeline, reopened_timeline):
         item.GetName.return_value = "synthetic-session"
+        item.GetUniqueId.return_value = "review-timeline-id"
         item.GetSettings.return_value = {"timelineFrameRate": "60"}
         item.GetStartFrame.return_value = 216000
         item.GetStartTimecode.return_value = "01:00:00:00"

@@ -76,7 +76,7 @@ class DirectorPrepareTests(unittest.TestCase):
             project.GetMediaPool.return_value.CreateEmptyTimeline.return_value.GetName.return_value = "DirectorA REVIEW"
             timeline.GetName.return_value = "DirectorA REVIEW"
             timeline.GetUniqueId.return_value = "timeline"
-            reopened.GetUniqueId.return_value = "project"
+            project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = "project"
             with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
                   patch("autoclipper.resolve_builder.mkdtemp", return_value=directory)):
                 built = build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")

@@ -28,8 +28,8 @@ class DirectorReceiptTests(unittest.TestCase):
         self.manifest = make_manifest(self.root)
         for name in ("a1", "a2", "b1"):
             (self.root / f"{name}.mp4").touch()
-        self.sdk, _, _, _, self.reopened = fake_resolve()
-        self.reopened.GetUniqueId.return_value = "fixture-project"
+        self.sdk, _, _, project, self.reopened = fake_resolve()
+        project.GetUniqueId.return_value = self.reopened.GetUniqueId.return_value = "fixture-project"
         self.timeline = self.reopened.GetTimelineByIndex.return_value
         self.timeline.GetUniqueId.return_value = "fixture-timeline"
 
