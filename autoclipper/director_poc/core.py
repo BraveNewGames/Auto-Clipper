@@ -119,7 +119,7 @@ class Capture:
 
 
 class Review:
-    def __init__(self, resolve, result, manifest, *, out_inclusive=True):
+    def __init__(self, resolve, result, manifest, *, out_inclusive=True, binding=None):
         self.resolve = resolve
         self.result = result
         self.out_inclusive = out_inclusive
@@ -128,7 +128,10 @@ class Review:
         if not all(result[k] for k in ("project_id", "timeline", "timeline_id")):
             raise ValueError("Missing scratch identity")
         timeline = self.active()
-        self.clock = Clock(manifest, timeline.GetStartTimecode(), timeline.GetStartFrame())
+        start_timecode, start_frame = timeline.GetStartTimecode(), timeline.GetStartFrame()
+        if binding is not None and (start_timecode, start_frame) != (binding.start_timecode, binding.start_frame):
+            raise ValueError("Active timeline start differs from its verified review receipt")
+        self.clock = Clock(manifest, start_timecode, start_frame)
         if Fraction(timeline.GetSettings()["timelineFrameRate"]) != self.clock.fps:
             raise ValueError("Unexpected timeline frame rate")
 
@@ -173,35 +176,67 @@ class Review:
         return self.clock.timeline_frame(note["session_in"])
 
     def jump(self, note):
-        target = self.clock.timecode(self.note_frame(note))
-        if not self.active().SetCurrentTimecode(target):
+        frame = self.note_frame(note)
+        timeline = self.active()
+        _, marker = self.find_note_marker(timeline, note["note_id"])
+        if marker is not None:
+            frame = self.check_marker_range(note, frame, marker)
+        target = self.clock.timecode(frame)
+        if not timeline.SetCurrentTimecode(target):
             raise RuntimeError("Resolve rejected the seek")
         actual, _ = self.sample()
         return f"Target {target}, read back {actual}"
+
+    @staticmethod
+    def find_note_marker(timeline, key):
+        markers = timeline.GetMarkers()
+        if not isinstance(markers, dict):
+            raise RuntimeError("Could not verify timeline markers")
+        matches = [(frame, marker) for frame, marker in markers.items() if marker.get("customData") == key]
+        if len(matches) > 1:
+            raise ValueError("Multiple markers use this note UUID. Remove duplicates in Resolve before retrying.")
+        return markers, matches[0] if matches else None
+
+    @staticmethod
+    def check_marker_range(note, expected, marker):
+        frame, data = marker
+        duration = note["session_out_exclusive"] - note["session_in"]
+        if frame != expected or data.get("duration") != duration:
+            raise ValueError("This note's marker is stale. Delete it and add it again to mirror the current range.")
+        return int(frame)
 
     def marker(self, note, operation):
         frame = self.note_frame(note)
         timeline = self.active()
         key = note["note_id"]
-        if operation == "add":
-            if frame in (timeline.GetMarkers() or {}):
+        markers, existing = self.find_note_marker(timeline, key)
+        if operation == "delete":
+            if existing is None or not timeline.DeleteMarkerByCustomData(key):
+                raise RuntimeError("Resolve could not delete the note marker")
+        elif existing is not None:
+            self.check_marker_range(note, frame, existing)
+        elif operation == "add":
+            if frame in markers:
                 raise ValueError("This frame already has a marker. The note is still saved.")
             duration = note["session_out_exclusive"] - note["session_in"]
             label = note.get("marker_name") or marker_name(note.get("title", ""), note.get("text", ""))
             if not timeline.AddMarker(frame, "Blue", label, "", duration, key):
                 raise RuntimeError("Resolve rejected the marker")
-        if operation == "delete" and not timeline.DeleteMarkerByCustomData(key):
-            raise RuntimeError("Resolve could not delete the note marker")
+        else:
+            return None
         return timeline.GetMarkerByCustomData(key)
 
 
 def connect_review(result, manifest, out_inclusive):
+    from .receipt import validate_review_receipt
+
+    binding = validate_review_receipt(manifest, result)
     from DaVinciResolveScript import scriptapp
 
     resolve = scriptapp("Resolve")
     if not resolve:
         raise RuntimeError("Resolve unavailable. Verify Local scripting and SDK environment.")
-    return Review(resolve, result, manifest, out_inclusive=out_inclusive)
+    return Review(resolve, result, manifest, out_inclusive=out_inclusive, binding=binding)
 
 
 class NoteStore:

@@ -13,6 +13,9 @@ from autoclipper.director_poc.__main__ import initialize_fkb, main
 from autoclipper.director_poc.core import Capture, Clock
 from autoclipper.fkb import FKBStore
 from autoclipper.models import Part, POV, Session
+from autoclipper.resolve_builder import build_export
+
+from test_resolve_builder import fake_resolve
 
 
 class DirectorPrepareTests(unittest.TestCase):
@@ -68,8 +71,15 @@ class DirectorPrepareTests(unittest.TestCase):
             self.assertEqual((scratch / "session.json").read_bytes(), originals[source])
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
-            built = {"mode": "director_review", "reopened": True, "review_session_frames": [60, 240],
-                     "project_id": "project", "timeline_id": "timeline"}
+            sdk, _, _, project, reopened = fake_resolve()
+            timeline = reopened.GetTimelineByIndex.return_value
+            project.GetMediaPool.return_value.CreateEmptyTimeline.return_value.GetName.return_value = "DirectorA REVIEW"
+            timeline.GetName.return_value = "DirectorA REVIEW"
+            timeline.GetUniqueId.return_value = "timeline"
+            reopened.GetUniqueId.return_value = "project"
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=directory)):
+                built = build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")
             for unverified_manifest, unverified_result in (
                     (manifest, {key: value for key, value in built.items() if key != "review_session_frames"}),
                     ({key: value for key, value in manifest.items() if key != "review_session_frames"}, built),
@@ -77,7 +87,7 @@ class DirectorPrepareTests(unittest.TestCase):
                     (manifest, {**built, "reopened": False})):
                 with self.subTest(manifest=unverified_manifest.get("review_session_frames"),
                                   result=unverified_result):
-                    with self.assertRaisesRegex(ValueError, "verified build"):
+                    with self.assertRaisesRegex(ValueError, "Build a new disposable review"):
                         initialize_fkb(scratch, session, unverified_manifest, unverified_result)
                     self.assertFalse(FKBStore(scratch).path.exists())
 
