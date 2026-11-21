@@ -112,13 +112,23 @@ class Mp4SessionRootTests(unittest.TestCase):
                 source_session(source, root / "absent")
             confirmations = root / "confirmations.json"
             confirmations.write_text('{"confirmations": []}', encoding="utf-8")
+            missing_error = io.StringIO()
+            with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
+                                             str(root), "--session-root", str(root)]),
+                  patch("autoclipper.director_poc.__main__.mkdtemp") as scratch,
+                  redirect_stderr(missing_error), self.assertRaises(SystemExit)):
+                main()
+            self.assertIn("SRT missing for part", missing_error.getvalue())
+            scratch.assert_not_called()
             error = io.StringIO()
             with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
                                              str(root), "--session-root", str(root / "absent")]),
+                  patch("autoclipper.director_poc.__main__.mkdtemp") as scratch,
                   redirect_stderr(error), self.assertRaises(SystemExit)):
                 main()
             self.assertIn("--session-root does not exist", error.getvalue())
             self.assertNotIn("Traceback", error.getvalue())
+            scratch.assert_not_called()
 
     def test_absolute_srt_outside_root_is_valid_without_override(self):
         with TemporaryDirectory() as directory:
@@ -146,10 +156,80 @@ class Mp4SessionRootTests(unittest.TestCase):
             source.write_text(json.dumps(session.to_dict()), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "SRT path escapes session root"):
                 source_session(source, root)
+            confirmations = parent / "confirmations.json"
+            confirmations.write_text('{"confirmations": []}', encoding="utf-8")
+            with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
+                                             str(root), "--session-root", str(root)]),
+                  patch("autoclipper.director_poc.__main__.mkdtemp") as scratch,
+                  redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
+                main()
+            scratch.assert_not_called()
             part.srt_path = None
             source.write_text(json.dumps(session.to_dict()), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Recording missing or outside --session-root"):
                 source_session(source, root)
+
+    def test_empty_folder_uses_explicit_root_for_both_commands_and_old_manifest_warns(self):
+        with TemporaryDirectory() as directory:
+            parent = Path(directory)
+            media = parent / "media"
+            media.mkdir()
+            (media / "angle.mp4").touch()
+            source = parent / "session.json"
+            source.write_text(json.dumps(Session(session_id="synthetic", folder="", povs=[
+                POV("p", "Player", [Part("part", video_path="angle.mp4", duration=1)])
+            ]).to_dict()), encoding="utf-8")
+            self.assertEqual(source_session(source).folder, str(parent))
+            confirmations = parent / "confirmations.json"
+            confirmations.write_text(json.dumps({"confirmations": [
+                {"part_id": "part", "transcriber_track": 1, "speaker": "Player",
+                 "confirmed_by": "owner"}]}), encoding="utf-8")
+            metadata = parent / "metadata"
+            metadata.mkdir()
+            (metadata / "angle.json").write_text(json.dumps({
+                "speaker_tracks": {"audio_track_1": "Player"}}), encoding="utf-8")
+            scratch = parent / "autoclipper-director-a-empty"
+            scratch.mkdir()
+            streams = [{"codec_type": "video", "r_frame_rate": "60/1", "nb_frames": "60",
+                        "duration": "1"},
+                       {"codec_type": "audio", "index": 1, "channels": 2,
+                        "tags": {"title": "Track1"}}]
+            with (patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(scratch)),
+                  patch("autoclipper.resolve_manifest.probe_streams", return_value=streams)):
+                prepare(SimpleNamespace(session=source, confirmations=confirmations, media_root=media,
+                                        session_root=media, metadata=metadata, fps=60))
+            manifest_path = scratch / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["pinned_inputs"]["session_source"]["root"], str(media).casefold())
+            (scratch / "build.json").write_text("{}", encoding="utf-8")
+            args = ["director", "index-notes", str(scratch), str(source), "--session-root", str(media)]
+            with (patch.object(sys, "argv", args),
+                  patch("autoclipper.director_poc.__main__.initialize_fkb", return_value=scratch / "catalog") as index):
+                main()
+            index.assert_called_once()
+            manifest["pinned_inputs"].pop("session_source")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            warning = io.StringIO()
+            with (patch.object(sys, "argv", args),
+                  patch("autoclipper.director_poc.__main__.initialize_fkb", return_value=scratch / "catalog") as index,
+                  redirect_stderr(warning)):
+                main()
+            self.assertIn("older manifest has no pinned session root or SRT digests", warning.getvalue())
+            index.assert_called_once()
+            implicit = parent / "autoclipper-director-a-implicit"
+            implicit.mkdir()
+            with (patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(implicit)),
+                  patch("autoclipper.resolve_manifest.probe_streams", return_value=streams)):
+                prepare(SimpleNamespace(session=source, confirmations=confirmations, media_root=media,
+                                        session_root=None, metadata=metadata, fps=60))
+            implicit_manifest = json.loads((implicit / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(implicit_manifest["pinned_inputs"]["session_source"]["root"],
+                             str(parent).casefold())
+            (implicit / "build.json").write_text("{}", encoding="utf-8")
+            with (patch.object(sys, "argv", ["director", "index-notes", str(implicit), str(source)]),
+                  patch("autoclipper.director_poc.__main__.initialize_fkb", return_value=implicit / "catalog") as index):
+                main()
+            index.assert_called_once()
 
     def test_losslesscut_mp4_fallback_and_legacy_mkv(self):
         with TemporaryDirectory() as directory:

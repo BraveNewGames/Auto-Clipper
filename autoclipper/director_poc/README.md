@@ -47,7 +47,13 @@ Use the same `--session-root` for `index-notes` when it was used for `prepare`.
 The override affects memory only and requires an existing source directory with
 the referenced recordings and SRTs. Missing SRTs stop preparation or indexing
 with a part-specific message. Preparation pins the resolved root and SRT content
-digests; indexing refuses a different root or changed SRT. A saved MKV reference uses its same-stem MP4 when
+digests; indexing refuses a different root or changed SRT. For a copied JSON
+with an empty `folder`, both commands derive the root from the original copy's
+location; use `--session-root` if the recordings live elsewhere. Absolute SRT
+paths may lie outside that root; their contents are still pinned by digest.
+Older manifests without this source binding remain indexable, with a warning
+that their root and SRTs cannot be checked against preparation. A saved MKV
+reference uses its same-stem MP4 when
 the MKV is gone; the source JSON is not rewritten. A different recording
 reference changes catalog identity and is rejected during indexing.
 
