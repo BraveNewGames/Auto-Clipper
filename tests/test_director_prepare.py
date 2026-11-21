@@ -140,17 +140,32 @@ class DirectorPrepareTests(unittest.TestCase):
                 {"part_id": part.part_id, "transcriber_track": 2, "speaker": "Ada", "confirmed_by": "owner"}
                 for _, part in session.all_parts()
             ]}), encoding="utf-8")
+            metadata = root / "metadata"
+            metadata.mkdir()
+            for stem in ("first", "second"):
+                (metadata / f"{stem}.json").write_text(
+                    json.dumps({"speaker_tracks": {"audio_track_2": "Ada"}}), encoding="utf-8")
+            conflicting_confirmations = original_root / ".autoclipper" / "mic_confirmations.json"
+            conflicting_confirmations.parent.mkdir()
+            conflicting_confirmations.write_text(json.dumps({"confirmations": []}), encoding="utf-8")
+            conflicting_metadata = original_root / "_Transcripts"
+            conflicting_metadata.mkdir()
+            for stem in ("first", "second"):
+                (conflicting_metadata / f"{stem}.json").write_text(
+                    json.dumps({"speaker_tracks": {"audio_track_1": "Other"}}), encoding="utf-8")
             media_files = [media / name for name in ("first.mp4", "second.mp4")]
             for path in media_files:
                 path.write_bytes(b"synthetic fixture")
-            originals = {path: path.read_bytes() for path in [source, confirmations, *media_files]}
+            originals = {path: path.read_bytes() for path in [source, confirmations, *media_files,
+                                                               *metadata.glob("*.json")]}
             inventory = [
                 {"codec_type": "video", "r_frame_rate": "60/1", "nb_frames": "60", "duration": "1"},
                 {"codec_type": "audio", "index": 1, "channels": 2, "tags": {"title": "Track1"}},
                 {"codec_type": "audio", "index": 2, "channels": 2, "tags": {"title": "Track2"}},
             ]
             sdk = Mock()
-            with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations), str(media)]),
+            with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
+                                             str(media), "--metadata", str(metadata)]),
                   patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
                   patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(scratch)),
                   patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory) as probe,
@@ -161,6 +176,8 @@ class DirectorPrepareTests(unittest.TestCase):
             manifest = json.loads((scratch / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["mode"], "director_review")
             self.assertEqual(manifest["session_id"], "DirectorA REVIEW")
+            self.assertEqual(manifest["pinned_inputs"]["confirmations"]["path"], "mic_confirmations.json")
+            self.assertEqual(manifest["pinned_inputs"]["metadata"]["path"], "metadata")
             self.assertEqual(manifest["requested_session_frames"], [0, 420])
             self.assertEqual(manifest["review_session_frames"], [60, 240])
             self.assertEqual([segment["kind"] for segment in manifest["segments"]],
@@ -198,6 +215,7 @@ class DirectorPrepareTests(unittest.TestCase):
                 main()
             store = FKBStore(scratch)
             self.assertEqual(store.load().session.review_session_start_frame, 60)
+            self.assertEqual(store.load().pinned_inputs, manifest["pinned_inputs"])
             catalog = NotesCatalog(store)
             capture = Capture("Scratch", "project", "Review", "timeline", 120, 125,
                               "01:00:02:00", "01:00:02:05", 180, 185, 60,
@@ -214,12 +232,37 @@ class DirectorPrepareTests(unittest.TestCase):
             ])))
             live = load_session(source)
             with patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory) as probe:
-                edit = compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1",
-                                             confirmations=confirmations)
+                edit = compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1")
             self.assertEqual(edit["source_mapping_digest"], manifest["source_mapping_digest"])
             angle, = edit["segments"][0]["angles"]
             self.assertEqual(angle["mp4_path"], str(media / "second.mp4"))
             self.assertEqual((angle["source_in_frame"], angle["source_out_frame"]), (0, 5))
+            self.assertEqual(angle["mic"]["expected_owner_track"], 2)
             self.assertEqual([call.args[0] for call in probe.call_args_list], media_files)
+            with patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory):
+                explicit = compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1",
+                                                 confirmations=confirmations, transcripts_dir=metadata)
+            self.assertEqual(explicit["source_mapping_digest"], edit["source_mapping_digest"])
+            with self.assertRaisesRegex(ValueError, "Mic confirmations does not match"):
+                compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1",
+                                      confirmations=conflicting_confirmations)
+            with self.assertRaisesRegex(ValueError, "Metadata does not match"):
+                compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1",
+                                      transcripts_dir=conflicting_metadata)
+            pinned_file = scratch / "mic_confirmations.json"
+            pinned_bytes = pinned_file.read_bytes()
+            pinned_file.write_text(json.dumps({"confirmations": []}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Mic confirmations does not match"):
+                compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1")
+            pinned_file.write_bytes(pinned_bytes)
+            pinned_metadata = scratch / "metadata" / "first.json"
+            pinned_metadata.unlink()
+            with self.assertRaisesRegex(ValueError, "Metadata does not match"):
+                compile_fkb_edit_plan(live, store.load(), "draft", revision_id="r1")
+            pinned_metadata.write_bytes((metadata / "first.json").read_bytes())
+            legacy = store.load()
+            legacy.pinned_inputs = None
+            with self.assertRaisesRegex(ValueError, "older source-backed catalog"):
+                compile_fkb_edit_plan(live, legacy, "draft", revision_id="r1")
             self.assertEqual((live.folder, live.povs[0].parts[1].video_path),
                              (str(original_root), "second.mkv"))

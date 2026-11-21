@@ -162,6 +162,7 @@ class FootageKnowledgeBase(_Model):
     schema_version: int = 1
     source_mapping_digest: str | None = None
     source_resolution: dict | None = None
+    pinned_inputs: dict | None = None
 
     @classmethod
     def from_dict(cls, data):
@@ -214,7 +215,9 @@ class FKBStore:
         self.backup = self.path.with_suffix(".json.bak")
 
     def load(self):
-        return FootageKnowledgeBase.from_dict(loads(self.path.read_text(encoding="utf-8")))
+        database = FootageKnowledgeBase.from_dict(loads(self.path.read_text(encoding="utf-8")))
+        database._scratch_dir = self.path.parent.parent
+        return database
 
     def initialize(self, database):
         with self._lock:
@@ -330,5 +333,6 @@ def ingest_session(source, *, fps, timeline_start_frame=0, review_session_start_
             "paths": {part_id: row["source_path"] for part_id, row in mapping_parts.items()},
         }
     return FootageKnowledgeBase(session, parts, spans, source_mapping_digest=digest,
-                                source_resolution=resolution)
+                                source_resolution=resolution,
+                                pinned_inputs=review_manifest.get("pinned_inputs") if digest else None)
 

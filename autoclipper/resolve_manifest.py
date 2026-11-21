@@ -301,10 +301,11 @@ def _angle(pov, part, media, placement, first_frame, last_frame, rate):
         "handle_after_frames": limit - source_out,
     }
 
-def _manifest_inputs(session, transcripts_dir, confirmations, fps):
+def _manifest_inputs(session, transcripts_dir, confirmations, fps, *, isolated_inputs=False):
     folder = Path(session.folder).resolve()
     roots = ([Path(transcripts_dir)] if transcripts_dir is not None else [])
-    roots += [folder / "_Transcripts", folder.parent / "_Transcripts"]
+    if not isolated_inputs:
+        roots += [folder / "_Transcripts", folder.parent / "_Transcripts"]
     if confirmations is None:
         confirmations = _load_confirmations(folder / ".autoclipper" / "mic_confirmations.json")
     elif isinstance(confirmations, (str, Path)):
@@ -474,6 +475,52 @@ def source_mapping_digest(manifest: dict) -> str:
                   .encode("utf-8")).hexdigest()
 
 
+def pinned_input_digest(path):
+    """Hash one file or a directory by sorted relative names and file bytes."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"Pinned input is a symlink: {path}")
+    if path.is_file():
+        return sha256(path.read_bytes()).hexdigest()
+    if not path.is_dir():
+        raise ValueError(f"Pinned input is missing: {path}")
+    digest = sha256()
+    for file in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
+        if file.is_symlink():
+            raise ValueError(f"Pinned metadata contains a symlink: {file}")
+        if file.is_dir():
+            continue
+        if not file.is_file():
+            raise ValueError(f"Pinned metadata contains an unsupported file: {file}")
+        name = file.relative_to(path).as_posix().encode("utf-8")
+        content = file.read_bytes()
+        digest.update(len(name).to_bytes(8, "big"))
+        digest.update(name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _verified_pinned_input(root, record, supplied, label):
+    try:
+        relative = Path(record["path"])
+        expected = record["sha256"]
+        if (relative.is_absolute() or ".." in relative.parts or not relative.parts
+                or not isinstance(expected, str) or len(expected) != 64):
+            raise ValueError("invalid pinned input identity")
+        pinned = root / relative
+        if not pinned.resolve().is_relative_to(root.resolve()):
+            raise ValueError("pinned input leaves scratch directory")
+        if pinned_input_digest(pinned) != expected:
+            raise ValueError("pinned copy changed")
+        if supplied is not None and pinned_input_digest(supplied) != expected:
+            raise ValueError("explicit input differs from prepared copy")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} does not match the prepared input ({exc}). "
+                         "Restore the scratch copy or pass the same verified input used at prepare.") from exc
+    return supplied if supplied is not None else pinned
+
+
 def _source_file_identity(path):
     stat = path.stat()
     if not S_ISREG(stat.st_mode):
@@ -517,8 +564,9 @@ def verify_source_media_identity(manifest, required_paths):
         raise ValueError(f"A Director source is missing from the verified media mapping. {retry}")
 
 
-def _review_coverage(session, transcripts_dir, confirmations, fps):
-    folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
+def _review_coverage(session, transcripts_dir, confirmations, fps, *, isolated_inputs=False):
+    folder, roots, confirmations, rate, manifest = _manifest_inputs(
+        session, transcripts_dir, confirmations, fps, isolated_inputs=isolated_inputs)
     fps = manifest["fps"]
     if type(fps) is not int:
         raise ValueError("Director timelines require integer fps")
@@ -613,9 +661,10 @@ def _frame_segment(fps, first, end, record, angles, unavailable, *, entry_id, ti
     }
 
 
-def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps=None):
+def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps=None, *, _isolated_inputs=False):
     """Build a frame-grid review without compressing interior gaps or trusting estimated tails."""
-    manifest, _, first, end, spans = _review_coverage(session, transcripts_dir, confirmations, fps)
+    manifest, _, first, end, spans = _review_coverage(
+        session, transcripts_dir, confirmations, fps, isolated_inputs=_isolated_inputs)
     manifest.update(mode="director_review", requested_session_frames=[first, end],
                     catalog_source=catalog_source_identity(session))
     playable = [index for index, span in enumerate(spans) if span[2]]
@@ -647,7 +696,7 @@ def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps
     return manifest
 
 
-def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None):
+def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *, _isolated_inputs=False):
     """Compile the assembler projection of an EditPlan, without importing Resolve.
 
     The projection has plan_id, session_id, fps, revision_id, revision_history
@@ -691,7 +740,8 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None):
             if not isinstance(refs, (tuple, list)) or any(not isinstance(ref, str) or not ref for ref in refs):
                 raise ValueError(f"Expected IDs in {key}")
 
-    manifest, coverage, _, _, _ = _review_coverage(session, transcripts_dir, confirmations, plan["fps"])
+    manifest, coverage, _, _, _ = _review_coverage(
+        session, transcripts_dir, confirmations, plan["fps"], isolated_inputs=_isolated_inputs)
     if any(entry["kind"] == "source" for entry in plan["entries"]) and "source_mapping_digest" in plan:
         if plan["source_mapping_digest"] != manifest["source_mapping_digest"]:
             raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
@@ -803,15 +853,37 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
         "source_mapping_digest": digest,
     }
     resolution = getattr(knowledge_base, "source_resolution", None)
+    isolated_inputs = False
     if resolution and any(entry["kind"] == "source" for entry in entries):
         if resolution["catalog_source"] != catalog_source_identity(session):
             raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
+        pinned = getattr(knowledge_base, "pinned_inputs", None)
+        if pinned is None:
+            if confirmations is None and transcripts_dir is None:
+                raise ValueError("This older source-backed catalog has no pinned inputs. Pass the same "
+                                 "confirmations and metadata used at prepare explicitly.")
+        else:
+            isolated_inputs = True
+            scratch = getattr(knowledge_base, "_scratch_dir", None)
+            if scratch is None:
+                raise ValueError("Load the pinned catalog from its scratch FKB before compiling.")
+            scratch = Path(scratch)
+            confirmations = _verified_pinned_input(
+                scratch, pinned["confirmations"], confirmations, "Mic confirmations")
+            if "metadata" in pinned:
+                transcripts_dir = _verified_pinned_input(
+                    scratch, pinned["metadata"], transcripts_dir, "Metadata")
+            elif transcripts_dir is not None:
+                raise ValueError("No metadata was pinned at prepare; omit transcripts_dir.")
+            else:
+                transcripts_dir = scratch / "_empty_metadata"
         paths = resolution["paths"]
         session = replace(session, povs=[
             replace(pov, parts=[replace(part, video_path=paths[part.part_id]) for part in pov.parts])
             for pov in session.povs
         ])
-    return compile_edit_plan(session, projection, transcripts_dir, confirmations)
+    return compile_edit_plan(session, projection, transcripts_dir, confirmations,
+                             _isolated_inputs=isolated_inputs)
 
 
 def render_report(manifest) -> str:
