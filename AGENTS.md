@@ -54,6 +54,7 @@ Module paths below are relative to `autoclipper/`.
 - Import/export formats, transcription metadata/schema, privacy, file deletion/overwriting, project settings or release code.
 
 ## Operating policy
+- Testing policy: every worker follows `docs/DEVELOPMENT_AND_TESTING_POLICY.md`.
 - Canonical approval and privacy contract: `docs/policies/AutoClipper_Orchestrator_Execution_Contract_v0.1.md` (read relevant sections when necessary).
 - No unapproved substantive implementation; no merge/push/release or paid service/dependency without owner authorization.
 - One focused task per worker; keep findings concise.

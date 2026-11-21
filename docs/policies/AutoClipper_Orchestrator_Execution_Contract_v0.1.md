@@ -1,6 +1,7 @@
 # Auto-Clipper — Orchestrator Execution and Release Contract
 
 **Policy | v0.1 — November 20, 2026**  
+**Testing and review precedence:** `docs/DEVELOPMENT_AND_TESTING_POLICY.md` supersedes this contract's testing and review rules where they differ.
 **Document role:** Cross-cutting development policy (historically named `06-ORCHESTRATOR-EXECUTION-CONTRACT.md` / “Milestone 0”). **This is not Milestone 6 of the product.**  
 **Status:** **OWNER-APPROVED POLICY.** This document defines permitted actions; it does not assert that Orchestrator's current configuration, repository protections, or review automation have already been verified.  
 **Immediate process pilot:** **Resolve Timeline Assembler — Stage 1 technical proof of concept**, under its separately scoped assignment v0.1. The formerly proposed 60-clip preview-bug pilot is no longer the first execution-contract pilot; that issue remains independently trackable under Stabilization.
