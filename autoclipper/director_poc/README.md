@@ -163,3 +163,17 @@ If the old receipt is missing or any range cannot be verified, omit
 and reselect any ranges needed in the new verified review. Persistent capture
 requires the new verified source mapping. A receipted, zero-origin legacy
 review can still open in disposable mode.
+
+## Offline synthetic harness
+
+From the repository root, run:
+
+```powershell
+python -m unittest discover -s tests -p director_synthetic_harness.py -v
+```
+
+Use Python 3.10+ with `ffmpeg` (libx264 and AAC encoders) and `ffprobe` on
+`PATH`. The harness skips if either executable is missing. It generates and
+cleans up its own temporary MP4s, checks separate media roots and exact note
+trims, and verifies that changed source files block both Director build paths.
+Resolve is mocked. Normal unit-test discovery does not run this harness.
