@@ -46,7 +46,8 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
 Use the same `--session-root` for `index-notes` when it was used for `prepare`.
 The override affects memory only and requires an existing source directory with
 the referenced recordings and SRTs. Missing SRTs stop preparation or indexing
-with a part-specific message. A saved MKV reference uses its same-stem MP4 when
+with a part-specific message. Preparation pins the resolved root and SRT content
+digests; indexing refuses a different root or changed SRT. A saved MKV reference uses its same-stem MP4 when
 the MKV is gone; the source JSON is not rewritten. A different recording
 reference changes catalog identity and is rejected during indexing.
 

@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 from functools import partial
 import json
+import os
 from pathlib import Path
 from shutil import copyfile, copytree
 from tempfile import gettempdir, mkdtemp
@@ -18,6 +19,10 @@ from .receipt import validate_review_receipt
 
 _SCRATCH_RECOVERY = ("Keep the existing catalog and its backup. See the legacy recovery steps in "
                      "autoclipper/director_poc/README.md.")
+
+
+class SourceRootError(ValueError):
+    """An explicitly supplied source root cannot be used."""
 
 
 def read(path):
@@ -35,17 +40,24 @@ def source_session(path, session_root=None):
     """Load a temp JSON with an optional in-memory source root and SRT preflight."""
     session = load_session(temp_copy(path))
     if session_root is not None:
-        root = session_root.resolve(strict=True)
+        try:
+            root = session_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SourceRootError(f"--session-root does not exist: {session_root}") from exc
         if not root.is_dir():
-            raise ValueError("--session-root must be an existing directory")
+            raise SourceRootError("--session-root must be an existing directory")
         session.folder = str(root)
     root = Path(session.folder).resolve()
     for _, part in session.all_parts():
         if part.srt_path:
-            srt = (root / part.srt_path).resolve()
-            if not srt.is_relative_to(root) or not srt.is_file():
-                raise ValueError(f"SRT missing or outside session root for {part.part_id}: "
-                                 f"{part.srt_path}. Supply --session-root with the recording folder.")
+            reference = Path(part.srt_path)
+            srt = (root / reference).resolve()
+            if not reference.is_absolute() and not srt.is_relative_to(root):
+                raise ValueError(f"SRT path escapes session root for {part.part_id}: {part.srt_path}")
+            if not srt.is_file():
+                remedy = ("Check this absolute SRT path." if reference.is_absolute() else
+                          "Supply --session-root with the recording folder.")
+                raise ValueError(f"SRT missing for {part.part_id}: {part.srt_path}. {remedy}")
         if session_root is not None and part.video_path:
             saved = (root / part.video_path).resolve()
             media = resolve_recording(root, part.video_path)
@@ -53,6 +65,16 @@ def source_session(path, session_root=None):
                 raise ValueError(f"Recording missing or outside --session-root for {part.part_id}: "
                                  f"{part.video_path}")
     return session
+
+
+def source_input_identity(session):
+    """Bind indexing to the source root and exact SRT bytes used by prepare."""
+    root = Path(session.folder).resolve()
+    return {
+        "root": os.path.normcase(str(root)),
+        "srts": {part.part_id: pinned_input_digest(root / part.srt_path)
+                 for _, part in session.all_parts() if part.srt_path},
+    }
 
 
 def prepare(args):
@@ -73,6 +95,7 @@ def prepare(args):
                                      "sha256": pinned_input_digest(pinned_metadata)}
     print(f"Scratch directory: {scratch}", flush=True)
     session = source_session(scratch / "session.json", args.session_root)
+    pinned_inputs["session_source"] = source_input_identity(session)
     catalog_source = catalog_source_identity(session)
     if not session.all_parts():
         raise ValueError("The session has no recordings")
@@ -159,7 +182,10 @@ def main():
     run.add_argument("--out-exclusive", action="store_true", help="Use only if A1 verifies exclusive marks")
     args = parser.parse_args()
     if args.command == "prepare":
-        prepare(args)
+        try:
+            prepare(args)
+        except SourceRootError as exc:
+            parser.error(str(exc))
         return
     try:
         scratch = temp_copy(args.scratch)
@@ -185,7 +211,14 @@ def main():
     try:
         built = read(result_path)
         if args.command == "index-notes":
-            source = source_session(args.session, args.session_root)
+            try:
+                source = source_session(args.session, args.session_root)
+                pinned_source = (manifest.get("pinned_inputs") or {}).get("session_source")
+                if pinned_source is not None and pinned_source != source_input_identity(source):
+                    raise ValueError("Session root or SRT contents differ from prepare. "
+                                     "Use the same --session-root and unchanged SRTs, or prepare a new review.")
+            except (OSError, ValueError) as exc:
+                parser.error(f"Cannot index the source session. {exc}")
             print(initialize_fkb(scratch, source, manifest, built, migrate_from=args.migrate_from))
             return
 
