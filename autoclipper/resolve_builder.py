@@ -75,8 +75,11 @@ def validate_manifest(manifest):
                 raise ValueError("Expected bounded media or a labeled placeholder")
         elif not segment["angles"]:
             raise ValueError("Segments need at least one angle")
-        if not edit and ("audio_angle" in segment or segment.get("kind") == "placeholder"):
+        if not edit and ("audio_angle" in segment or "reference_angle" in segment
+                         or segment.get("kind") == "placeholder"):
             raise ValueError("Slates and independent audio choices require an edit plan")
+        if "reference_angle" in segment and segment.get("reference_audio") is None:
+            raise ValueError("A reference source needs its GROUP REFERENCE AUDIO placement")
         # Read marker identity during preflight, before making a project.
         marker_data(segment)
         if edit:
@@ -85,14 +88,18 @@ def validate_manifest(manifest):
             segment_ids.add(segment["segment_id"])
         record += length
         reference = segment.get("reference_audio")
+        # Edit plans may take the group mix from the selected mic or a separately verified covering angle.
+        sources = ([*segment["angles"], *(segment[key] for key in ("audio_angle", "reference_angle")
+                                          if segment.get(key) is not None)]
+                   if edit else segment["angles"])
         if reference is not None:
-            if mode in {"director_review", "director_edit_plan"} or not any(
+            if review or (edit and segment.get("kind") != "media") or not any(
                     angle["pov_id"] == reference.get("pov_id")
                     and angle["part_id"] == reference.get("part_id")
                     and angle["mp4_path"] == reference.get("mp4_path")
                     and angle["source_in_frame"] == reference.get("source_in_frame")
                     and angle["source_out_frame"] == reference.get("source_out_frame")
-                    and angle.get("reference_track") == reference.get("track") for angle in segment["angles"]):
+                    and angle.get("reference_track") == reference.get("track") for angle in sources):
                 raise ValueError("Reference audio must match a covered verified angle")
             track = reference["track"]
             if (reference.get("record_start_frame") != segment["record_start_frame"]
@@ -104,10 +111,10 @@ def validate_manifest(manifest):
                 raise ValueError("Reference audio placement or mix mapping is unverified")
         povs = set()
         paths = set()
-        angles = segment["angles"]
-        audio = segment.get("audio_angle") if edit else None
-        if audio is not None and audio not in angles:
-            angles = [*angles, audio]
+        angles = list(segment["angles"])
+        for extra in sources[len(angles):]:
+            if extra not in angles:
+                angles.append(extra)
         for angle in angles:
             path = Path(angle["mp4_path"])
             if not path.is_absolute() or path.suffix.lower() != ".mp4":
@@ -637,7 +644,8 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     require(Fraction(timeline.GetSettings()["timelineFrameRate"]) == fps, "Export timeline rate differs")
     clips = import_sources(pool, media, fps)
     segments = manifest["segments"]
-    reference_clips = import_reference_sources(pool, segments, clips, fps) if not mapped_director else {}
+    reference_clips = (import_reference_sources(pool, segments, clips, fps)
+                       if manifest.get("mode") != "director_review" else {})
     if any("reference_audio" in segment for segment in segments):
         require(timeline.AddTrack("audio", "stereo"), "Could not add stereo GROUP REFERENCE AUDIO track")
         require(timeline.SetTrackName("audio", 2, REFERENCE_TRACK_NAME)

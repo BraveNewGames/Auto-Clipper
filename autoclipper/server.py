@@ -799,6 +799,97 @@ class App:
         threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
         return job
 
+    # ------------------------------------------------------------ AI rough cut
+    # Rough cuts never change session.json; accepted cuts go to autoclipper_exports/rough-cuts/.
+    def _rough_context(self):
+        rc = _mod("rough_cut")
+        snap, fingerprint = self._snapshot()
+        try:
+            context = rc.prepare(snap)
+        except (OSError, ValueError) as exc:
+            raise ApiError(f"Could not read the session's transcript and recordings: {exc}", 409)
+        return rc, snap, fingerprint, context
+
+    def rough_cut_prompt(self, body):
+        rc, snap, fingerprint, context = self._rough_context()
+        try:
+            prompt = rc.build_prompt(context, brief=body.get("brief"), target_seconds=body.get("target_seconds"))
+        except rc.RoughCutError as exc:
+            raise ApiError(str(exc))
+        mics = self._mic_rows(snap, context["mapping"])
+        with self.lock:
+            self._unchanged(fingerprint)
+        return {"prompt": prompt, "export_id": context["export_id"], "fps": context["fps"],
+                "filename": f"{snap.session_id}_rough_cut_prompt.txt",
+                "excluded": rc.excluded_parts(context), "mics": mics,
+                "povs": [{"pov_id": pov.pov_id, "name": pov.name} for pov in snap.povs]}
+
+    def rough_cut_import(self, body):
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError("Paste the AI's JSON answer")
+        rc, snap, fingerprint, context = self._rough_context()
+        try:
+            result = rc.validate_response(context, text, brief=body.get("brief"),
+                                          target_seconds=body.get("target_seconds"))
+        except rc.RoughCutError as exc:
+            raise ApiError(str(exc))
+        out = {key: result[key] for key in ("ok", "export_id", "errors", "warnings", "stale", "repair_prompt")}
+        if not result["ok"]:
+            return out
+        with self.lock:
+            self._unchanged(fingerprint)
+            try:
+                folder = rc.save_cut(rc.session_cuts_root(snap), result, text)
+            except (OSError, rc.RoughCutError) as exc:
+                raise ApiError(f"Could not save the rough cut (nothing was saved): {exc}", 409)
+        out.update(cut_id=folder.name, cut_dir=str(folder), report_path=str(folder / "report.md"),
+                   title=result["title"], clips=result["clips"], segments=len(result["manifest"]["segments"]),
+                   reference_gaps=sum(1 for s in result["manifest"]["segments"]
+                                      if "reference_audio" in s and s["reference_audio"] is None))
+        return out
+
+    def rough_cut_build(self, body):
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            rc, snap, fingerprint, context = self._rough_context()
+            try:
+                folder, manifest, record = rc.load_cut(rc.session_cuts_root(snap), body.get("cut_id"))
+                _mod("resolve_builder").validate_manifest(manifest)
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise ApiError(f"Cannot build this rough cut: {exc}", 409)
+            if record.get("export_id") != context["export_id"]:
+                raise ApiError("The session, transcript, mic confirmations or recordings changed since this rough "
+                               "cut was validated. Copy a new prompt and import a new answer.", 409)
+            with self.lock:
+                self._unchanged(fingerprint)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                name = f"build-{stamp}"
+                if (folder / name).exists():
+                    raise ApiError(f"Build folder already exists: {folder / name}. Try again in a second.", 409)
+                try:
+                    out = rc.safe_directory(folder, name)
+                except (OSError, rc.RoughCutError) as exc:
+                    raise ApiError(str(exc), 409)
+            job = {
+                "state": "running", "kind": "rough_cut", "cut_id": folder.name,
+                "project": f"AutoClipper Export {manifest['session_id']} {stamp}",
+                "out_dir": str(out), "manifest_path": str(folder / "manifest.json"),
+                "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
+        threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
+        return job
+
     def _run_resolve_job(self, job):
         result = {"state": "failed"}
         readback = Path(job["out_dir"]) / "readback.json"
@@ -940,6 +1031,9 @@ POST_ROUTES = {
     "/api/open-path": "open_path",
     "/api/resolve/confirm-mic": "resolve_confirm_mic",
     "/api/resolve/export": "resolve_export",
+    "/api/rough-cut/prompt": "rough_cut_prompt",
+    "/api/rough-cut/import": "rough_cut_import",
+    "/api/rough-cut/build": "rough_cut_build",
 }
 
 

@@ -667,7 +667,7 @@ def verify_source_media_identity(manifest, required_paths):
         raise ValueError(f"A Director source is missing from the verified media mapping. {retry}")
 
 
-def _review_coverage(session, transcripts_dir, confirmations, fps, *, isolated_inputs=False):
+def _review_coverage(session, transcripts_dir, confirmations, fps, *, isolated_inputs=False, reference=False):
     folder, roots, confirmations, rate, manifest = _manifest_inputs(
         session, transcripts_dir, confirmations, fps, isolated_inputs=isolated_inputs)
     fps = manifest["fps"]
@@ -694,7 +694,7 @@ def _review_coverage(session, transcripts_dir, confirmations, fps, *, isolated_i
             })
         first = min(first, start)
         media, _, problem, game = _part_media(folder, roots, pov, part, confirmations, fps,
-                                             frame_count=True)
+                                             frame_count=True, reference=reference)
         estimated = _positive_duration(part.duration)
         if estimated:
             end = max(end, start + _record_frame(estimated, 0, rate))
@@ -804,13 +804,20 @@ def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps
     return manifest
 
 
-def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *, _isolated_inputs=False):
+def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *, _isolated_inputs=False,
+                      reference_audio=False):
     """Compile the assembler projection of an EditPlan, without importing Resolve.
 
     The projection has plan_id, session_id, fps, revision_id, revision_history
     and ordered entries. A source entry has session_in/session_out_exclusive and
     optional pov_id/audio_pov_id. A placeholder has only provisional_frames and
     a title for its timing. Both may carry candidate_ids and note_ids.
+
+    reference_audio=True also resolves each part's verified Track1 group mix and
+    lays one GROUP REFERENCE AUDIO source under every media segment. It prefers
+    one POV across the whole plan and may use any covering angle, so the group
+    track stays continuous when a segment shows or hears a single fixed POV.
+    The default leaves Director manifests and their source mapping unchanged.
     """
     if plan["session_id"] != session.session_id:
         raise ValueError("EditPlan belongs to another session")
@@ -849,7 +856,8 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *
                 raise ValueError(f"Expected IDs in {key}")
 
     manifest, coverage, _, _, _ = _review_coverage(
-        session, transcripts_dir, confirmations, plan["fps"], isolated_inputs=_isolated_inputs)
+        session, transcripts_dir, confirmations, plan["fps"], isolated_inputs=_isolated_inputs,
+        reference=reference_audio)
     if any(entry["kind"] == "source" for entry in plan["entries"]) and "source_mapping_digest" in plan:
         if plan["source_mapping_digest"] != manifest["source_mapping_digest"]:
             raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
@@ -858,6 +866,7 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *
         "revision_history": deepcopy(list(plan["revision_history"])),
     })
     record = 0
+    covered = []
     for entry in plan["entries"]:
         entry_id, title = entry["entry_id"], entry["title"]
         provenance = {key: list(entry.get(key, ())) for key in ("candidate_ids", "note_ids")}
@@ -875,6 +884,7 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *
                                          title=title, kind="media", range_source="edit_plan")
                 if audio is not None:
                     segment["audio_angle"] = audio
+                covered.append((segment, available))
             else:
                 cause = "planned_missing_beat" if entry["kind"] == "placeholder" else "source_unavailable"
                 segment = {
@@ -890,7 +900,44 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None, *
                            pieces=len(spans), requested_pov_id=pov, requested_audio_pov_id=audio_pov, **provenance)
             manifest["segments"].append(segment)
             record += end - first
+    if reference_audio:
+        _edit_reference_audio(manifest, covered)
     return manifest
+
+
+def _edit_reference_audio(manifest, covered):
+    """Choose one verified Track1 mix per media segment, preferring one POV for the whole plan."""
+    verified = lambda angle: angle["reference_track"]["status"] == "verified"
+    totals = Counter()
+    for segment, available in covered:
+        for angle in available:
+            if verified(angle):
+                totals[angle["pov_id"]] += segment["duration_frames"]
+    preference = sorted(totals, key=lambda pov_id: (-totals[pov_id], pov_id))
+    warned = set()
+    for segment, available in covered:
+        for angle in available:
+            if not verified(angle) and angle["part_id"] not in warned:
+                warned.add(angle["part_id"])
+                manifest["warnings"].append({"code": "reference_track_unverified",
+                    "part_id": angle["part_id"], "pov_name": angle["pov_name"],
+                    "message": f"GROUP REFERENCE AUDIO cannot use this part: {angle['reference_track']['reason']}"})
+        choice = next((angle for pov_id in preference for angle in available
+                       if angle["pov_id"] == pov_id and verified(angle)), None)
+        if choice is None:
+            segment["reference_audio"] = None
+            manifest["warnings"].append({"code": "reference_audio_gap",
+                "event_id": segment["event_id"], "segment_id": segment["segment_id"],
+                "message": f"GROUP REFERENCE AUDIO has a gap for {segment['segment_id']}: no covered verified mix."})
+            continue
+        segment["reference_audio"] = {key: choice[key] for key in
+            ("pov_id", "pov_name", "part_id", "mp4_path", "source_in_frame", "source_out_frame")}
+        segment["reference_audio"].update(record_start_frame=segment["record_start_frame"],
+                                          duration_frames=segment["duration_frames"],
+                                          track=choice["reference_track"])
+        if choice not in segment["angles"] and choice != segment.get("audio_angle"):
+            # The builder imports this source too, so its verified mic and identity are rechecked.
+            segment["reference_angle"] = choice
 
 
 def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
@@ -1001,7 +1048,8 @@ def render_report(manifest) -> str:
         return str(value).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
     segments = manifest["segments"]
-    reference_mode = manifest.get("mode") not in {"director_review", "director_edit_plan"}
+    reference_mode = (manifest.get("mode") not in {"director_review", "director_edit_plan"}
+                      or any("reference_audio" in segment for segment in segments))
     selected = {segment["suggestion_id"] for segment in segments}
     label = {"director_review": "Full-session review", "director_edit_plan": "Director edit plan"}.get(
         manifest.get("mode"), f"{len(selected)} timed Keep selections")

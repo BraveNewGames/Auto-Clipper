@@ -92,6 +92,7 @@ const state = {
   focusIdx: -1,
   exportResult: null, exportInfo: null, exportMode: "exclude_rejected",
   resolve: null,
+  roughCut: { brief: "", target: "", info: null, answer: "", result: null },
 };
 
 function applyPayload(p) {
@@ -99,6 +100,7 @@ function applyPayload(p) {
     if (!state.session || state.session.folder !== p.session.folder) {
       state.exportResult = null; state.alignSuggestions = null; state.transcriptQ = "";
       state.resolve = null;
+      state.roughCut = { brief: "", target: "", info: null, answer: "", result: null };
     }
     state.exportInfo = null;
     state.session = p.session; state.coverage = p.coverage; state.reviewers = p.reviewers || [];
@@ -847,7 +849,7 @@ function micOptionLabel(o, m) {
 // Pick one of the MP4's real audio tracks and confirm it in-page (no native dialogs): the
 // button stays disabled until the owner ticks "I listened", so a stray click or double-click
 // can never record a confirmation. Re-confirming replaces the earlier choice for the part.
-function micConfirmControl(m, box) {
+function micConfirmControl(m, box, refresh) {
   const options = m.options || [];
   if (!m.mp4_found) return h("div", { class: "bad-text small" }, "No OBS-remuxed MP4 found for this part.");
   if (!options.length) {
@@ -864,7 +866,7 @@ function micConfirmControl(m, box) {
     if (!(track > 0)) throw new Error("Choose the mic track first");
     await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
     toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}: track ${track}`, "ok");
-    await loadResolvePreview(box);
+    await (refresh ? refresh() : loadResolvePreview(box));
   }) }, "Confirm mic");
   const sync = () => { button.disabled = !listened.checked || !pick.value; };
   listened.addEventListener("change", sync);
@@ -873,15 +875,15 @@ function micConfirmControl(m, box) {
     h("label", { class: "small" }, listened, " I listened: this is ", m.pov_name, "'s own mic"), button);
 }
 
-function resolveMicRow(m, box) {
+function resolveMicRow(m, box, refresh) {
   const verified = m.status === "verified" || m.status === "owner_confirmed";
   let control = null;
   if (m.status === "unverified" || m.status === "unmapped") {
-    control = micConfirmControl(m, box);
+    control = micConfirmControl(m, box, refresh);
   } else if (m.status === "owner_confirmed") {
     // Let the owner correct a wrong pick without a dialog: reveal the same control on demand.
     control = h("div", null);
-    control.appendChild(h("button", { class: "btn small", onclick: () => control.replaceChildren(micConfirmControl(m, box)) }, "Change…"));
+    control.appendChild(h("button", { class: "btn small", onclick: () => control.replaceChildren(micConfirmControl(m, box, refresh)) }, "Change…"));
   }
   const expected = m.expected_track
     ? ` · metadata expects track ${m.expected_track}` +
@@ -1003,9 +1005,149 @@ function resolvePanel() {
   return box;
 }
 
+// ---------------------------------------------------------------- Rough cut (AI)
+// Copy a prompt, paste the AI's ordered clip list back, validate it strictly, then build it into a
+// new Resolve project through the same single export job as Export to Resolve.
+let roughPoll = null;
+
+function roughBody() {
+  const rc = state.roughCut;
+  return { brief: rc.brief, target_seconds: rc.target === "" ? null : rc.target };
+}
+
+async function loadRoughPrompt(box) {
+  state.roughCut.info = await api("/api/rough-cut/prompt", roughBody());
+  fillRough(box);
+  return state.roughCut.info;
+}
+
+function pollRough(box) {
+  if (roughPoll) return;
+  roughPoll = setInterval(async () => {
+    try {
+      const job = await api("/api/resolve/status");
+      if (job.state !== "running" && job.state !== "preparing") { clearInterval(roughPoll); roughPoll = null; }
+      if (state.roughCut.result) state.roughCut.result.job = job;
+      if (box.isConnected) fillRough(box);
+      if (job.state === "done") toast("Rough cut built in Resolve", "ok");
+      if (job.state === "failed") toast("Rough-cut build stopped — see the Export tab", "error");
+    } catch (e) { clearInterval(roughPoll); roughPoll = null; toast(e.message, "error"); }
+  }, 1500);
+}
+
+function roughRejected(r) {
+  return h("div", { class: "resolve-blockers" },
+    h("b", { class: "bad-text" }, r.stale ? "This answer belongs to an older prompt. Nothing was saved."
+      : `Rejected (${r.errors.length} problem(s)). Nothing was saved.`),
+    h("ul", { class: "issues bad-text" }, r.errors.map((e) => h("li", null, e))),
+    r.repair_prompt ? h("div", null,
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: action(async () => {
+        await navigator.clipboard.writeText(r.repair_prompt);
+        toast("Repair prompt copied — paste it into the same chat", "ok");
+      }) }, "Copy repair prompt"), h("span", { class: "muted small" }, "Paste it into the same chat, then paste the corrected answer above.")),
+      h("pre", { class: "setup small" }, r.repair_prompt))
+      : h("div", { class: "muted small" }, "Copy a new prompt and ask again."));
+}
+
+function roughClipRow(c, i) {
+  const cells = c.kind === "placeholder"
+    ? [h("td", { colspan: 4, class: "warn-text small" }, `Labelled slate, ${c.seconds.toFixed(2)} s`)]
+    : [h("td", { class: "mono small" }, `${fmt(c.session_start)} – ${fmt(c.session_end)}`),
+      h("td", null, c.pov_id || "multicam"), h("td", null, c.audio_pov_id || "per angle"),
+      h("td", { class: "mono small" }, (c.quotes || []).join(", ") || "—")];
+  return h("tr", null, h("td", { class: "muted" }, i + 1), h("td", { class: "mono" }, c.id), h("td", null, c.title), cells);
+}
+
+function roughResult(r, box) {
+  if (!r) return null;
+  if (!r.ok) return roughRejected(r);
+  const job = r.job;
+  const running = job && (job.state === "running" || job.state === "preparing");
+  if (running) pollRough(box);
+  return h("div", null,
+    h("div", { class: "good-text" }, h("b", null, `Validated “${r.title}”: `),
+      `${r.clips.length} entries → ${r.segments} timeline segment(s)` +
+      (r.reference_gaps ? `, ${r.reference_gaps} without group reference audio` : "") + ". Saved to ",
+      h("span", { class: "mono small" }, r.cut_dir)),
+    h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["#", "Clip", "Title", "Session range", "Video", "Mic", "Quotes"].map((x) => h("th", null, x)))),
+      h("tbody", null, r.clips.map(roughClipRow))),
+    r.warnings.length ? h("details", null, h("summary", { class: "warn-text small" }, `${r.warnings.length} warning(s)`),
+      issueList(r.warnings, "warn-text")) : null,
+    h("div", { class: "row resolve-go" },
+      h("button", { class: "btn primary", disabled: running ? true : null, onclick: action(async () => {
+        r.job = await api("/api/rough-cut/build", { cut_id: r.cut_id });
+        fillRough(box);
+      }) }, "Build into new Resolve project"),
+      openBtn("Open report.md", r.report_path), openBtn("Open folder", r.cut_dir),
+      h("span", { class: "muted small" }, "Save and close your Resolve project and leave the Project Manager open first.")),
+    job && job.cut_id === r.cut_id ? resolveJobBox(job, box) : null);
+}
+
+function fillRough(box) {
+  while (box.childNodes.length > 3) box.lastChild.remove();
+  const rc = state.roughCut;
+  const info = rc.info;
+  const answer = h("textarea", { rows: 8, class: "mono", placeholder: "Paste the AI's JSON answer here (code fences are fine)…" });
+  answer.value = rc.answer;
+  answer.addEventListener("input", () => { rc.answer = answer.value; });
+  appendAll(box,
+    info ? h("div", { class: "muted small" }, "Export ID ", h("span", { class: "mono" }, info.export_id),
+      ". Answers are accepted only for this session state; editing the session or confirming a mic needs a new prompt.") : null,
+    info && info.excluded.length ? h("div", null, h("b", { class: "warn-text small" }, "Recordings left out of the prompt (unverified):"),
+      issueList(info.excluded, "warn-text")) : null,
+    info && info.mics.length ? h("div", null, h("h3", null, "Microphones to confirm"),
+      h("table", { class: "t" }, h("thead", null, h("tr", null, ["Player", "Part", "Status", "Metadata says", ""].map((x) => h("th", null, x)))),
+        h("tbody", null, info.mics.map((m) => resolveMicRow(m, box, () => loadRoughPrompt(box)))))) : null,
+    h("h3", null, "2. Paste the AI's answer"),
+    h("div", { class: "row" }, answer),
+    h("div", { class: "row" },
+      h("button", { class: "btn primary", onclick: action(async () => {
+        rc.result = await api("/api/rough-cut/import", { ...roughBody(), text: answer.value });
+        toast(rc.result.ok ? "Rough cut validated and saved" : "Rough cut rejected — see the problems below", rc.result.ok ? "ok" : "warn");
+        fillRough(box);
+      }) }, "Validate answer"),
+      h("span", { class: "muted small" }, "Every clip is checked against the transcript and verified footage. Any problem saves nothing.")),
+    roughResult(rc.result, box));
+}
+
+function roughCutPanel() {
+  const rc = state.roughCut;
+  const brief = h("textarea", { rows: 2, placeholder: "Optional editorial brief, e.g. a 90-second cut of the funniest disasters" });
+  brief.value = rc.brief;
+  brief.addEventListener("input", () => { rc.brief = brief.value; });
+  const target = h("input", { type: "number", min: 5, max: 1800, placeholder: "seconds", style: { width: "100px" } });
+  target.value = rc.target;
+  target.addEventListener("input", () => { rc.target = target.value; });
+  const box = h("div", { class: "panel" },
+    h("h2", null, "Rough cut (AI)"),
+    h("div", { class: "muted small" }, "An AI picks transcript-supported moments from anywhere in the verified session and orders them. ",
+      "Auto-Clipper validates every clip against the transcript and footage, then builds a new Resolve project with ",
+      "multicam angles, Source-mode mics and the GROUP REFERENCE AUDIO track. session.json is not changed."),
+    h("div", null,
+      h("h3", null, "1. Copy the prompt"),
+      h("div", { class: "row" }, h("label", { class: "f", style: { flex: "1" } }, "Brief", brief), h("label", { class: "f" }, "Target length (s)", target)),
+      h("div", { class: "row" },
+        h("button", { class: "btn primary", onclick: action(async () => {
+          const info = await loadRoughPrompt(box);
+          await navigator.clipboard.writeText(info.prompt);
+          toast("Rough-cut prompt copied — paste it into a new chat", "ok");
+        }) }, "Copy prompt"),
+        h("button", { class: "btn", onclick: action(async () => {
+          const info = await loadRoughPrompt(box);
+          const url = URL.createObjectURL(new Blob([info.prompt], { type: "text/plain" }));
+          const a = h("a", { href: url, download: info.filename });
+          document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+        }) }, "Download prompt"),
+        h("span", { class: "muted small" }, "Paste it into a fresh ChatGPT or Claude chat. Keep the same brief when validating."))));
+  fillRough(box);
+  return box;
+}
+
 function renderExport(main) {
   const s = state.session;
   main.appendChild(resolvePanel());
+  main.appendChild(roughCutPanel());
   const modes = h("div", { class: "row" }, Object.entries(EXPORT_MODES).map(([k, m]) =>
     h("label", null, h("input", { type: "radio", name: "xmode", value: k, checked: state.exportMode === k,
       onchange: () => { state.exportMode = k; } }), " ", m.label)));

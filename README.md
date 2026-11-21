@@ -116,12 +116,41 @@ or muted track is excluded from the render. Game audio is reported as not identi
 transcriber metadata names it.
 Source MP4s are imported by reference and never modified.
 
+## Rough cut (AI)
+
+The **Rough cut (AI)** panel in the Export tab turns an AI-chosen, ordered list of moments into a
+new Resolve project. It uses manual copy and paste only, with no API calls.
+
+1. Optionally enter a brief and a target length, then **Copy prompt** and paste it into a fresh
+   ChatGPT or Claude chat. The prompt contains the transcript (with line IDs), the existing AI
+   Review suggestions and Keep decisions as hints, each POV's verified video and mic coverage, the
+   JSON answer format, and an **export ID** that fingerprints the session, transcript and verified
+   recordings. Recordings that are not verified (for example, a mic that is not confirmed) are left
+   out; confirm their mics in the panel and copy the prompt again.
+2. Paste the answer and **Validate answer**. Every clip must be anchored to transcript line IDs, an
+   existing suggestion ID, or exact frames with a matching timecode. Pads are 0–10 s. Quotes must be
+   verbatim from a line inside the clip. The chosen POV (or, for `pov: null`, any camera) and the
+   chosen mic (`audio_pov`) must have verified coverage for the whole clip. Clips may come from
+   anywhere in the session, in any order. The answer is then compiled with the edit-plan compiler and
+   preflighted by the Resolve builder. Any problem saves nothing and shows a **repair prompt** for the
+   same chat. An answer for an older export ID (the session, transcript, mic confirmations or MP4s
+   changed) is refused; copy a new prompt.
+3. **Build into new Resolve project** uses the same single export job as Export to Resolve and creates
+   **AutoClipper Export `<session id>` `<timestamp>`** from the Project Manager. Each clip is a
+   multicam of the covering angles (or one fixed POV) in the answer's order, with Source-mode mics
+   unless a fixed `audio_pov` is chosen, and labelled slates for placeholders. The
+   **GROUP REFERENCE AUDIO** track uses one POV's verified Track1 mix for the whole cut where it is
+   covered, even under a fixed single-POV clip.
+
+Rough cuts never change `session.json`.
+
 ## Where files go
 
 | What | Where |
 |---|---|
 | Session project (offsets, reviews, decisions) | `<session folder>\.autoclipper\session.json` |
 | Resolve export manifest, report and readback | `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\` |
+| AI rough cut (prompt, answer, plan, manifest, report, validation) | `<session folder>\autoclipper_exports\rough-cuts\<YYYYMMDD-HHMMSS>\`; each build adds `build-<timestamp>\readback.json` |
 | Owner mic confirmations | `<session folder>\.autoclipper\mic_confirmations.json` |
 | LosslessCut CSVs + README per reviewer | `<session folder>\autoclipper_exports\<reviewer>\<POV>_part<N>_pass<K>.csv` |
 | Recent sessions list | `%APPDATA%\AutoClipper\recent.json` |
