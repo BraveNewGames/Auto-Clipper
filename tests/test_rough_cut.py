@@ -84,7 +84,8 @@ class RoughCutCoreTests(unittest.TestCase):
         context = self.context()
         prompt = rc.build_prompt(context, brief="Short and funny", target_seconds=30)
         self.assertEqual(prompt, rc.build_prompt(self.context(), brief="Short and funny", target_seconds=30))
-        for text in (context["export_id"], "L0004 00:00:11 Bravo: Who left the door open again",
+        for text in (rc.prompt_export_id(context, brief="Short and funny", target_seconds=30),
+                     "L0004 00:00:11 Bravo: Who left the door open again",
                      '"bravo" (Bravo): video + own mic verified during 00:00:05.000-00:00:15.000',
                      "claude-01 [keep] 00:00:10.500-00:00:14.000", "charlie-1 (mp4_missing)", "Short and funny"):
             self.assertIn(text, prompt)
@@ -190,6 +191,58 @@ class RoughCutCoreTests(unittest.TestCase):
         self.assertFalse(missing["stale"])
         self.assertIn("must be copied exactly", missing["errors"][0])
         self.assertIn(context["export_id"], missing["repair_prompt"])
+
+    def test_prompt_options_are_bound_to_export_id(self):
+        context = self.context()
+        alternate = rc.prompt_export_id(context, brief="A different brief", target_seconds=45)
+        self.assertNotEqual(alternate, context["export_id"])
+        self.assertIn(alternate, rc.build_prompt(context, brief="A different brief", target_seconds=45))
+        stale = rc.validate_response(context, answer(context["export_id"], GOOD_CLIPS),
+                                     brief="A different brief", target_seconds=45)
+        self.assertTrue(stale["stale"])
+        self.assertIn("prompt options", stale["errors"][0])
+        accepted = rc.validate_response(context, answer(alternate, GOOD_CLIPS),
+                                        brief="A different brief", target_seconds=45)
+        self.assertTrue(accepted["ok"], accepted["errors"])
+        self.assertEqual(accepted["manifest"]["rough_cut"]["brief"], "A different brief")
+
+    def test_nonfinite_suggestion_is_untimed_in_prompt_and_import(self):
+        self.session.reviews["claude-01"].approved_end = float("inf")
+        context = self.context()
+        self.assertNotIn("claude-01 [keep]", rc.build_prompt(context))
+        result = rc.validate_response(context, answer(context["export_id"], GOOD_CLIPS))
+        self.assertFalse(result["ok"])
+        self.assertIn("has no timed range", "\n".join(result["errors"]))
+
+    def test_one_character_quote_is_not_verbatim_evidence(self):
+        context = self.context()
+        clips = [{**GOOD_CLIPS[0], "quotes": [{"line": "L0004", "text": "o"}]}, GOOD_CLIPS[2]]
+        result = rc.validate_response(context, answer(context["export_id"], clips))
+        self.assertFalse(result["ok"])
+        self.assertIn("not verbatim", "\n".join(result["errors"]))
+
+    def test_line_anchor_keeps_later_start_line_end(self):
+        context = self.context()
+        context["line_index"]["L0001"] = replace(context["line_index"]["L0001"], session_end=8)
+        clips = [{**GOOD_CLIPS[2], "start_line": "L0001", "end_line": "L0002"}, GOOD_CLIPS[0]]
+        result = rc.validate_response(context, answer(context["export_id"], clips))
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["plan"]["entries"][0]["session_out_exclusive"], 480)
+
+    def test_nonpart_compile_blocker_remains_fatal(self):
+        from autoclipper import resolve_manifest as rm
+        context = self.context()
+        compile_plan = rm.compile_edit_plan
+
+        def with_blocker(*args, **kwargs):
+            manifest = compile_plan(*args, **kwargs)
+            manifest["blockers"].append({"code": "fatal", "part_id": None, "message": "Fatal mapping error"})
+            return manifest
+
+        with patch.object(rm, "compile_edit_plan", side_effect=with_blocker):
+            result = rc.validate_response(context, answer(context["export_id"], GOOD_CLIPS))
+        self.assertFalse(result["ok"])
+        self.assertIn("Fatal mapping error", "\n".join(result["errors"]))
 
     def test_pov_names_are_not_accepted_as_source_ids(self):
         context = self.context()
@@ -388,7 +441,8 @@ class RoughCutApiTests(unittest.TestCase):
         self.assertEqual(info["filename"], "synthetic-cut_rough_cut_prompt.txt")
         cuts = self.folder / "autoclipper_exports" / "rough-cuts"
 
-        rejected = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS[:1])})
+        rejected = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS[:1]),
+                                                       "brief": "Quick", "target_seconds": "20"})
         self.assertFalse(rejected["ok"])
         self.assertTrue(rejected["repair_prompt"])
         self.assertFalse(cuts.exists())
@@ -429,6 +483,11 @@ class RoughCutApiTests(unittest.TestCase):
         self.assertIn("changed after validation",
                       self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]}, expect=409)["error"])
         (folder / "manifest.json").write_bytes(original)
+        validation = (folder / "validation.json").read_bytes()
+        (folder / "validation.json").write_text("[]", encoding="utf-8")
+        self.assertIn("validation record is malformed",
+                      self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]}, expect=409)["error"])
+        (folder / "validation.json").write_bytes(validation)
         self.call("/api/session/meta", {"notes": "edited after validation"})
         self.assertIn("changed since this rough cut was validated",
                       self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]}, expect=409)["error"])
@@ -436,6 +495,26 @@ class RoughCutApiTests(unittest.TestCase):
         self.assertEqual(self.call("/api/resolve/status")["state"], "idle")
         self.assertEqual(self.call("/api/rough-cut/import", {"text": " "}, expect=400)["error"],
                          "Paste the AI's JSON answer")
+
+    def test_prompt_options_and_compile_io_fail_cleanly(self):
+        info = self.call("/api/rough-cut/prompt", {"brief": "Original", "target_seconds": 30})
+        self.assertIn(info["export_id"], info["prompt"])
+        altered = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS),
+                                                      "brief": "Changed", "target_seconds": 30})
+        self.assertTrue(altered["stale"])
+        with patch("autoclipper.resolve_manifest.compile_edit_plan", side_effect=OSError("probe unavailable")):
+            failed = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS),
+                                                       "brief": "Original", "target_seconds": 30}, expect=409)
+        self.assertIn("Could not compile", failed["error"])
+        self.assertFalse((self.folder / "autoclipper_exports" / "rough-cuts").exists())
+
+    def test_nonfinite_review_range_returns_clean_prompt_and_import(self):
+        self.app.session.reviews["claude-01"].approved_end = float("inf")
+        info = self.call("/api/rough-cut/prompt", {})
+        self.assertNotIn("claude-01 [keep]", info["prompt"])
+        rejected = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})
+        self.assertFalse(rejected["ok"])
+        self.assertIn("has no timed range", "\n".join(rejected["errors"]))
 
 
 if __name__ == "__main__":

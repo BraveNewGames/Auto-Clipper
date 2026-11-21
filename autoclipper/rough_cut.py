@@ -19,6 +19,7 @@ import sys
 from datetime import datetime, timezone
 from fractions import Fraction
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -141,8 +142,20 @@ def _intervals(spans, test):
 def _suggestion_range(session, suggestion):
     review = session.reviews.get(suggestion.suggestion_id)
     if review and review.approved_start is not None and review.approved_end is not None:
-        return review.approved_start, review.approved_end, review.status
-    return suggestion.start, suggestion.end, review.status if review else None
+        start, end = review.approved_start, review.approved_end
+    else:
+        start, end = suggestion.start, suggestion.end
+    status = review.status if review else None
+    if not (type(start) in (int, float) and type(end) in (int, float)
+            and isfinite(start) and isfinite(end) and end > start):
+        return None, None, status
+    return start, end, status
+
+
+def prompt_export_id(context, *, brief="", target_seconds=None):
+    """Bind one answer to both the verified session and the prompt options."""
+    return "rc-" + _digest({"session": context["session_export_id"],
+                            "brief": _clean_brief(brief), "target_seconds": _target(target_seconds)})[:16]
 
 
 def prepare(session, *, transcripts_dir=None, confirmations=None, fps=DEFAULT_FPS):
@@ -157,12 +170,15 @@ def prepare(session, *, transcripts_dir=None, confirmations=None, fps=DEFAULT_FP
     identity = {"schema": SCHEMA, "session_id": session.session_id, "fps": fps,
                 "session_sha256": session_digest, "transcript_sha256": transcript_digest,
                 "source_mapping_digest": mapping["source_mapping_digest"]}
-    return {
-        **identity, "export_id": "rc-" + _digest(identity)[:16],
+    base_id = "rc-" + _digest(identity)[:16]
+    context = {
+        **identity, "session_export_id": base_id,
         "session": session, "lines": lines, "line_index": {p.packet_id: p for p in lines},
         "mapping": mapping, "coverage": coverage, "first": first, "end": end, "spans": spans,
         "transcripts_dir": transcripts_dir, "confirmations": confirmations,
     }
+    context["export_id"] = prompt_export_id(context)
+    return context
 
 
 def excluded_parts(context):
@@ -191,7 +207,7 @@ def _suggestions_text(session):
     rows = []
     for suggestion in session.suggestions:
         start, end, status = _suggestion_range(session, suggestion)
-        if not (end > start):
+        if start is None:
             continue
         reviewer = suggestion.reviewer_name or suggestion.reviewer
         rows.append(f"- {suggestion.suggestion_id} [{status or 'unreviewed'}] {fmt_ts(start)}-{fmt_ts(end)} "
@@ -204,7 +220,8 @@ def build_prompt(context, *, brief="", target_seconds=None) -> str:
 
     brief = _clean_brief(brief)
     target = _target(target_seconds)
-    example = json.dumps(_EXAMPLE, indent=1).replace("<EXPORT ID>", context["export_id"])
+    export_id = prompt_export_id(context, brief=brief, target_seconds=target)
+    example = json.dumps(_EXAMPLE, indent=1).replace("<EXPORT ID>", export_id)
     length = f"about {target} seconds of source footage" if target else "about 60-120 seconds of source footage"
     return f"""You are the editor of a ROUGH CUT built from ONE multiplayer playtest session that was recorded
 from several player POVs (cameras). Choose transcript-supported moments from anywhere in the session
@@ -247,7 +264,7 @@ JSON schema: {json.dumps(RESPONSE_JSON_SCHEMA, separators=(",", ":"))}
 
 SESSION
 Session id: {context["session"].session_id}
-EXPORT ID: {context["export_id"]} (copy into "export_id"; it proves the answer matches this session state)
+EXPORT ID: {export_id} (copy into "export_id"; it proves the answer matches this session state and prompt options)
 
 COVERAGE
 {_coverage_text(context)}
@@ -401,7 +418,7 @@ def _validate_clip(context, clip, where, errors):
         suggestion = next((s for s in session.suggestions if s.suggestion_id == sid), None)
         if suggestion is None:
             errors.append(f"{where}: suggestion_id {sid!r} is not in EXISTING SUGGESTIONS.")
-        elif not _suggestion_range(session, suggestion)[1] > _suggestion_range(session, suggestion)[0]:
+        elif _suggestion_range(session, suggestion)[0] is None:
             errors.append(f"{where}: suggestion {sid!r} has no timed range.")
             suggestion = None
     has_lines = any(key in clip for key in ("start_line", "end_line"))
@@ -432,7 +449,8 @@ def _validate_clip(context, clip, where, errors):
                 errors.append(f"{where}: start_line {start} comes after end_line {stop}.")
             else:
                 first = _seconds_to_frame(Fraction(str(lines[start].session_start)) - pads["pad_before"], rate)
-                end = _seconds_to_frame(Fraction(str(lines[stop].session_end)) + pads["pad_after"], rate)
+                end = _seconds_to_frame(Fraction(str(max(lines[start].session_end, lines[stop].session_end)))
+                                        + pads["pad_after"], rate)
     elif has_frames:
         anchor = "frames"
         first, end = clip.get("session_in_frame"), clip.get("session_out_frame")
@@ -492,8 +510,10 @@ def _validate_clip(context, clip, where, errors):
         if line is None:
             errors.append(f"{label}: line {quote.get('line')!r} is not a transcript line id.")
             continue
-        if not isinstance(text, str) or not _normalize_quote(text) or \
-                _normalize_quote(text) not in _normalize_quote(line.text):
+        normalized = _normalize_quote(text) if isinstance(text, str) else ""
+        full_line = _normalize_quote(line.text)
+        if (not normalized or normalized not in full_line or
+                not (len(normalized.split()) >= 3 or len(normalized) >= 12 or normalized == full_line)):
             errors.append(f"{label}: text is not verbatim from {line.packet_id} ({line.text!r}).")
             continue
         if first is not None and end is not None and not (
@@ -510,14 +530,15 @@ def _validate_clip(context, clip, where, errors):
             "_anchor": anchor, "_quotes": cited}
 
 
-def _repair_prompt(context, errors, stale=False):
+def _repair_prompt(context, errors, stale=False, export_id=None):
     if stale:
         return ""
     povs = ", ".join(f'"{pov.pov_id}" ({pov.name})' for pov in context["session"].povs)
     problems = "\n".join(f"{number}. {error}" for number, error in enumerate(errors, 1))
-    return f"""Auto-Clipper rejected your rough-cut JSON for export {context['export_id']}. Nothing was saved.
+    export_id = export_id or context["export_id"]
+    return f"""Auto-Clipper rejected your rough-cut JSON for export {export_id}. Nothing was saved.
 Fix EVERY problem below and return the COMPLETE corrected JSON object only, with "schema": "{SCHEMA}"
-and "export_id": "{context['export_id']}". Keep the clips that had no problems unchanged and in order.
+and "export_id": "{export_id}". Keep the clips that had no problems unchanged and in order.
 
 PROBLEMS
 {problems}
@@ -536,24 +557,25 @@ def validate_response(context, text, *, brief="", target_seconds=None):
     from .resolve_builder import validate_manifest
 
     brief, target = _clean_brief(brief), _target(target_seconds)
+    export_id = prompt_export_id(context, brief=brief, target_seconds=target)
     prompt = build_prompt(context, brief=brief, target_seconds=target)
-    result = {"ok": False, "export_id": context["export_id"], "errors": [], "warnings": [],
+    result = {"ok": False, "export_id": export_id, "errors": [], "warnings": [],
               "stale": False, "repair_prompt": ""}
     errors = result["errors"]
     try:
         data = extract_json(text)
     except ValueError as exc:
         errors.append(str(exc))
-        result["repair_prompt"] = _repair_prompt(context, errors)
+        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
         return result
 
     claimed = data.get("export_id")
     if not isinstance(claimed, str) or not re.fullmatch(r"rc-[0-9a-f]{16}", claimed):
-        errors.append(f"\"export_id\" must be copied exactly from the prompt: \"{context['export_id']}\".")
-    elif claimed != context["export_id"]:
+        errors.append(f"\"export_id\" must be copied exactly from the prompt: \"{export_id}\".")
+    elif claimed != export_id:
         result["stale"] = True
         errors.append(f"The answer is for export {data.get('export_id')!r}, but the session is now at "
-                      f"{context['export_id']}. The session, transcript, mic confirmations or recordings "
+                      f"{export_id}. The session, prompt options, transcript, mic confirmations or recordings "
                       "changed since the prompt was copied (or the answer belongs to another session). "
                       "Copy a new prompt.")
         return result
@@ -599,7 +621,7 @@ def validate_response(context, text, *, brief="", target_seconds=None):
         if total > MAX_TOTAL_SECONDS * fps:
             errors.append(f"The cut is {total / fps:.1f} s; the limit is {MAX_TOTAL_SECONDS} s.")
     if errors:
-        result["repair_prompt"] = _repair_prompt(context, errors)
+        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
         return result
 
     warnings = result["warnings"]
@@ -614,7 +636,7 @@ def validate_response(context, text, *, brief="", target_seconds=None):
 
     response_sha = sha256(text.encode("utf-8")).hexdigest()
     plan = {
-        "plan_id": f"rough-cut-{context['export_id']}", "revision_id": response_sha[:16],
+        "plan_id": f"rough-cut-{export_id}", "revision_id": response_sha[:16],
         "revision_history": [], "session_id": context["session"].session_id, "fps": fps,
         "source_mapping_digest": context["source_mapping_digest"],
         "entries": [{key: value for key, value in entry.items() if not key.startswith("_")} for entry in entries],
@@ -633,16 +655,20 @@ def validate_response(context, text, *, brief="", target_seconds=None):
     unavailable = [s["event_id"] for s in manifest["segments"] if s.get("placeholder_reason") == "source_unavailable"]
     if unavailable:
         errors.append(f"Compile dry run found unavailable footage in {', '.join(dict.fromkeys(unavailable))}.")
-        result["repair_prompt"] = _repair_prompt(context, errors)
+        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
         return result
     reference_gaps = [s["event_id"] for s in manifest["segments"]
                       if s.get("kind") == "media" and s.get("reference_audio") is None]
     if reference_gaps:
         errors.append("No verified GROUP REFERENCE AUDIO mix covers the whole range of "
                       + ", ".join(dict.fromkeys(reference_gaps)) + ". Choose ranges with a verified group mix.")
-        result["repair_prompt"] = _repair_prompt(context, errors)
+        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
         return result
-    # Parts that failed verification only remove their coverage; the plan cannot reference them.
+    # Parts that failed verification only remove their coverage; other blockers remain fatal.
+    if any(not blocker.get("part_id") for blocker in manifest["blockers"]):
+        errors.extend(f"Compile dry run blocked: {blocker['message']}" for blocker in manifest["blockers"]
+                      if not blocker.get("part_id"))
+        return result
     for blocker in manifest["blockers"]:
         manifest["warnings"].append({**blocker, "code": "part_excluded", "excluded_code": blocker["code"],
                                      "message": f"Excluded from coverage: {blocker['message']}"})
@@ -652,7 +678,8 @@ def validate_response(context, text, *, brief="", target_seconds=None):
     if used & {item["part_id"] for item in excluded_parts(context)}:
         errors.append("Compile dry run used an excluded recording part.")
         return result
-    manifest["rough_cut"] = {"schema": SCHEMA, "export_id": context["export_id"], "title": title,
+    manifest["rough_cut"] = {"schema": SCHEMA, "export_id": export_id, "title": title,
+                             "brief": brief, "target_seconds": target,
                              "prompt_sha256": sha256(prompt.encode("utf-8")).hexdigest(),
                              "response_sha256": response_sha}
     try:
@@ -777,9 +804,13 @@ def load_cut(cuts_root, cut_id):
             raise RoughCutError(f"Rough cut {cut_id} is incomplete.")
     manifest_bytes = (folder / "manifest.json").read_bytes()
     record = json.loads((folder / "validation.json").read_text(encoding="utf-8"))
+    if not isinstance(record, dict):
+        raise RoughCutError(f"Rough cut {cut_id} validation record is malformed. Import the answer again.")
     if sha256(manifest_bytes).hexdigest() != record.get("manifest_sha256"):
         raise RoughCutError(f"Rough cut {cut_id} manifest was changed after validation. Import the answer again.")
     manifest = json.loads(manifest_bytes.decode("utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("rough_cut"), dict):
+        raise RoughCutError(f"Rough cut {cut_id} manifest is malformed. Import the answer again.")
     if manifest.get("rough_cut", {}).get("export_id") != record.get("export_id"):
         raise RoughCutError(f"Rough cut {cut_id} records disagree. Import the answer again.")
     return folder, manifest, record

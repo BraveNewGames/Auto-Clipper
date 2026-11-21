@@ -819,7 +819,9 @@ class App:
         mics = self._mic_rows(snap, context["mapping"])
         with self.lock:
             self._unchanged(fingerprint)
-        return {"prompt": prompt, "export_id": context["export_id"], "fps": context["fps"],
+        return {"prompt": prompt, "export_id": rc.prompt_export_id(
+                    context, brief=body.get("brief"), target_seconds=body.get("target_seconds")),
+                "fps": context["fps"],
                 "filename": f"{snap.session_id}_rough_cut_prompt.txt",
                 "excluded": rc.excluded_parts(context), "mics": mics,
                 "povs": [{"pov_id": pov.pov_id, "name": pov.name} for pov in snap.povs]}
@@ -834,6 +836,8 @@ class App:
                                           target_seconds=body.get("target_seconds"))
         except rc.RoughCutError as exc:
             raise ApiError(str(exc))
+        except OSError as exc:
+            raise ApiError(f"Could not compile the rough cut from verified inputs: {exc}", 409)
         out = {key: result[key] for key in ("ok", "export_id", "errors", "warnings", "stale", "repair_prompt")}
         if not result["ok"]:
             return out
@@ -862,7 +866,9 @@ class App:
                 _mod("resolve_builder").validate_manifest(manifest)
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise ApiError(f"Cannot build this rough cut: {exc}", 409)
-            if record.get("export_id") != context["export_id"]:
+            options = manifest.get("rough_cut", {})
+            if record.get("export_id") != rc.prompt_export_id(
+                    context, brief=options.get("brief"), target_seconds=options.get("target_seconds")):
                 raise ApiError("The session, transcript, mic confirmations or recordings changed since this rough "
                                "cut was validated. Copy a new prompt and import a new answer.", 409)
             with self.lock:

@@ -1093,7 +1093,7 @@ function fillRough(box) {
   answer.addEventListener("input", () => { rc.answer = answer.value; });
   appendAll(box,
     info ? h("div", { class: "muted small" }, "Export ID ", h("span", { class: "mono" }, info.export_id),
-      ". Answers are accepted only for this session state; editing the session or confirming a mic needs a new prompt.") : null,
+      ". Answers are accepted only for this session state and brief/target; changing any of these needs a new prompt.") : null,
     info && info.excluded.length ? h("div", null, h("b", { class: "warn-text small" }, "Recordings left out of the prompt (unverified):"),
       issueList(info.excluded, "warn-text")) : null,
     info && info.mics.length ? h("div", null, h("h3", null, "Microphones to confirm"),
