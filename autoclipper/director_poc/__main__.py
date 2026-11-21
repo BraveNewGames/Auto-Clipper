@@ -8,10 +8,11 @@ from pathlib import Path
 from shutil import copyfile
 from tempfile import gettempdir, mkdtemp
 
-from ..resolve_builder import DIRECTOR_TEST_PREFIX, START_TIMECODE, build_export, validate_manifest
+from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
 from ..resolve_manifest import build_review_manifest
 from ..store import _write_json, load_session
-from .core import Clock, NoteStore, connect_review, tc_frame
+from .core import NoteStore, connect_review
+from .receipt import validate_review_receipt
 
 
 def read(path):
@@ -54,29 +55,13 @@ def prepare(args):
 
 
 def verified_review_origin(manifest, built):
-    """Use reopened builder readback for a rebased review; legacy reviews must map to zero."""
-    bounds = manifest.get("review_session_frames")
-    if (manifest.get("mode") == "director_review" or built.get("mode") == "director_review"
-            or bounds is not None or built.get("review_session_frames") is not None):
-        if (manifest.get("mode") != "director_review" or built.get("mode") != "director_review"
-                or built.get("reopened") is not True
-                or not isinstance(bounds, list) or len(bounds) != 2
-                or any(type(frame) is not int for frame in bounds)
-                or bounds[0] >= bounds[1] or bounds != built.get("review_session_frames")):
-            raise ValueError("Review session origin is missing or disagrees with the verified build")
-        validate_manifest(manifest)
-        return bounds[0]
-    fps = manifest["fps"]
-    clock = Clock(manifest, START_TIMECODE, tc_frame(START_TIMECODE, fps))
-    if not clock.segments or any(record != session for record, session, _ in
-                                 (clock.intervals(segment) for segment in clock.segments)):
-        raise ValueError("Legacy review has no verified session origin")
-    return 0
+    return validate_review_receipt(manifest, built).session_origin
 
 
 def initialize_fkb(scratch, source, manifest, built):
     from ..fkb import FKBStore
 
+    binding = validate_review_receipt(manifest, built)
     mappings = {}
     for segment in manifest["segments"]:
         for angle in segment["angles"]:
@@ -87,8 +72,8 @@ def initialize_fkb(scratch, source, manifest, built):
                     raise ValueError("Conflicting assembler microphone mappings")
     store = FKBStore(scratch)
     fps = manifest["fps"]
-    store.ingest(source, fps=fps, timeline_start_frame=tc_frame(START_TIMECODE, fps),
-                 review_session_start_frame=verified_review_origin(manifest, built),
+    store.ingest(source, fps=fps, timeline_start_frame=binding.start_frame,
+                 review_session_start_frame=binding.session_origin,
                  project_id=built["project_id"], timeline_id=built["timeline_id"],
                  audio_by_part=mappings)
     return store.path
@@ -134,14 +119,21 @@ def main():
         print(f"Reopened {name} / {result['timeline']}")
         return
 
+    try:
+        built = read(result_path)
+        if args.command == "companion":
+            binding = validate_review_receipt(manifest, built)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        parser.error(f"Cannot verify the scratch review build receipt. Keep manifest.json and build.json from "
+                     f"the same new disposable build. {exc}")
+
     if args.command == "index-notes":
         source = load_session(temp_copy(args.session))
-        print(initialize_fkb(scratch, source, manifest, read(result_path)))
+        print(initialize_fkb(scratch, source, manifest, built))
         return
 
     from .window import run_window
 
-    built = read(result_path)
     connect = partial(connect_review, built, manifest, not args.out_exclusive)
     persistent = None
     if args.persistent_notes:
@@ -150,8 +142,10 @@ def main():
 
         store = FKBStore(scratch)
         session = store.load().session
-        if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame) != (
-                built["project_id"], built["timeline_id"], manifest["fps"], verified_review_origin(manifest, built)):
+        if (session.project_id, session.timeline_id, session.fps, session.review_session_start_frame,
+                session.timeline_start_frame) != (
+                built["project_id"], built["timeline_id"], manifest["fps"], binding.session_origin,
+                binding.start_frame):
             parser.error("The scratch FKB is bound to a different timeline or clock")
         persistent = NotesCatalog(store)
     run_window(connect, NoteStore(scratch / "notes.json"), scratch / "playhead.csv",

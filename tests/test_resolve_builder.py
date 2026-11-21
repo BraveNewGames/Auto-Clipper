@@ -69,6 +69,7 @@ def fake_resolve():
         item.GetName.return_value = "synthetic-session"
         item.GetSettings.return_value = {"timelineFrameRate": "60"}
         item.GetStartFrame.return_value = 216000
+        item.GetStartTimecode.return_value = "01:00:00:00"
         item.GetItemListInTrack.side_effect = lambda kind, index: list(state[kind])
         item.GetMarkerCustomData.side_effect = lambda offset: state["markers"][offset]
 

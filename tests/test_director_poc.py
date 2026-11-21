@@ -87,6 +87,7 @@ class DirectorCaptureTests(unittest.TestCase):
         self.marks = {"in": 10, "out": 39}
         self.timeline.GetMarkInOut.return_value = {"video": self.marks}
         self.timeline.GetCurrentTimecode.return_value = "01:00:00:50"
+        self.timeline.GetMarkers.return_value = {}
         self.manifest = manifest(segment(0, 0, 120, "one"))
         self.review = Review(self.api, IDENTITY, self.manifest)
         self.timeline.reset_mock()
@@ -137,18 +138,16 @@ class DirectorCaptureTests(unittest.TestCase):
 
     def test_persistent_catalog_with_mock_resolve(self):
         from autoclipper.director_notes import NotesCatalog, review_payload
-        from autoclipper.director_poc.__main__ import initialize_fkb
-        from autoclipper.fkb import FKBStore
-        from autoclipper.models import Part, POV, Session
+        from autoclipper.fkb import FKBStore, FootageKnowledgeBase, RecordingPart
 
         capture = self.review.capture()
         self.marks.update({"in": 20, "out": 59})
-        self.manifest["segments"][0]["angles"][0]["mic"] = {"transcriber_track": 2}
         with TemporaryDirectory() as folder:
-            source = Session(session_id="synthetic", folder=folder,
-                             povs=[POV("pov", "Player", [Part("one", duration=2)])])
-            initialize_fkb(folder, source, self.manifest, IDENTITY)
             store = FKBStore(folder)
+            store.initialize(FootageKnowledgeBase(FKBSession("synthetic", 60, 216000, "p1", "t1"), recording_parts=[
+                RecordingPart("one", "pov", "Player", None, None, 2, "fixture", 0, "fixture", None,
+                              {"start": 0, "end": 120}, {"start": 0, "end": 120}, {"transcriber_track": 2}, True),
+            ]))
             catalog = NotesCatalog(store)
             note = catalog.create(capture, "Observation", playback="paused")
             self.assertEqual(note.frames, {"start": 10, "end": 40})
@@ -204,10 +203,76 @@ class DirectorCaptureTests(unittest.TestCase):
         self.timeline.AddMarker.assert_called_once_with(10, "Blue", "Observation", "", 30,
                                                          note["note_id"])
         marks = {note["note_id"]: {"name": "Renamed in Resolve", "customData": note["note_id"]}}
+        self.timeline.GetMarkers.return_value = {10: {**marks[note["note_id"]], "duration": 30}}
         self.timeline.GetMarkerByCustomData.side_effect = marks.get
-        self.timeline.DeleteMarkerByCustomData.side_effect = lambda key: bool(marks.pop(key))
+        self.timeline.DeleteMarkerByCustomData.side_effect = lambda key: bool(
+            marks.pop(key) and self.timeline.GetMarkers.return_value.pop(10))
         self.assertEqual(self.review.marker(note, "read")["name"], "Renamed in Resolve")
         self.timeline.GetMarkerByCustomData.assert_called_with(note["note_id"])
         self.assertIsNone(self.review.marker(note, "delete"))
         self.timeline.DeleteMarkerByCustomData.assert_called_once_with(note["note_id"])
         self.assertEqual(marker_readback(self.review.marker(note, "read")), "No marker found for this note.")
+
+    def test_retimed_marker_is_idempotent_stale_and_deletable_by_uuid(self):
+        with TemporaryDirectory() as directory:
+            store = NoteStore(Path(directory) / "notes.json")
+            note = store.add(self.review.capture(), "Same title")
+            self.marks.update({"in": 70, "out": 99})
+            other = store.add(self.review.capture(), "Same title")
+        markers = {}
+        self.timeline.GetMarkers.side_effect = lambda: dict(markers)
+
+        def add(frame, color, name, text, duration, uuid):
+            markers[frame] = {"name": name, "duration": duration, "customData": uuid}
+            return True
+
+        def first_match(uuid):
+            return next((frame for frame, marker in markers.items() if marker["customData"] == uuid), None)
+
+        def delete(uuid):
+            frame = first_match(uuid)
+            return markers.pop(frame, None) is not None
+
+        self.timeline.AddMarker.side_effect = add
+        self.timeline.GetMarkerByCustomData.side_effect = lambda uuid: markers.get(first_match(uuid))
+        self.timeline.DeleteMarkerByCustomData.side_effect = delete
+        self.review.marker(note, "add")
+        self.review.marker(note, "add")
+        self.timeline.AddMarker.assert_called_once()
+        self.review.marker(other, "add")
+        self.assertEqual(markers[10]["name"], markers[70]["name"])
+        self.assertNotEqual(markers[10]["customData"], markers[70]["customData"])
+        self.assertEqual(self.review.marker(other, "read")["customData"], other["note_id"])
+        self.timeline.GetCurrentTimecode.return_value = "01:00:01:10"
+        self.assertEqual(self.review.jump(other), "Target 01:00:01:10, read back 01:00:01:10")
+        self.timeline.SetCurrentTimecode.reset_mock()
+        retimed = {**note, "session_in": 20, "session_out_exclusive": 50}
+        for operation in ("add", "read"):
+            with self.assertRaisesRegex(ValueError, "stale"):
+                self.review.marker(retimed, operation)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.review.jump(retimed)
+        self.timeline.SetCurrentTimecode.assert_not_called()
+        self.assertEqual(set(markers), {10, 70})
+        self.review.marker(retimed, "delete")
+        self.timeline.DeleteMarkerByCustomData.assert_called_once_with(note["note_id"])
+        self.assertIsNone(self.review.marker(retimed, "read"))
+        self.timeline.GetCurrentTimecode.return_value = "01:00:00:20"
+        self.assertEqual(self.review.jump(retimed), "Target 01:00:00:20, read back 01:00:00:20")
+        self.review.marker(retimed, "add")
+        self.assertEqual(set(markers), {20, 70})
+
+    def test_duplicate_marker_uuid_refuses_first_match_operations(self):
+        with TemporaryDirectory() as directory:
+            note = NoteStore(Path(directory) / "notes.json").add(self.review.capture(), "Observation")
+        row = {"name": "Observation", "duration": 30, "customData": note["note_id"]}
+        self.timeline.GetMarkers.return_value = {10: row, 50: {**row, "name": "Renamed duplicate"}}
+        self.timeline.GetMarkerByCustomData.return_value = row
+        for operation in ("add", "read", "delete"):
+            with self.subTest(operation=operation), self.assertRaisesRegex(ValueError, "Multiple markers"):
+                self.review.marker(note, operation)
+        with self.assertRaisesRegex(ValueError, "Multiple markers"):
+            self.review.jump(note)
+        self.timeline.GetMarkerByCustomData.assert_not_called()
+        self.timeline.DeleteMarkerByCustomData.assert_not_called()
+        self.timeline.SetCurrentTimecode.assert_not_called()

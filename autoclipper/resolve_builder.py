@@ -484,9 +484,14 @@ def build_export(manifest, *, dry_run=False, project_name=None):
                     "timeline_id": require(timeline.GetUniqueId(), "Missing timeline ID")}
     review = {key: manifest[key] for key in ("mode", "review_session_frames", "uncovered_edges", "edit_plan")
               if key in manifest}
-    return {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity, **review,
-            "sources": list(persisted.values()), "segments": rows,
-            "warnings": warnings, "limitations": limitations}
+    result = {"project": name, "timeline": session, "fps": fps, "reopened": True, **identity, **review,
+              "sources": list(persisted.values()), "segments": rows,
+              "warnings": warnings, "limitations": limitations}
+    if identity and manifest.get("mode") != "director_edit_plan":
+        from .director_poc.receipt import record_review_receipt
+
+        record_review_receipt(manifest, result, timeline)
+    return result
 
 
 def main(argv=None):

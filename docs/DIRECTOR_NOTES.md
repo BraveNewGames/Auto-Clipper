@@ -12,9 +12,11 @@ Pre-roll evidence may have negative frames. Every interval includes In and
 excludes Out. Resolve timeline start is a separate absolute frame origin.
 The persistent catalog checks both endpoints by adding the verified review
 session origin to the timeline-relative marks. The coverage manifest and
-reopened builder readback must agree before a clipped review can initialize
-or open a persistent catalog. Older snapshots default to zero, and legacy
-review manifests must map to zero across the timeline. Imported transcript
+reopened builder receipt must match in identity, timing and coverage before
+either companion mode connects. A legacy review manifest requires a verified
+new build receipt and a zero-origin mapping. Rebuild into a new disposable
+project if the matching receipt is unavailable. Older catalog snapshots
+default to zero. Imported transcript
 ranges round outward, while media coverage includes full frames
 only. Unknown-duration and offline parts supply no confirmed coverage.
 Separate part intervals retain gaps and overlaps. Assembler microphone
@@ -56,8 +58,11 @@ note or starts a new note. **New capture** always starts a separate note.
 Use **Adjust range** to preview old and new frame boundaries before saving.
 Full text edits, revision restoration and delete/recover operate on the
 selected note. Search matches text, title, tags and overlapping speech.
-Jump and marker operations run only on explicit request. A marker at an
-occupied frame leaves both notes available in the catalog.
+Jump and marker operations run only on explicit request. Adding the same note
+marker again reuses it by UUID. If the note range changes, delete and re-add the
+stale marker to mirror the new range. If Resolve already has duplicate markers
+with the same UUID, remove the duplicates in Resolve before retrying. A marker
+at an occupied frame leaves both notes available in the catalog.
 
 The companion saves text before running deterministic local title/tag
 generation in the background. `MetadataProvider` supports injection for
