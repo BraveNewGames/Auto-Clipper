@@ -348,17 +348,45 @@ class ResolveManifestTests(unittest.TestCase):
         part_id = self.add_part("Alpha", inferred=True)
         self.select("pick", "EV-01", 1, 2)
         save_session(self.session)
-        output = self.root / "output"
         confirmations = self.folder / ".autoclipper" / "mic_confirmations.json"
-        args = [str(self.folder), "--out", str(output), "--confirm-mic", part_id, "2", "Alpha"]
+        export_root = self.folder / "autoclipper_exports" / "resolve"
+        args = [str(self.folder), "--confirm-mic", part_id, "2", "Alpha"]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main([*args, "--dry-run"]), 0)
-            self.assertFalse(output.exists())
+            self.assertFalse(export_root.exists())
             self.assertFalse(confirmations.exists())
             self.assertEqual(main(args), 0)
         self.assertTrue(confirmations.is_file())
+        output, = export_root.iterdir()
         self.assertTrue((output / "manifest.json").is_file())
         self.assertTrue((output / "report.md").is_file())
+
+    def test_director_cli_requires_separate_scratch_output_and_keeps_confirmations_there(self):
+        part_id = self.add_part("Alpha", inferred=True)
+        save_session(self.session)
+        source_files = sorted(self.folder.rglob("*"))
+        scratch_root = self.root / "temp"
+        output = scratch_root / "director"
+        args = [str(self.folder), "--full-session", "--transcripts", str(self.transcripts),
+                "--confirm-mic", part_id, "2", "Alpha"]
+        with (contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors,
+              patch("autoclipper.resolve_manifest.gettempdir", return_value=str(scratch_root))):
+            for destination in ([], ["--out", str(self.folder / "output")],
+                                ["--out", str(self.root / "elsewhere")]):
+                with self.subTest(destination=destination), self.assertRaises(SystemExit) as raised:
+                    main([*args, *destination])
+                self.assertEqual(raised.exception.code, 2)
+            self.assertIn("requires an explicit --out", errors.getvalue())
+            self.assertIn("separate from the source session", errors.getvalue())
+            self.assertEqual(sorted(self.folder.rglob("*")), source_files)
+            self.assertEqual(main([*args, "--dry-run"]), 0)
+            self.assertFalse(scratch_root.exists())
+            self.assertEqual(main([*args, "--out", str(output)]), 0)
+        confirmations = json.loads((output / "mic_confirmations.json").read_text(encoding="utf-8"))
+        self.assertEqual(confirmations["confirmations"][0]["part_id"], part_id)
+        self.assertTrue((output / "manifest.json").is_file())
+        self.assertTrue((output / "report.md").is_file())
+        self.assertEqual(sorted(self.folder.rglob("*")), source_files)
 
 
 class MP4InventoryTests(unittest.TestCase):

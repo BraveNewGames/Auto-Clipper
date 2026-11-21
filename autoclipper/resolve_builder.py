@@ -131,9 +131,36 @@ def marker_data(segment):
     return base
 
 
-def project_is_active(manager, project, name):
+def project_is_active(manager, project, name, *, project_id=None):
     current = manager.GetCurrentProject()
-    return bool(current and current.GetName() == name and current.GetUniqueId() == project.GetUniqueId())
+    return bool(current and current.GetName() == name
+                and current.GetUniqueId() == (project_id if project_id is not None else project.GetUniqueId()))
+
+
+def require_director_project_manager(manager):
+    names = manager.GetProjectListInCurrentFolder()
+    require(names is not None, "Could not enumerate projects in the current folder")
+    current = manager.GetCurrentProject()
+    if current:
+        name = current.GetName()
+        require(name == "Untitled Project" and name.casefold() not in {n.casefold() for n in names},
+                "Director requires Project Manager. Save and close the active project first.")
+        pool = current.GetMediaPool()
+        root = pool.GetRootFolder() if pool else None
+        require(current.GetTimelineCount() == 0 and root and root.GetClipList() == []
+                and root.GetSubFolderList() == [],
+                "Director requires Project Manager or its empty default Untitled Project.")
+        project_id = require(current.GetUniqueId(), "Missing default project ID")
+        require(project_is_active(manager, current, name, project_id=project_id),
+                "Director project context changed before the project-manager operation")
+    return names
+
+
+def create_director_project(manager, name):
+    media_dir = mkdtemp(prefix="autoclipper-export-media-")
+    names = require_director_project_manager(manager)
+    require(name.casefold() not in {n.casefold() for n in names}, f"Export project already exists: {name}")
+    return require(manager.CreateProject(name, media_dir), "Resolve refused to create an export project")
 
 
 def create_export_project(manager, name):
@@ -428,7 +455,17 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     manager = require(resolve.GetProjectManager(), "Resolve project manager is unavailable")
     session = manifest["session_id"]
     name = project_name or f"{EXPORT_PREFIX}{session} {datetime.now():%Y%m%d-%H%M%S}"
-    project = create_export_project(manager, name)
+    director = (manifest.get("mode") in {"director_review", "director_edit_plan"}
+                or name.startswith(DIRECTOR_TEST_PREFIX))
+    project_id = None
+    if director:
+        project = create_director_project(manager, name)
+        project_id = require(project.GetUniqueId(), "Missing new Director project ID")
+        require(project_is_active(manager, project, name, project_id=project_id),
+                "New Director project is not active")
+        require(project.GetTimelineCount() == 0, "New Director project already contains timelines")
+    else:
+        project = create_export_project(manager, name)
     fps = manifest["fps"]
     require(project.SetSettings({"timelineFrameRate": str(fps)}), "Could not set export frame rate")
     pool = require(project.GetMediaPool(), "Export media pool is unavailable")
@@ -443,12 +480,16 @@ def build_export(manifest, *, dry_run=False, project_name=None):
         elif segment.get("kind") == "placeholder":
             build_placeholder(project, pool, timeline, segment, slates[segment["segment_id"]])
     read_export(timeline, segments, names, slates)
-    require(project_is_active(manager, project, name), "Export project is no longer active")
+    require(project_is_active(manager, project, name, project_id=project_id), "Export project is no longer active")
     require(manager.SaveProject(), f"Could not save {name}")
-    require(project_is_active(manager, project, name), "Export project changed before reload")
+    require(project_is_active(manager, project, name, project_id=project_id), "Export project changed before reload")
     require(manager.CloseProject(project), f"Saved {name}, but could not close it for verification")
+    if director:
+        require_director_project_manager(manager)
     reopened = require(manager.LoadProject(name), f"Saved {name}, but could not reopen it for verification")
-    require(project_is_active(manager, reopened, name), "Reopened export is not active")
+    if director:
+        require(reopened.GetUniqueId() == project_id, "Reopened Director project ID differs")
+    require(project_is_active(manager, reopened, name, project_id=project_id), "Reopened export is not active")
     require(reopened.GetTimelineCount() == 1, "Reopened project must contain exactly one timeline")
     timeline = require(reopened.GetTimelineByIndex(1), "Reopened project has no timeline")
     require(timeline.GetName() == session and Fraction(timeline.GetSettings()["timelineFrameRate"]) == fps,
