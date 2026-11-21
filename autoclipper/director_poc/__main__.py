@@ -5,11 +5,11 @@ from datetime import datetime
 from functools import partial
 import json
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, copytree
 from tempfile import gettempdir, mkdtemp
 
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
-from ..resolve_manifest import build_review_manifest, catalog_source_identity
+from ..resolve_manifest import build_review_manifest, catalog_source_identity, pinned_input_digest
 from ..store import _write_json, load_session
 from .core import NoteStore, connect_review
 from .receipt import validate_review_receipt
@@ -36,6 +36,16 @@ def prepare(args):
     metadata = temp_copy(args.metadata) if args.metadata else None
     scratch = Path(mkdtemp(prefix="autoclipper-director-a-"))
     copyfile(source, scratch / "session.json")
+    pinned_confirmations = scratch / "mic_confirmations.json"
+    copyfile(confirmations, pinned_confirmations)
+    pinned_inputs = {"confirmations": {"path": pinned_confirmations.name,
+                                        "sha256": pinned_input_digest(pinned_confirmations)}}
+    if metadata is not None:
+        pinned_input_digest(metadata)  # Reject links and reparse points before copying.
+        pinned_metadata = scratch / "metadata"
+        copytree(metadata, pinned_metadata)
+        pinned_inputs["metadata"] = {"path": pinned_metadata.name,
+                                     "sha256": pinned_input_digest(pinned_metadata)}
     print(f"Scratch directory: {scratch}", flush=True)
     session = load_session(scratch / "session.json")
     catalog_source = catalog_source_identity(session)
@@ -50,11 +60,13 @@ def prepare(args):
         if not path.is_relative_to(root) or not source_path.resolve().is_relative_to(root):
             raise ValueError("A recording path lies outside the approved media root")
         part.video_path = str(path)
-    confirmed = read(confirmations)["confirmations"]
+    confirmed = read(pinned_confirmations)["confirmations"]
     session.folder = str(scratch)
     session.session_id = "DirectorA REVIEW"
-    manifest = build_review_manifest(session, transcripts_dir=metadata, confirmations=confirmed, fps=args.fps)
+    manifest = build_review_manifest(session, transcripts_dir=pinned_metadata if metadata else None,
+                                     confirmations=confirmed, fps=args.fps, _isolated_inputs=True)
     manifest["catalog_source"] = catalog_source
+    manifest["pinned_inputs"] = pinned_inputs
     _write_json(scratch / "manifest.json", manifest)
     validate_manifest(manifest)
     print(f"Verified {len(manifest['segments'])} planned segments at {args.fps} fps")

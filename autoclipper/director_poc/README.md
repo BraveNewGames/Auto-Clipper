@@ -141,6 +141,11 @@ edit its clock, coverage digest, or receipt by hand.
 3. If the old zero-origin scratch review is under system temp and still has
    its original manifest, verified build receipt, and matching legacy catalog,
    run the following before creating any catalog in the new scratch directory.
+   Zero-origin alone is insufficient: the old manifest must have no mode, the
+   old catalog must have no mapping digest, and the original receipt, session,
+   and clock must match. Otherwise the CLI reports that the old catalog does
+   not match the receipted legacy review and source session. Keep that catalog
+   as a reference and reselect ranges against a fresh verified catalog.
 
    ```powershell
    python -m autoclipper.director_poc index-notes <new-scratch> <approved-session-copy> --migrate-from <old-scratch>
@@ -150,13 +155,22 @@ edit its clock, coverage digest, or receipt by hand.
    of every note and revision. It preserves note and marker UUIDs, text, revision
    numbers, and history. Captures and playheads are rebound to the new review,
    with original capture metadata kept under `migrated_from`. The old snapshot
-   stays untouched. Existing plans are copied without rebinding. A legacy
-   receipt verifies recorded placement and provides no historical file-identity
-   check.
+   stays untouched. Existing plans are copied without rebinding. A migrated
+   source-backed plan therefore fails compilation with "EditPlan source mapping
+   is unverified" until the operator saves a new selection against the verified
+   catalog. A legacy receipt verifies recorded placement and provides no
+   historical file-identity check.
 4. Open the new companion with `companion <new-scratch> --persistent-notes`.
-   For separate-root edit compilation, use the original approved session copy
-   and the same confirmations and optional metadata used during `prepare`.
-   The verified catalog supplies the pinned media paths.
+   For separate-root edit compilation, use the original approved session copy.
+   The verified catalog supplies pinned media paths and, by default, verified
+   scratch copies of the confirmations and optional metadata from `prepare`.
+   The entire metadata directory is pinned, including every file and relative
+   name; an explicitly passed directory must be identical. Explicit
+   confirmations or metadata must match the pinned hashes. Catalogs created
+   before input pinning require the same confirmations file used at `prepare`
+   to be passed explicitly, plus the metadata directory if one was used.
+   Source-backed compilation never searches the original session folder or
+   its parent for omitted metadata.
 
 If the old receipt is missing or any range cannot be verified, omit
 `--migrate-from` to create a fresh catalog. Keep the old catalog as a reference
