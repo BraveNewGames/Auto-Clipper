@@ -164,9 +164,13 @@ edit its clock, coverage digest, or receipt by hand.
    For separate-root edit compilation, use the original approved session copy.
    The verified catalog supplies pinned media paths and, by default, verified
    scratch copies of the confirmations and optional metadata from `prepare`.
-   Explicit confirmations or metadata must match the pinned hashes. Catalogs
-   created before input pinning require the same confirmations and metadata
-   used at `prepare` to be passed explicitly.
+   The entire metadata directory is pinned, including every file and relative
+   name; an explicitly passed directory must be identical. Explicit
+   confirmations or metadata must match the pinned hashes. Catalogs created
+   before input pinning require the same confirmations file used at `prepare`
+   to be passed explicitly, plus the metadata directory if one was used.
+   Source-backed compilation never searches the original session folder or
+   its parent for omitted metadata.
 
 If the old receipt is missing or any range cannot be verified, omit
 `--migrate-from` to create a fresh catalog. Keep the old catalog as a reference

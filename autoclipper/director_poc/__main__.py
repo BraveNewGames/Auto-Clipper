@@ -41,8 +41,7 @@ def prepare(args):
     pinned_inputs = {"confirmations": {"path": pinned_confirmations.name,
                                         "sha256": pinned_input_digest(pinned_confirmations)}}
     if metadata is not None:
-        if any(path.is_symlink() for path in metadata.rglob("*")):
-            raise ValueError("Approved metadata copies must not contain symlinks")
+        pinned_input_digest(metadata)  # Reject links and reparse points before copying.
         pinned_metadata = scratch / "metadata"
         copytree(metadata, pinned_metadata)
         pinned_inputs["metadata"] = {"path": pinned_metadata.name,

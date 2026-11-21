@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -38,10 +39,12 @@ class DirectorIntegrationTests(unittest.TestCase):
                 store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
                     {"entry_id": "cut", "kind": "candidate", "candidate_id": candidate.candidate_id},
                 ])))
+                confirmations = Path(folder) / "confirmations.json"
+                confirmations.write_text(json.dumps({"confirmations": confirmed_mics(source)}), encoding="utf-8")
 
                 def compile_draft():
                     return compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1",
-                                                 confirmations=confirmed_mics(source))
+                                                 confirmations=confirmations)
 
                 with synthetic_probe(source, 60):
                     segment, = compile_draft()["segments"]
@@ -95,8 +98,10 @@ class DirectorIntegrationTests(unittest.TestCase):
                      "frames": {"start": 0, "end": 120}},
                 ])))
                 db = store.load()
+                confirmation_file = Path(folder) / "confirmations.json"
+                confirmation_file.write_text(json.dumps({"confirmations": confirmations}), encoding="utf-8")
                 draft = compile_fkb_edit_plan(source, db, "draft", revision_id="r1",
-                                              confirmations=confirmations)
+                                              confirmations=confirmation_file)
 
             expected = [(0, 30, ["ada", "bob"]), (30, 60, ["bob"]), (60, 120, ["bob"])]
             for manifest in (review, draft):
@@ -173,9 +178,11 @@ class DirectorIntegrationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 FootageKnowledgeBase.from_dict(malformed)
 
+            confirmation_file = root / "confirmations.json"
+            confirmation_file.write_text(json.dumps({"confirmations": confirmed_mics(source)}), encoding="utf-8")
             with synthetic_probe(source, 60):
                 manifest = compile_fkb_edit_plan(source, saved, "draft", revision_id="r2",
-                                                 confirmations=confirmed_mics(source))
+                                                 confirmations=confirmation_file)
             grounded, placeholder = manifest["segments"]
             self.assertEqual(grounded["candidate_ids"], [ranked[0].candidate_id])
             self.assertEqual(grounded["note_ids"], [first.note_id, second.note_id])

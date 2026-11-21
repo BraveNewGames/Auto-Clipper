@@ -9,7 +9,9 @@ from fractions import Fraction
 from hashlib import sha256
 import json
 from math import floor, isfinite
+import os
 from pathlib import Path
+import stat
 from stat import S_ISREG
 import re
 from tempfile import gettempdir
@@ -478,30 +480,55 @@ def source_mapping_digest(manifest: dict) -> str:
 def pinned_input_digest(path):
     """Hash one file or a directory by sorted relative names and file bytes."""
     path = Path(path)
-    if path.is_symlink():
-        raise ValueError(f"Pinned input is a symlink: {path}")
+
+    def reject_link(item):
+        info = os.lstat(item)
+        if (os.path.islink(item) or
+                getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+            raise ValueError(f"Pinned input contains a link or reparse point: {item}")
+
+    reject_link(path)
+
+    def hash_file(file, digest):
+        with file.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+
     if path.is_file():
-        return sha256(path.read_bytes()).hexdigest()
+        digest = sha256()
+        hash_file(path, digest)
+        return digest.hexdigest()
     if not path.is_dir():
         raise ValueError(f"Pinned input is missing: {path}")
     digest = sha256()
-    for file in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
-        if file.is_symlink():
-            raise ValueError(f"Pinned metadata contains a symlink: {file}")
-        if file.is_dir():
-            continue
-        if not file.is_file():
-            raise ValueError(f"Pinned metadata contains an unsupported file: {file}")
+    files = []
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                item = Path(entry.path)
+                reject_link(item)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(item)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append(item)
+                else:
+                    raise ValueError(f"Pinned metadata contains an unsupported file: {item}")
+    for file in sorted(files, key=lambda item: item.relative_to(path).as_posix()):
         name = file.relative_to(path).as_posix().encode("utf-8")
-        content = file.read_bytes()
         digest.update(len(name).to_bytes(8, "big"))
         digest.update(name)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
+        size = file.stat().st_size
+        digest.update(size.to_bytes(8, "big"))
+        hash_file(file, digest)
     return digest.hexdigest()
 
 
-def _verified_pinned_input(root, record, supplied, label):
+def _verified_pinned_input(root, record, supplied, label, *, directory=False):
+    if supplied is not None and not isinstance(supplied, (str, Path)):
+        kind = "metadata directory" if directory else "confirmations file"
+        raise ValueError(f"Pass a {kind} path matching the input used at prepare.")
     try:
         relative = Path(record["path"])
         expected = record["sha256"]
@@ -511,10 +538,16 @@ def _verified_pinned_input(root, record, supplied, label):
         pinned = root / relative
         if not pinned.resolve().is_relative_to(root.resolve()):
             raise ValueError("pinned input leaves scratch directory")
+        if not (pinned.is_dir() if directory else pinned.is_file()):
+            raise ValueError("pinned copy is missing or has the wrong type")
         if pinned_input_digest(pinned) != expected:
             raise ValueError("pinned copy changed")
-        if supplied is not None and pinned_input_digest(supplied) != expected:
-            raise ValueError("explicit input differs from prepared copy")
+        if supplied is not None:
+            supplied = Path(supplied)
+            if not (supplied.is_dir() if directory else supplied.is_file()):
+                raise ValueError("explicit input is missing or has the wrong type")
+            if pinned_input_digest(supplied) != expected:
+                raise ValueError("explicit input differs from prepared copy")
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} does not match the prepared input ({exc}). "
                          "Restore the scratch copy or pass the same verified input used at prepare.") from exc
@@ -858,12 +891,16 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
         if resolution["catalog_source"] != catalog_source_identity(session):
             raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
         pinned = getattr(knowledge_base, "pinned_inputs", None)
+        isolated_inputs = True
         if pinned is None:
-            if confirmations is None and transcripts_dir is None:
+            if (confirmations is None or not isinstance(confirmations, (str, Path))
+                    or not Path(confirmations).is_file()):
                 raise ValueError("This older source-backed catalog has no pinned inputs. Pass the same "
-                                 "confirmations and metadata used at prepare explicitly.")
+                                 "confirmations file used at prepare explicitly, and metadata directory if used.")
+            if transcripts_dir is not None and (not isinstance(transcripts_dir, (str, Path))
+                                                or not Path(transcripts_dir).is_dir()):
+                raise ValueError("Pass the same metadata directory used at prepare, or omit it if none was used.")
         else:
-            isolated_inputs = True
             scratch = getattr(knowledge_base, "_scratch_dir", None)
             if scratch is None:
                 raise ValueError("Load the pinned catalog from its scratch FKB before compiling.")
@@ -872,11 +909,9 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
                 scratch, pinned["confirmations"], confirmations, "Mic confirmations")
             if "metadata" in pinned:
                 transcripts_dir = _verified_pinned_input(
-                    scratch, pinned["metadata"], transcripts_dir, "Metadata")
+                    scratch, pinned["metadata"], transcripts_dir, "Metadata", directory=True)
             elif transcripts_dir is not None:
                 raise ValueError("No metadata was pinned at prepare; omit transcripts_dir.")
-            else:
-                transcripts_dir = scratch / "_empty_metadata"
         paths = resolution["paths"]
         session = replace(session, povs=[
             replace(pov, parts=[replace(part, video_path=paths[part.part_id]) for part in pov.parts])

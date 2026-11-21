@@ -269,12 +269,14 @@ class FKBStore:
                                           or data.source_mapping_digest != incoming.source_mapping_digest)
                     if not data.mapping_stale:
                         data.source_resolution = incoming.source_resolution
+                        data.pinned_inputs = incoming.pinned_inputs
                     return
                 data.recording_parts = incoming.recording_parts
                 data.transcript_spans = incoming.transcript_spans
                 data.session.source_manifest = incoming.session.source_manifest
                 data.source_mapping_digest = incoming.source_mapping_digest
                 data.source_resolution = incoming.source_resolution
+                data.pinned_inputs = incoming.pinned_inputs
                 data.mapping_stale = False
 
             self.update(refresh)

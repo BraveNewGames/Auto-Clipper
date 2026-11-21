@@ -2,13 +2,38 @@
 import unittest
 from pathlib import Path
 
-from autoclipper.fkb import FKBStore, FrameRange, Session as FKBSession
+from autoclipper.fkb import EditPlan, FKBStore, FrameRange, Session as FKBSession
 from autoclipper.models import Part, POV, Session
 from autoclipper.store import save_session
 from director_fixtures import verified_review
 
 
 class FKBTest(unittest.TestCase):
+    def test_refresh_keeps_pinned_inputs_with_source_resolution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "camera.mp4").touch()
+            source = Session(session_id="test", folder=folder, povs=[
+                POV("ada", "Ada", [Part("part", video_path="camera.mp4", duration=1)])])
+            store = FKBStore(folder)
+
+            def manifest(name):
+                review = verified_review(source, 24)
+                review["pinned_inputs"] = {"confirmations": {"path": name, "sha256": "a" * 64}}
+                return review
+
+            store.ingest(source, fps=24, review_manifest=manifest("first.json"))
+            store.ingest(source, fps=24, review_manifest=manifest("second.json"))
+            self.assertEqual(store.load().pinned_inputs["confirmations"]["path"], "second.json")
+            store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                {"entry_id": "cut", "kind": "source", "title": "Cut", "frames": {"start": 0, "end": 5}},
+            ])))
+            store.ingest(source, fps=24, review_manifest=manifest("third.json"))
+            refreshed = store.load()
+            self.assertFalse(refreshed.mapping_stale)
+            self.assertEqual(refreshed.pinned_inputs["confirmations"]["path"], "third.json")
+            self.assertIsNotNone(refreshed.source_resolution)
+
     def test_ingest_and_refresh(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

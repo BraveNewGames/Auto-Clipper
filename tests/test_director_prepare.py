@@ -1,9 +1,11 @@
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
 from dataclasses import asdict, replace
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -16,6 +18,7 @@ from autoclipper.fkb import DirectorNote, EditPlan, FKBStore
 from autoclipper.models import Part, POV, Session
 from autoclipper.resolve_builder import build_export
 from autoclipper.resolve_manifest import compile_fkb_edit_plan
+from autoclipper import resolve_manifest
 from autoclipper.store import load_session
 
 from test_resolve_builder import fake_resolve
@@ -23,6 +26,132 @@ from director_fixtures import confirmed_mics, synthetic_probe, verified_review
 
 
 class DirectorPrepareTests(unittest.TestCase):
+    @contextmanager
+    def source_bound_fixture(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "original"
+            original.mkdir()
+            media = root / "media"
+            media.mkdir()
+            (media / "angle.mp4").write_bytes(b"synthetic fixture")
+            source = Session(session_id="source", folder=str(original), povs=[
+                POV("ada", "Ada", [Part("angle", video_path="angle.mp4", duration=1)])])
+            source_path = root / "session.json"
+            source_path.write_text(json.dumps(source.to_dict()), encoding="utf-8")
+            confirmations = root / "confirmations.json"
+            confirmations.write_text(json.dumps({"confirmations": confirmed_mics(source)}), encoding="utf-8")
+            original_metadata = original / "_Transcripts"
+            original_metadata.mkdir()
+            (original_metadata / "angle.json").write_text(
+                json.dumps({"speaker_tracks": {"audio_track_1": "Ada"}}), encoding="utf-8")
+            original_confirmations = original / ".autoclipper" / "mic_confirmations.json"
+            original_confirmations.parent.mkdir()
+            original_confirmations.write_text(json.dumps({"confirmations": []}), encoding="utf-8")
+            scratch = root / "autoclipper-director-a-test"
+            scratch.mkdir()
+            with (patch.object(sys, "argv", ["director", "prepare", str(source_path),
+                                             str(confirmations), str(media)]),
+                  patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(scratch)),
+                  synthetic_probe(source, 60), redirect_stdout(io.StringIO())):
+                main()
+            manifest = json.loads((scratch / "manifest.json").read_text(encoding="utf-8"))
+            store = FKBStore(scratch)
+            with synthetic_probe(source, 60):
+                store.ingest(source, fps=60, review_manifest=manifest)
+            store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                {"entry_id": "cut", "kind": "source", "title": "Cut", "frames": {"start": 0, "end": 5}},
+            ])))
+            yield source, store, scratch, confirmations, original_metadata
+
+    def test_pinned_without_metadata_ignores_all_unpinned_transcript_roots(self):
+        with self.source_bound_fixture() as (source, store, scratch, _, _):
+            unpinned = scratch / "_empty_metadata"
+            unpinned.mkdir()
+            (unpinned / "angle.json").write_text(
+                json.dumps({"speaker_tracks": {"audio_track_1": "Ada"}}), encoding="utf-8")
+            with (synthetic_probe(source, 60),
+                  patch("autoclipper.resolve_manifest._metadata", wraps=resolve_manifest._metadata) as lookup):
+                edit = compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1")
+            self.assertTrue(lookup.called)
+            self.assertTrue(all(call.args[0] == [] for call in lookup.call_args_list))
+            self.assertEqual(edit["segments"][0]["angles"][0]["mic"]["expected_owner_track"], 2)
+
+    def test_pinned_without_metadata_refuses_explicit_metadata(self):
+        with self.source_bound_fixture() as (source, store, _, _, original_metadata):
+            with self.assertRaisesRegex(ValueError, "No metadata was pinned at prepare"):
+                compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1",
+                                      transcripts_dir=original_metadata)
+
+    def test_legacy_source_catalog_requires_confirmations_and_isolates_metadata(self):
+        with self.source_bound_fixture() as (source, store, _, confirmations, original_metadata):
+            legacy = store.load()
+            legacy.pinned_inputs = None
+            with self.assertRaisesRegex(ValueError, "Pass the same confirmations file"):
+                compile_fkb_edit_plan(source, legacy, "draft", revision_id="r1",
+                                      transcripts_dir=original_metadata)
+            with self.assertRaisesRegex(ValueError, "Pass the same confirmations file"):
+                compile_fkb_edit_plan(source, legacy, "draft", revision_id="r1")
+            with (synthetic_probe(source, 60),
+                  patch("autoclipper.resolve_manifest._metadata", wraps=resolve_manifest._metadata) as lookup):
+                edit = compile_fkb_edit_plan(source, legacy, "draft", revision_id="r1",
+                                             confirmations=confirmations)
+            self.assertTrue(lookup.called)
+            self.assertTrue(all(call.args[0] == [] for call in lookup.call_args_list))
+            self.assertEqual(edit["segments"][0]["angles"][0]["mic"]["expected_owner_track"], 2)
+
+    def test_pinned_confirmations_missing_or_not_a_file(self):
+        with self.source_bound_fixture() as (source, store, scratch, _, _):
+            pinned = scratch / "mic_confirmations.json"
+            pinned.unlink()
+            with self.assertRaisesRegex(ValueError, "Mic confirmations does not match"):
+                compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1")
+            pinned.mkdir()
+            with self.assertRaisesRegex(ValueError, "wrong type"):
+                compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1")
+
+    def test_pinned_confirmations_require_file_path(self):
+        with self.source_bound_fixture() as (source, store, _, _, _):
+            for supplied in ({"confirmations": []}, []):
+                with self.subTest(type=type(supplied).__name__):
+                    with self.assertRaisesRegex(ValueError, "Pass a confirmations file path"):
+                        compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1",
+                                              confirmations=supplied)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows junction test")
+    def test_prepare_refuses_metadata_junction_without_following_it(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "metadata"
+            metadata.mkdir()
+            target = root / "target"
+            target.mkdir()
+            sentinel = target / "keep.json"
+            sentinel.write_text("{}", encoding="utf-8")
+            junction = metadata / "linked"
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                self.skipTest(f"Cannot create test junction: {result.stderr.strip()}")
+            try:
+                source = root / "session.json"
+                source.write_text("{}", encoding="utf-8")
+                confirmations = root / "confirmations.json"
+                confirmations.write_text('{"confirmations": []}', encoding="utf-8")
+                media = root / "media"
+                media.mkdir()
+                scratch = root / "autoclipper-director-a-test"
+                scratch.mkdir()
+                with (patch.object(sys, "argv", ["director", "prepare", str(source),
+                                                 str(confirmations), str(media), "--metadata", str(metadata)]),
+                      patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(scratch))):
+                    with self.assertRaisesRegex(ValueError, "link or reparse point"):
+                        main()
+                self.assertTrue(sentinel.is_file())
+            finally:
+                os.rmdir(junction)
+            self.assertTrue(sentinel.is_file())
+
     def test_migrate_legacy_catalog_preserves_notes_and_validates_each_revision(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -113,9 +242,11 @@ class DirectorPrepareTests(unittest.TestCase):
                 {"entry_id": "cut", "kind": "source", "title": "Migrated",
                  "frames": restored.frames, "note_ids": [restored.note_id]},
             ])))
+            confirmation_file = root / "migration-confirmations.json"
+            confirmation_file.write_text(json.dumps({"confirmations": confirmed_mics(source)}), encoding="utf-8")
             with synthetic_probe(source, 60):
                 edit = compile_fkb_edit_plan(source, new_store.load(), "draft", revision_id="r1",
-                                             confirmations=confirmed_mics(source))
+                                             confirmations=confirmation_file)
             self.assertEqual(edit["segments"][0]["angles"][0]["source_in_frame"], 10)
 
     def test_scratch_prepare_uses_verified_coverage_without_resolve(self):
