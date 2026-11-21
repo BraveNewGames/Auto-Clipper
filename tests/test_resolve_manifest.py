@@ -207,8 +207,13 @@ class ResolveManifestTests(unittest.TestCase):
         plan = SimpleNamespace(plan_id="plan", timeline_id="prior-timeline", revisions=[{"revision_id": "r1"}],
                                entries=[{"entry_id": "cut", "kind": "source", "title": "Grounded cut",
                                          "frames": {"start": 9, "end": 19}, "pov_id": "alpha"}])
-        knowledge = SimpleNamespace(mapping_stale=False, edit_plans=[plan],
+        digest = build_review_manifest(self.session)["source_mapping_digest"]
+        knowledge = SimpleNamespace(mapping_stale=False, edit_plans=[plan], director_notes=[],
+                                    transcript_spans=[], source_mapping_digest=digest,
                                     session=SimpleNamespace(session_id=self.session.session_id, fps=60))
+        with self.assertRaisesRegex(ValueError, "source mapping is unverified"):
+            compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
+        plan.source_mapping_digest = digest
         manifest = compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
         segment, = manifest["segments"]
         self.assertEqual((segment["session_start_frame"], segment["session_end_frame"]), (9, 19))

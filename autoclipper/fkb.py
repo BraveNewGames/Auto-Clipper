@@ -10,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from .models import _Model
 from .reconcile import build_session_transcript
+from .resolve_manifest import catalog_source_identity, source_mapping_digest
 from .store import _write_json
 
 
@@ -74,6 +75,7 @@ class RecordingPart(_Model):
     session_range: dict | None
     audio_stream_mapping: dict | None
     media_online: bool
+    playable_intervals: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -107,6 +109,7 @@ class DirectorNote(_Model):
     revisions: list[dict] = field(default_factory=list)
     deleted: bool = False
     revision: int = 0
+    source_mapping_digest: str | None = None
 
 
 @dataclass
@@ -123,6 +126,8 @@ class CandidateMoment(_Model):
     run_id: str | None = None
     model_version: str | None = None
     revisions: list[dict] = field(default_factory=list)
+    note_anchor_id: str | None = None
+    note_anchor_revision: int | None = None
 
     def __post_init__(self):
         if not isinstance(self.frames, dict):
@@ -140,6 +145,9 @@ class EditPlan(_Model):
     entries: list[dict]
     timeline_id: str | None = None
     revisions: list[dict] = field(default_factory=list)
+    source_mapping_digest: str | None = None
+    note_revisions: dict[str, int] = field(default_factory=dict)
+    candidate_note_anchors: dict[str, list] = field(default_factory=dict)
 
 
 @dataclass
@@ -152,6 +160,7 @@ class FootageKnowledgeBase(_Model):
     edit_plans: list[EditPlan] = field(default_factory=list)
     mapping_stale: bool = False
     schema_version: int = 1
+    source_mapping_digest: str | None = None
 
     @classmethod
     def from_dict(cls, data):
@@ -168,10 +177,31 @@ class FootageKnowledgeBase(_Model):
         })
 
     def coverage(self, frames):
-        """Return each known covered part separately, preserving gaps and overlaps."""
+        """Return the verified parts with at least one playable frame in the range."""
+        if self.mapping_stale or not self.source_mapping_digest:
+            return []
         return [part for part in self.recording_parts
-                if part.media_online and part.session_range
-                and FrameRange.from_dict(part.session_range).overlaps(frames)]
+                if any(FrameRange(*interval).overlaps(frames)
+                       for interval in part.playable_intervals)]
+
+    def bind_edit_plan(self, plan):
+        """Bind a newly selected plan to this catalog snapshot."""
+        if self.mapping_stale:
+            raise ValueError("Reconcile the stale footage mapping before saving an edit plan.")
+        plan.source_mapping_digest = self.source_mapping_digest
+        refs = {note_id for entry in plan.entries if entry["kind"] != "placeholder"
+                for note_id in entry.get("note_ids", ())}
+        plan.note_revisions = {note.note_id: note.revision for note in self.director_notes
+                               if note.note_id in refs and not note.deleted}
+        candidates = {candidate.candidate_id: candidate for candidate in self.candidate_moments}
+        plan.candidate_note_anchors = {}
+        for entry in plan.entries:
+            if entry["kind"] == "candidate":
+                candidate = candidates.get(entry["candidate_id"])
+                if candidate and candidate.note_anchor_id:
+                    plan.candidate_note_anchors[candidate.candidate_id] = [
+                        candidate.note_anchor_id, candidate.note_anchor_revision]
+        return plan
 
 
 class FKBStore:
@@ -195,7 +225,11 @@ class FKBStore:
         with self._lock:
             data = self.load()
             previous = data.to_dict()
+            existing_plans = {plan.plan_id for plan in data.edit_plans}
             result = change(data)
+            for plan in data.edit_plans:
+                if plan.plan_id not in existing_plans and plan.source_mapping_digest is None:
+                    data.bind_edit_plan(plan)
             current = data.to_dict()
             if current != previous:
                 _write_json(self.backup, previous)
@@ -203,11 +237,12 @@ class FKBStore:
             return result
 
     def ingest(self, source, *, fps, timeline_start_frame=0, review_session_start_frame=0, project_id=None,
-               timeline_id=None, cues_by_part=None, audio_by_part=None):
+               timeline_id=None, cues_by_part=None, audio_by_part=None, review_manifest=None):
         incoming = ingest_session(source, fps=fps, timeline_start_frame=timeline_start_frame,
                                   review_session_start_frame=review_session_start_frame,
                                   project_id=project_id, timeline_id=timeline_id,
-                                  cues_by_part=cues_by_part, audio_by_part=audio_by_part)
+                                  cues_by_part=cues_by_part, audio_by_part=audio_by_part,
+                                  review_manifest=review_manifest)
         with self._lock:
             if not self.path.exists():
                 self.initialize(incoming)
@@ -226,40 +261,51 @@ class FKBStore:
                 if has_references:
                     # Freeze the evidence previously referenced by editorial records.
                     data.mapping_stale = (data.recording_parts != incoming.recording_parts
-                                          or data.transcript_spans != incoming.transcript_spans)
+                                          or data.transcript_spans != incoming.transcript_spans
+                                          or data.source_mapping_digest != incoming.source_mapping_digest)
                     return
                 data.recording_parts = incoming.recording_parts
                 data.transcript_spans = incoming.transcript_spans
                 data.session.source_manifest = incoming.session.source_manifest
+                data.source_mapping_digest = incoming.source_mapping_digest
                 data.mapping_stale = False
 
             self.update(refresh)
 
 
 def ingest_session(source, *, fps, timeline_start_frame=0, review_session_start_frame=0, project_id=None,
-                   timeline_id=None, cues_by_part=None, audio_by_part=None):
+                   timeline_id=None, cues_by_part=None, audio_by_part=None, review_manifest=None):
     if not source.session_id:
         raise ValueError("Auto-Clipper session requires a stable session ID")
     session = Session(source.session_id, fps, timeline_start_frame, project_id, timeline_id,
                       review_session_start_frame=review_session_start_frame)
     parts = []
     by_id = {}
+    mapping_parts = {}
+    digest = None
+    if review_manifest is not None:
+        digest = source_mapping_digest(review_manifest)
+        mapping = review_manifest["source_mapping"]
+        if (digest != review_manifest.get("source_mapping_digest") or mapping["fps"] != fps
+                or review_manifest.get("catalog_source") != catalog_source_identity(source)):
+            raise ValueError("Review source mapping disagrees with this session. Rebuild and reconcile the catalog.")
+        mapping_parts = {row["part_id"]: row for row in mapping["parts"]}
     for pov, part in source.all_parts():
         key = stable_id(source.session_id, "part", pov.pov_id, part.part_id)
         if not part.part_id or part.part_id in by_id:
             raise ValueError("Auto-Clipper recording part IDs must be unique and nonempty")
         by_id[part.part_id] = key, part.srt_path
-        end = part.duration
-        local = session.frames(0, end).to_dict() if end and end > 0 else None
-        # Include full media frames only. Do not claim a partial frame as footage.
-        first = ceil(Fraction(str(part.offset)) * fps)
-        last = floor((Fraction(str(part.offset)) + Fraction(str(end))) * fps) if local else first
-        coverage = FrameRange(first, last).to_dict() if last > first else None
-        online = bool(part.video_path and (Path(source.folder) / part.video_path).is_file())
+        row = mapping_parts.get(part.part_id, {})
+        media = row.get("media")
+        intervals = row.get("playable_intervals", [])
+        local = FrameRange(0, media["source_frame_count"]).to_dict() if media else None
+        placement = row.get("session_start_frame")
+        bounds = FrameRange(placement, placement + local["end"]).to_dict() if local else None
         parts.append(RecordingPart(
-            key, pov.pov_id, pov.name, part.video_path, part.srt_path, end,
+            key, pov.pov_id, pov.name, part.video_path, part.srt_path, part.duration,
             part.duration_source, part.offset, part.offset_source, part.offset_confidence,
-            local, coverage, (audio_by_part or {}).get(part.part_id), online))
+            local, bounds, media["mic"] if media else (audio_by_part or {}).get(part.part_id), bool(media),
+            [list(interval) for interval in intervals]))
     session.source_manifest = [part.part_id for part in parts]
     spans = []
     for line in build_session_transcript(source, cues_by_part):
@@ -273,5 +319,5 @@ def ingest_session(source, *, fps, timeline_start_frame=0, review_session_start_
             stable_id(source.session_id, "span", identity), line.text, line.speaker,
             line.confidence, line.uncertain,
             session.frames(line.session_start, line.session_end).to_dict(), sources))
-    return FootageKnowledgeBase(session, parts, spans)
+    return FootageKnowledgeBase(session, parts, spans, source_mapping_digest=digest)
 

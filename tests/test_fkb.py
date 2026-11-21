@@ -5,6 +5,7 @@ from pathlib import Path
 from autoclipper.fkb import FKBStore, FrameRange, Session as FKBSession
 from autoclipper.models import Part, POV, Session
 from autoclipper.store import save_session
+from director_fixtures import verified_review
 
 
 class FKBTest(unittest.TestCase):
@@ -20,7 +21,7 @@ class FKBTest(unittest.TestCase):
             original = save_session(source)
             before = original.read_bytes()
             store = FKBStore(folder)
-            store.ingest(source, fps=24)
+            store.ingest(source, fps=24, review_manifest=verified_review(source, 24))
             data = store.load()
             span, = data.transcript_spans
             recording, = data.coverage(FrameRange(24, 25))
@@ -28,7 +29,7 @@ class FKBTest(unittest.TestCase):
             self.assertEqual(span.sources[0]["part_id"], recording.part_id)
             self.assertFalse(data.coverage(FrameRange(0, 24)))
             part.offset = 2
-            store.ingest(source, fps=24)
+            store.ingest(source, fps=24, review_manifest=verified_review(source, 24))
             self.assertEqual(store.load().transcript_spans[0].span_id, span.span_id)
             self.assertTrue(store.backup.exists())
             self.assertEqual(original.read_bytes(), before)

@@ -11,6 +11,7 @@ from autoclipper.recommendations import (
     recommend, refresh_recommendations, search_evidence, set_candidate_status,
 )
 from autoclipper.reviews import import_review, session_packet_lines
+from director_fixtures import verified_review
 
 
 class RecommendationTests(unittest.TestCase):
@@ -29,7 +30,8 @@ class RecommendationTests(unittest.TestCase):
                 Part("two", index=2, video_path="two.mp4", duration=6, offset=6),
             ])
         ])
-        self.db = ingest_session(self.source, fps=24, timeline_start_frame=3600)
+        self.db = ingest_session(self.source, fps=24, timeline_start_frame=3600,
+                                 review_manifest=verified_review(self.source, 24))
         self.span, self.piano, self.hallway = self.db.transcript_spans
 
     def enter_temp_folder(self):

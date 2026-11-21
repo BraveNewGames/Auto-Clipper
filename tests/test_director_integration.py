@@ -5,18 +5,114 @@ import unittest
 from unittest.mock import patch
 
 from autoclipper.director_notes import NotesCatalog
-from autoclipper.director_poc.core import Capture
-from autoclipper.fkb import EditPlan, FKBStore, FootageKnowledgeBase, Provenance
+from autoclipper.director_poc.core import Capture, frame_tc
+from autoclipper.fkb import EditPlan, FKBStore, FootageKnowledgeBase, FrameRange, Provenance
 from autoclipper.models import Part, POV, Session
-from autoclipper.recommendations import OfflineProvider, recommend, refresh_recommendations
+from autoclipper.recommendations import OfflineProvider, available_povs, recommend, refresh_recommendations
 from autoclipper.resolve_builder import build_export
-from autoclipper.resolve_manifest import compile_fkb_edit_plan
+from autoclipper.resolve_manifest import build_review_manifest, compile_fkb_edit_plan
 from autoclipper.store import save_session
 
 from test_resolve_builder import fake_resolve
+from director_fixtures import confirmed_mics, synthetic_probe, verified_review
 
 
 class DirectorIntegrationTests(unittest.TestCase):
+    def capture(self, first, end):
+        return Capture("Scratch", "project", "Review", "timeline", first, end,
+                       frame_tc(216000 + first, 60), frame_tc(216000 + end, 60),
+                       first, end, 60, frame_tc(216000 + first, 60), "fixture")
+
+    def test_note_plan_rejects_mapping_drift_and_changed_anchor(self):
+        for change in ("offset", "retime", "delete", "text"):
+            with self.subTest(change=change), TemporaryDirectory() as folder:
+                part = Part("camera", video_path="camera.mp4", duration=10, offset=1)
+                (Path(folder) / part.video_path).touch()
+                source = Session(session_id="stable", folder=folder, povs=[POV("ada", "Ada", [part])])
+                store = FKBStore(folder)
+                store.ingest(source, fps=60, timeline_start_frame=216000, project_id="project",
+                             timeline_id="timeline", review_manifest=verified_review(source, 60))
+                catalog = NotesCatalog(store)
+                note = catalog.create(self.capture(300, 320), "Great reaction", playback="paused")
+                candidate, = store.update(lambda data: recommend(data, "reaction", run_id="notes"))
+                store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                    {"entry_id": "cut", "kind": "candidate", "candidate_id": candidate.candidate_id},
+                ])))
+
+                def compile_draft():
+                    return compile_fkb_edit_plan(source, store.load(), "draft", revision_id="r1",
+                                                 confirmations=confirmed_mics(source))
+
+                with synthetic_probe(source, 60):
+                    segment, = compile_draft()["segments"]
+                    self.assertEqual(segment["angles"][0]["source_in_frame"], 240)
+                    if change == "offset":
+                        part.offset = 2
+                    elif change == "retime":
+                        catalog.apply_range(catalog.preview_range(
+                            note.note_id, self.capture(330, 350), playback="paused"))
+                    elif change == "delete":
+                        catalog.delete(note.note_id)
+                    else:
+                        catalog.edit_text(note.note_id, "New interpretation")
+                    self.assertFalse(store.load().mapping_stale)
+                    message = "source mapping changed" if change == "offset" else "Note anchor changed"
+                    with self.assertRaisesRegex(ValueError, message):
+                        compile_draft()
+                    if change == "retime":
+                        store.update(lambda data: recommend(data, "reaction", run_id="notes"))
+                        with self.assertRaisesRegex(ValueError, "Note anchor selection changed"):
+                            compile_draft()
+                    if change != "offset":
+                        store.update(lambda data: data.edit_plans[0].entries.__setitem__(0, {
+                            "entry_id": "slate", "kind": "placeholder", "title": "Select new footage",
+                            "provisional_frames": 20,
+                        }))
+                        self.assertEqual(compile_draft()["segments"][0]["kind"], "placeholder")
+
+    def test_verified_availability_matches_review_catalog_and_edit(self):
+        with TemporaryDirectory() as folder:
+            source = Session(session_id="parity", folder=folder, povs=[
+                POV("ada", "Ada", [
+                    Part("short", video_path="short.mkv", duration=2, offset=0.005),
+                    Part("overlap", index=2, video_path="overlap.mp4", duration=0.5, offset=0.5),
+                ]),
+                POV("bob", "Bob", [Part("other", video_path="other.mp4", duration=2)]),
+            ])
+            for name in ("short.mp4", "overlap.mp4", "other.mp4"):
+                (Path(folder) / name).touch()
+            with synthetic_probe(source, 60, {"short": 60}):
+                confirmations = confirmed_mics(source)
+                review = build_review_manifest(source, fps=60, confirmations=confirmations)
+                store = FKBStore(folder)
+                store.ingest(source, fps=60, timeline_start_frame=216000, project_id="project",
+                             timeline_id="timeline", review_manifest=review)
+                catalog = NotesCatalog(store)
+                notes = [catalog.create(self.capture(first, end), "Coverage", playback="paused")
+                         for first, end in [(0, 1), (30, 60), (60, 120)]]
+                store.update(lambda data: data.edit_plans.append(EditPlan("draft", [
+                    {"entry_id": "all", "kind": "source", "title": "All footage",
+                     "frames": {"start": 0, "end": 120}},
+                ])))
+                db = store.load()
+                draft = compile_fkb_edit_plan(source, db, "draft", revision_id="r1",
+                                              confirmations=confirmations)
+
+            expected = [(0, 30, ["ada", "bob"]), (30, 60, ["bob"]), (60, 120, ["bob"])]
+            for manifest in (review, draft):
+                self.assertEqual([(row["session_start_frame"], row["session_end_frame"],
+                                   [angle["pov_id"] for angle in row["angles"]])
+                                  for row in manifest["segments"]], expected)
+                self.assertEqual(manifest["segments"][0]["angles"][0]["source_in_frame"], 0)
+            self.assertEqual([note.pov_ids for note in notes], [["ada", "bob"], ["bob"], ["bob"]])
+            self.assertEqual([note.source_mapping_digest for note in notes],
+                             [review["source_mapping_digest"]] * 3)
+            self.assertEqual([(pov, frames) for pov, _, frames in available_povs(db, FrameRange(0, 120))],
+                             [("ada", FrameRange(0, 30)), ("bob", FrameRange(0, 120))])
+            short, overlap, _ = db.recording_parts
+            self.assertEqual(short.source_range, {"start": 0, "end": 60})
+            self.assertEqual(overlap.playable_intervals, [])
+
     def test_offline_director_flow_preserves_provenance_and_sources(self):
         with TemporaryDirectory() as folder, TemporaryDirectory() as build_folder:
             root = Path(folder)
@@ -34,7 +130,8 @@ class DirectorIntegrationTests(unittest.TestCase):
             original = {path: path.read_bytes() for path in (video, captions, source_file)}
             store = FKBStore(root)
             store.ingest(source, fps=60, timeline_start_frame=216000,
-                         project_id="synthetic-project", timeline_id="synthetic-review")
+                         project_id="synthetic-project", timeline_id="synthetic-review",
+                         review_manifest=verified_review(source, 60))
             provider = OfflineProvider()
             before = store.update(lambda data: recommend(data, "truck", run_id="base", provider=provider))
             self.assertEqual([row.frames["start"] for row in before], [60, 300])
@@ -76,15 +173,9 @@ class DirectorIntegrationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 FootageKnowledgeBase.from_dict(malformed)
 
-            inventory = [
-                {"codec_type": "video", "r_frame_rate": "60/1", "duration": "10", "nb_frames": "600"},
-                {"codec_type": "audio", "index": 1, "channels": 2, "tags": {"title": "Track1"}},
-                {"codec_type": "audio", "index": 3, "channels": 2, "tags": {"title": "Track2"}},
-            ]
-            with patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory):
-                manifest = compile_fkb_edit_plan(source, saved, "draft", revision_id="r2", confirmations=[
-                    {"part_id": "camera", "speaker": "Ada", "confirmed_by": "owner", "transcriber_track": 2},
-                ])
+            with synthetic_probe(source, 60):
+                manifest = compile_fkb_edit_plan(source, saved, "draft", revision_id="r2",
+                                                 confirmations=confirmed_mics(source))
             grounded, placeholder = manifest["segments"]
             self.assertEqual(grounded["candidate_ids"], [ranked[0].candidate_id])
             self.assertEqual(grounded["note_ids"], [first.note_id, second.note_id])

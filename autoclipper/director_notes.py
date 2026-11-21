@@ -77,7 +77,8 @@ class NotesCatalog:
             frames, evidence = self._capture(data, capture, playback, delayed)
             timestamp = _now()
             note = DirectorNote(str(uuid4()), frames.to_dict(), text, text,
-                                timestamp, timestamp, evidence)
+                                timestamp, timestamp, evidence,
+                                source_mapping_digest=data.source_mapping_digest)
             note.marker_id = note.note_id
             note.pov_ids = sorted({part.pov_id for part in data.coverage(frames)})
             data.director_notes.append(note)
@@ -172,6 +173,7 @@ class NotesCatalog:
             if frames != adjustment.new:
                 raise ValueError("Capture range disagrees with the preview")
             return self._revise(note, frames=frames.to_dict(), capture=evidence,
+                                source_mapping_digest=data.source_mapping_digest,
                                 pov_ids=sorted({part.pov_id for part in data.coverage(frames)}))
 
         return self.store.update(apply)
@@ -194,7 +196,8 @@ class NotesCatalog:
                 raise ValueError("Resolve the stale footage mapping before restoring this range")
             fields = ("frames", "capture", "text", "pov_ids", "title", "tags",
                       "customized", "metadata_provider")
-            return self._revise(note, **{key: snapshot[key] for key in fields})
+            return self._revise(note, source_mapping_digest=snapshot.get("source_mapping_digest"),
+                                **{key: snapshot[key] for key in fields})
 
         return self.store.update(restore)
 
