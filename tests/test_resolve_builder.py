@@ -249,6 +249,18 @@ class ResolveBuilderTests(unittest.TestCase):
             with patch("autoclipper.resolve_builder.reference_xml_matches", return_value=False):
                 with self.assertRaisesRegex(RuntimeError, "source_start.*31113.*31112"):
                     read_export(timeline, [segment], [name])
+            for source_start, source_end, duration in ((31112, 31172, 60),
+                                                       (31111, 31173, 60),
+                                                       (31112, 31173, 59)):
+                with self.subTest(source_start=source_start, source_end=source_end,
+                                  duration=duration), patch(
+                        "autoclipper.resolve_builder.reference_xml_matches", return_value=True) as xml:
+                    item.GetSourceStartFrame.return_value = source_start
+                    item.GetSourceEndFrame.return_value = source_end
+                    item.GetDuration.return_value = duration
+                    with self.assertRaisesRegex(RuntimeError, "Reference audio source or placement differs"):
+                        read_export(timeline, [segment], [name])
+                    xml.assert_not_called()
 
     def test_reference_xml_confirms_exact_source_and_record_range(self):
         sdk = Mock()
@@ -262,20 +274,56 @@ class ResolveBuilderTests(unittest.TestCase):
             ref = {"mp4_path": str(source), "source_in_frame": 31113,
                    "source_out_frame": 33093}
 
+            xml_in = 31113
+            xml_out = 33093
+            xml_start = 50100
+            xml_end = 52080
+            xml_path = source
+            xml_track = 2
+            xml_copies = 1
+
             def export(path, _type, _subtype):
+                clip = (f'<clipitem><start>{xml_start}</start><end>{xml_end}</end>'
+                        f'<in>{xml_in}</in><out>{xml_out}</out><file id="source"/>'
+                        '</clipitem>')
+                tracks = ['<track>' + (clip * xml_copies if index == xml_track else '')
+                          + '</track>' for index in (1, 2)]
                 Path(path).write_text(
-                    '<xmeml><sequence><media><audio><track/><track>'
-                    '<clipitem><start>50100</start><end>52080</end>'
-                    '<in>31113</in><out>33093</out><file id="source"/>'
-                    '</clipitem></track></audio></media></sequence>'
-                    f'<file id="source"><pathurl>{source.as_uri()}</pathurl></file></xmeml>',
+                    '<xmeml><sequence><media><audio>' + ''.join(tracks)
+                    + '</audio></media></sequence>'
+                    + f'<file id="source"><pathurl>{xml_path.as_uri()}</pathurl></file></xmeml>',
                     encoding="utf-8")
                 return True
 
             timeline.Export.side_effect = export
             with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
                 self.assertTrue(reference_xml_matches(timeline, ref, 266100, 1980))
-                ref["source_in_frame"] = 31114
+                for wrong in ("start", "end", "path", "track", "duplicate"):
+                    with self.subTest(wrong=wrong):
+                        xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                        xml_path, xml_track, xml_copies = source, 2, 1
+                        if wrong == "start":
+                            xml_start = 50101
+                        elif wrong == "end":
+                            xml_end = 52079
+                        elif wrong == "path":
+                            xml_path = Path(folder) / "other.mp4"
+                        elif wrong == "track":
+                            xml_track = 1
+                        else:
+                            xml_copies = 2
+                        self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+
+                xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                xml_path, xml_track, xml_copies = source, 2, 1
+
+                def export_false(path, _type, _subtype):
+                    export(path, _type, _subtype)
+                    return False
+
+                timeline.Export.side_effect = export_false
+                self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+                timeline.Export.side_effect = RuntimeError("Resolve export failed")
                 self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
 
     def test_reference_audio_uses_separate_item_and_track_after_reopen(self):

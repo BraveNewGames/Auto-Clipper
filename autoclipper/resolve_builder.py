@@ -444,9 +444,9 @@ def reference_xml_matches(timeline, ref, record_start, length):
     resolve = DaVinciResolveScript.scriptapp("Resolve")
     with TemporaryDirectory(prefix="autoclipper-reference-readback-") as folder:
         path = Path(folder) / "timeline.xml"
-        if not timeline.Export(str(path), resolve.EXPORT_FCP_7_XML, resolve.EXPORT_NONE):
-            return False
         try:
+            if not timeline.Export(str(path), resolve.EXPORT_FCP_7_XML, resolve.EXPORT_NONE):
+                return False
             root = ET.parse(path).getroot()
             audio = root.find("./sequence/media/audio")
             tracks = audio.findall("track") if audio is not None else []
@@ -472,7 +472,7 @@ def reference_xml_matches(timeline, ref, record_start, length):
             if re.match(r"^/[A-Za-z]:/", source):
                 source = source[1:]
             return Path(source).resolve() == Path(ref["mp4_path"]).resolve()
-        except (OSError, ET.ParseError, TypeError, ValueError):
+        except (OSError, ET.ParseError, TypeError, ValueError, RuntimeError):
             return False
 
 
