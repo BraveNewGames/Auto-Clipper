@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
 from autoclipper.resolve_manifest import (
-    _video_frames, build_manifest, build_review_manifest, compile_edit_plan, compile_fkb_edit_plan, main,
+    _reference_track, _video_frames, build_manifest, build_review_manifest, compile_edit_plan, compile_fkb_edit_plan, main,
     render_report,
 )
 from autoclipper.store import save_session
@@ -281,7 +281,11 @@ class ResolveManifestTests(unittest.TestCase):
         self.write_metadata(part, metadata)
         manifest = build_manifest(self.session)
         self.assertIsNone(manifest["segments"][0]["reference_audio"])
-        self.assertIn("player mic", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        self.assertIn("'Other player'", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        metadata["speaker_tracks"][0]["speaker"] = "Team"
+        self.write_metadata(part, metadata)
+        manifest = build_manifest(self.session)
+        self.assertEqual(manifest["segments"][0]["reference_audio"]["pov_name"], "Alpha")
         metadata["speaker_tracks"] = metadata["speaker_tracks"][1:]
         self.write_metadata(part, metadata)
         self.streams.append({"index": 8, "codec_type": "audio", "channels": 2,
@@ -292,6 +296,22 @@ class ResolveManifestTests(unittest.TestCase):
         self.streams.pop()
         manifest = build_manifest(self.session)
         self.assertIn("missing", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+
+    def test_reference_rejects_track1_when_it_is_verified_mic(self):
+        streams = [{"index": 1, "codec_type": "audio", "channels": 2,
+                    "tags": {"title": "Track1"}}]
+        mic = {"mp4_audio_stream_index": 1, "mp4_audio_ordinal": 1}
+        result = _reference_track({"speaker_tracks": {"audio_track_1": "Team"}}, streams, mic)
+        self.assertEqual(result["status"], "omitted")
+        self.assertIn("verified owner mic", result["reason"])
+
+    def test_reference_prefers_pov_with_most_selected_frames(self):
+        self.streams[1]["channels"] = 2
+        self.add_part("Alpha", offset=0, duration=2)
+        self.add_part("Bravo", offset=0, duration=4)
+        self.select("pick", "EV-01", 1, 4)
+        segments = build_manifest(self.session)["segments"]
+        self.assertEqual([s["reference_audio"]["pov_name"] for s in segments], ["Bravo", "Bravo"])
 
     def test_inferred_requires_matching_owner_confirmation(self):
         part_id = self.add_part("Alpha", inferred=True)

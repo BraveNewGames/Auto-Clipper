@@ -105,7 +105,10 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
 
 Audio uses Resolve multicam *Source* mode: each angle carries its owner's mic (one switchable
 pair). New exports also have an enabled **GROUP REFERENCE AUDIO** track with the verified stereo
-Track1 mix from one covering POV per segment. It stays in place while you switch multicam angles.
+Track1 mix from one covering POV per segment. Track1 must map uniquely in the MP4, differ from
+the verified owner mic, and have no label or a mix, system, or Team label. The exporter prefers
+the POV covering the most selected frames and falls back to another verified POV when needed.
+The reference track stays in place while you switch multicam angles.
 If no safe mix is identified, that segment has a gap and the preview and report show a warning.
 Before the final render, disable **GROUP REFERENCE AUDIO** in the Edit track header or mute it in
 the Edit or Fairlight mixer if you do not want the group conversation in the final mix. A disabled

@@ -190,14 +190,16 @@ def _reference_track(metadata, streams, mic):
         stream = matches[0]
         ordinal = audio.index(stream) + 1
         counts = [s.get("channels") for s in audio[:ordinal]]
-        labels = [row.get("speaker") for row in _tracks(metadata) if row["track"] == 1]
-        if len(labels) > 1 or any(_normalized(label).strip("[]") not in
-                                  {"game audio", "system audio", "desktop audio", "mix", "group mix"}
-                                  for label in labels):
-            reason = "Metadata labels Track1 as a player mic or has conflicting speaker labels."
-        elif mic and (stream["index"] == mic["mp4_audio_stream_index"]
+        labels = [row["speaker"] for row in _tracks(metadata)
+                  if row["track"] == 1 and _normalized(row.get("speaker"))]
+        if mic and (stream["index"] == mic["mp4_audio_stream_index"]
                       or ordinal == mic["mp4_audio_ordinal"]):
             reason = "Track1 is the verified owner mic, not a separate group mix."
+        elif len(labels) > 1 or any(_normalized(label).strip("[]") not in
+                                  {"team", "game audio", "system audio", "desktop audio",
+                                   "discord", "discord audio", "mix", "group mix"}
+                                  for label in labels):
+            reason = f"Metadata labels Track1 as {', '.join(repr(label) for label in labels)}; its group/system mix identity is unverified."
         elif not all(_track_number(count) for count in counts) or counts[-1] != 2:
             reason = "Track1 is not a verified stereo pair."
         else:

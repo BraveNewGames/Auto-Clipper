@@ -448,8 +448,9 @@ def read_export(timeline, segments, names, placeholders=None):
     if has_reference:
         require(timeline.GetTrackCount("audio") >= 2
                 and timeline.GetTrackName("audio", 2) == REFERENCE_TRACK_NAME
+                and timeline.GetTrackSubType("audio", 2) == "stereo"
                 and timeline.GetIsTrackEnabled("audio", 2),
-                "GROUP REFERENCE AUDIO track name, presence or enabled state differs")
+                "GROUP REFERENCE AUDIO track name, stereo format, presence or enabled state differs")
         references = sorted(timeline.GetItemListInTrack("audio", 2) or [], key=lambda item: item.GetStart())
         require(len(references) == sum(segment.get("reference_audio") is not None for segment in segments),
                 "Reference audio item count differs from the manifest")
@@ -578,10 +579,11 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     segments = manifest["segments"]
     reference_clips = import_reference_sources(pool, segments, clips, fps) if not mapped_director else {}
     if any("reference_audio" in segment for segment in segments):
-        require(timeline.AddTrack("audio"), "Could not add GROUP REFERENCE AUDIO track")
+        require(timeline.AddTrack("audio", "stereo"), "Could not add stereo GROUP REFERENCE AUDIO track")
         require(timeline.SetTrackName("audio", 2, REFERENCE_TRACK_NAME)
-                and timeline.GetTrackName("audio", 2) == REFERENCE_TRACK_NAME,
-                "Could not label GROUP REFERENCE AUDIO track")
+                and timeline.GetTrackName("audio", 2) == REFERENCE_TRACK_NAME
+                and timeline.GetTrackSubType("audio", 2) == "stereo",
+                "Could not label stereo GROUP REFERENCE AUDIO track")
         require(timeline.SetTrackEnable("audio", 2, True)
                 and timeline.GetIsTrackEnabled("audio", 2),
                 "Could not enable GROUP REFERENCE AUDIO track")

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_builder import build_export, describe_failure, import_sources, main
+from autoclipper.resolve_builder import build_export, describe_failure, import_reference_sources, import_sources, main
 from autoclipper.resolve_manifest import build_manifest, build_review_manifest, compile_edit_plan, source_mapping_digest
 
 from director_fixtures import confirmed_mics, synthetic_probe
@@ -107,6 +107,7 @@ def fake_resolve():
         item.GetTrackCount.side_effect = lambda kind: 2 if kind == "audio" and state["reference_folder"] else 1
         item.SetTrackName.side_effect = lambda kind, index, name: state.update(track_name=name) or True
         item.GetTrackName.side_effect = lambda kind, index: state.get("track_name", "")
+        item.GetTrackSubType.return_value = "stereo"
         item.GetIsTrackEnabled.return_value = True
 
     def create_project(name, _):
@@ -237,11 +238,22 @@ class ResolveBuilderTests(unittest.TestCase):
             self.assertEqual(len(state["audio"]), 1)
             self.assertEqual(len(state["audio2"]), 1)
             self.assertEqual(state["track_name"], "GROUP REFERENCE AUDIO")
+            project.GetMediaPool.return_value.CreateEmptyTimeline.return_value.AddTrack.assert_called_once_with(
+                "audio", "stereo")
             ref = result["segments"][0]["reference_audio"]
             self.assertEqual((ref["path"], ref["source_start"], ref["record_start"], ref["channels"]),
                              (angle["mp4_path"], angle["source_in_frame"], 216000, [1, 2]))
             self.assertEqual(len(state["media"]), 2)
             self.assertEqual(len(state["reference_media"]), 1)
+
+    def test_reference_import_rejects_reused_mic_item(self):
+        pool, clip = Mock(), Mock()
+        path = Path("source.mp4").resolve()
+        pool.ImportMedia.return_value = [clip]
+        angle = {"mp4_path": str(path), "reference_track": {"mp4_audio_ordinal": 1}}
+        segment = {"reference_audio": {"mp4_path": str(path), "track": angle["reference_track"]}}
+        with self.assertRaisesRegex(RuntimeError, "reused the mic-mapped item"):
+            import_reference_sources(pool, [segment], {path: clip}, 60)
 
     def test_session_to_manifest_to_builder_dry_run(self):
         sdk = Mock()
