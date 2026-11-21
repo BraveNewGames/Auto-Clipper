@@ -11,6 +11,7 @@ import json
 from math import floor, isfinite
 from pathlib import Path
 import re
+from tempfile import gettempdir
 
 from .mapping import map_range
 from .media import probe_streams
@@ -24,7 +25,7 @@ def _read_json(path):
 
 
 def _load_confirmations(path):
-    return _read_json(path) if path.exists() else {"schema_version": 1, "confirmations": []}
+    return _read_json(path) if path is not None and path.exists() else {"schema_version": 1, "confirmations": []}
 
 
 def _metadata(roots, stems):
@@ -802,18 +803,41 @@ def render_report(manifest) -> str:
     return "\n".join(lines) + "\n"
 
 
+def director_output(out, session_input, session):
+    if out is None:
+        raise ValueError("Director requires an explicit --out pointing to an approved scratch directory.")
+    out = out.resolve()
+    temp = Path(gettempdir()).resolve()
+    source_input = session_input.resolve()
+    if source_input.is_file():
+        source_input = source_input.parent
+    sources = (source_input, Path(session.folder).resolve())
+    if (out == temp or not out.is_relative_to(temp)
+            or any(out.is_relative_to(source) or source.is_relative_to(out) for source in sources)):
+        raise ValueError("Director --out must be a scratch directory under system temp, separate from the source session.")
+    return out
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session_folder", type=Path)
     parser.add_argument("--transcripts", type=Path)
-    parser.add_argument("--out", type=Path)
+    parser.add_argument("--out", type=Path, help="For Director, an approved scratch directory under system temp")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--full-session", action="store_true", help="Plan a coverage-aware Director review")
     parser.add_argument("--confirm-mic", action="append", nargs=3, metavar=("PART_ID", "TRACK", "SPEAKER"))
     args = parser.parse_args(argv)
     try:
         session = load_session(args.session_folder)
-        path = Path(session.folder) / ".autoclipper" / "mic_confirmations.json"
+        out = args.out
+        if args.full_session:
+            if out is not None or not args.dry_run:
+                out = director_output(out, args.session_folder, session)
+            path = out / "mic_confirmations.json" if out is not None else None
+            if path is not None and path.is_symlink():
+                raise ValueError("Director mic confirmations must be stored directly in the scratch directory.")
+        else:
+            path = Path(session.folder) / ".autoclipper" / "mic_confirmations.json"
         confirmations = _load_confirmations(path)
         for part_id, track, speaker in args.confirm_mic or []:
             part = session.part_by_id(part_id)
@@ -829,10 +853,11 @@ def main(argv=None):
         manifest = plan(session, args.transcripts, confirmations)
         report = render_report(manifest)
         if not args.dry_run:
-            out = args.out or (Path(session.folder) / "autoclipper_exports" / "resolve"
-                               / datetime.now().strftime("%Y%m%d-%H%M%S"))
+            out = out or (Path(session.folder) / "autoclipper_exports" / "resolve"
+                          / datetime.now().strftime("%Y%m%d-%H%M%S"))
             out.mkdir(parents=True, exist_ok=True)
-            if (out / "manifest.json").exists() or (out / "report.md").exists():
+            outputs = (out / "manifest.json", out / "report.md")
+            if any(file.exists() or (args.full_session and file.is_symlink()) for file in outputs):
                 raise ValueError("The output directory already contains a Resolve export.")
             if args.confirm_mic:
                 _write_json(path, confirmations)

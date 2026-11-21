@@ -54,6 +54,7 @@ def fake_resolve():
     resolve.MULTICAM_ANGLE_NAME_CLIP = "clip"
     resolve.MULTICAM_AUDIO_SOURCE = "source"
     project, reopened = Mock(), Mock()
+    project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = "scratch-project-id"
     pool = project.GetMediaPool.return_value
     timeline, reopened_timeline = pool.CreateEmptyTimeline.return_value, Mock()
     state = {"current": None, "media": [], "video": [], "audio": [], "markers": {}}
@@ -521,6 +522,43 @@ class ResolveBuilderTests(unittest.TestCase):
                          "Owner Edit"):
                 with self.subTest(name=name), self.assertRaisesRegex(ValueError, "Explicit project name"):
                     build_export(manifest, dry_run=True, project_name=name)
+
+    def test_director_requires_project_manager_or_verified_default(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            project_name = "AutoClipper DirectorA Test 20261120-010203"
+            for active_name in ("AutoClipper Export Owner", "AutoClipper Stage2 Test Owner",
+                                "AutoClipper Stage1 Owner", "Untitled Project", None):
+                with self.subTest(active_name=active_name):
+                    sdk, manager, state, _, _ = fake_resolve()
+                    if active_name is not None:
+                        owner = Mock()
+                        owner.GetName.return_value = active_name
+                        owner.GetUniqueId.return_value = "owner-project-id"
+                        owner.GetTimelineCount.return_value = 0
+                        pool_root = owner.GetMediaPool.return_value.GetRootFolder.return_value
+                        pool_root.GetClipList.return_value = []
+                        pool_root.GetSubFolderList.return_value = []
+                        state["current"] = owner
+                    with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                          patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                        if active_name not in ("Untitled Project", None):
+                            with self.assertRaisesRegex(RuntimeError, "Director requires Project Manager"):
+                                build_export(manifest, project_name=project_name)
+                            manager.CreateProject.assert_not_called()
+                            manager.SaveProject.assert_not_called()
+                        else:
+                            if active_name == "Untitled Project":
+                                manager.GetProjectListInCurrentFolder.return_value = [active_name]
+                                with self.assertRaisesRegex(RuntimeError, "Director requires Project Manager"):
+                                    build_export(manifest, project_name=project_name)
+                                manager.CreateProject.assert_not_called()
+                                manager.GetProjectListInCurrentFolder.return_value = []
+                            self.assertTrue(build_export(manifest, project_name=project_name)["reopened"])
+                            manager.CreateProject.assert_called_once()
 
     def test_owner_checkout_and_failed_reopen(self):
         sdk, manager, state, _, _ = fake_resolve()

@@ -62,7 +62,10 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
 
 `python -m autoclipper.resolve_manifest <session-folder> --full-session --dry-run`
 plans a review without contacting Resolve or writing outputs. Omit `--dry-run` and
-provide `--out <scratch-dir>` to save the manifest when authorized. The existing
+provide `--out <scratch-dir>` to save the manifest when authorized. Use an
+owner-approved directory beneath system temp, separate from the source session.
+Director reads and saves `mic_confirmations.json` in that output directory.
+The existing
 `resolve_builder` accepts this manifest. The scratch companion's `prepare` command
 uses the same coverage-aware planner with its approved temp inputs. Ordinary
 reviewed Keep exports still use the existing strict Stage 2 planning path.
@@ -102,3 +105,18 @@ directory while the project references them. A later authorized Resolve test
 must verify the native audio-only append, slate visibility and exact duration,
 and source and slate readback after reopen. No Resolve connection was made for
 Phase B verification.
+
+## Known limitations / deferred
+
+- **Independent mic coverage (Medium 4).** Video coverage currently stands in
+  for mic availability. A delayed or truncated mic can yield silence, shifted
+  audio, or a rejected append. Test a delayed and short mic stream, comparing
+  its probed bounds with native audio-only append and readback after reopening.
+- **Variable cadence (Medium 6).** A nominal 60 fps report can hide irregular
+  timestamps and undermine frame-to-time mapping. Probe a synthetic
+  irregular-timestamp input and verify fixed-cadence detection before changing
+  rounding.
+- **Stale packet citations (Low 2).** A failed line citation can fall back to
+  another repetition of the same quote. Test a stale explicit line with no
+  timestamp or span ID and a single repeated hit in range. Require unresolved
+  or explicitly weaker attribution.
