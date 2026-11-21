@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from fractions import Fraction
+from hashlib import sha256
 import json
 from math import floor, isfinite
 from pathlib import Path
@@ -453,6 +454,24 @@ class _CoveredPart:
     media: dict
 
 
+def catalog_source_identity(session):
+    """Identify the session layout supplied to the catalog, before scratch path rebasing."""
+    return {
+        "session_id": session.session_id,
+        "parts": [[pov.pov_id, part.part_id, part.index, part.video_path, str(Fraction(str(part.offset)))]
+                  for pov, part in session.all_parts()],
+    }
+
+
+def source_mapping_digest(manifest: dict) -> str:
+    """Return the digest of a Director manifest's verified source mapping."""
+    mapping = manifest.get("source_mapping")
+    if not isinstance(mapping, dict) or mapping.get("version") != 1:
+        raise ValueError("Verified source mapping is missing. Rebuild the review and reconcile the catalog.")
+    return sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                  .encode("utf-8")).hexdigest()
+
+
 def _review_coverage(session, transcripts_dir, confirmations, fps):
     folder, roots, confirmations, rate, manifest = _manifest_inputs(session, transcripts_dir, confirmations, fps)
     fps = manifest["fps"]
@@ -461,8 +480,17 @@ def _review_coverage(session, transcripts_dir, confirmations, fps):
     coverage = {pov.pov_id: [] for pov in session.povs}
     first, end = 0, 0
     game_identified = False
+    rows = {}
     for pov, part in session.all_parts():
+        if not part.part_id or part.part_id in rows:
+            raise ValueError("Director recording part IDs must be unique and nonempty")
         start = _record_frame(part.offset, 0, rate)
+        row = rows[part.part_id] = {
+            "part_id": part.part_id, "pov_id": pov.pov_id, "index": part.index,
+            "offset": str(Fraction(str(part.offset))),
+            "source_path": str((folder / part.video_path).resolve()) if part.video_path else None,
+            "session_start_frame": start, "media": None, "playable_intervals": [],
+        }
         first = min(first, start)
         media, _, problem, game = _part_media(folder, roots, pov, part, confirmations, fps,
                                              frame_count=True)
@@ -472,10 +500,14 @@ def _review_coverage(session, transcripts_dir, confirmations, fps):
         if not problem and not media["source_frame_count"]:
             problem = "duration_unverified"
         if problem:
+            row["problem"] = problem
             manifest["blockers"].append({"code": problem, "part_id": part.part_id, "pov_name": pov.name,
                                          "message": _PROBLEMS[problem]})
             continue
         frames = media["source_frame_count"]
+        row["media"] = media
+        stat = Path(media["mp4_path"]).stat()
+        row["file_identity"] = [stat.st_size, stat.st_mtime_ns]
         end = max(end, start + frames)
         coverage[pov.pov_id].append(_CoveredPart(part.part_id, part.index, start, start + frames, media))
         game_identified |= game
@@ -484,7 +516,17 @@ def _review_coverage(session, transcripts_dir, confirmations, fps):
                                          "pov_name": pov.name, "message": conflict})
     if not game_identified:
         manifest["warnings"].append({"code": "game_audio_unidentified", "message": "Game audio not identified."})
-    return manifest, coverage, first, end
+    spans = list(_coverage_spans(session.povs, coverage, first, end))
+    for left, right, angles, _ in spans:
+        for angle in angles:
+            intervals = rows[angle["part_id"]]["playable_intervals"]
+            if intervals and intervals[-1][1] == left:
+                intervals[-1][1] = right
+            else:
+                intervals.append([left, right])
+    manifest["source_mapping"] = {"version": 1, "fps": fps, "parts": list(rows.values())}
+    manifest["source_mapping_digest"] = source_mapping_digest(manifest)
+    return manifest, coverage, first, end, spans
 
 
 def _coverage_spans(povs, coverage, first, end):
@@ -529,9 +571,9 @@ def _frame_segment(fps, first, end, record, angles, unavailable, *, entry_id, ti
 
 def build_review_manifest(session, transcripts_dir=None, confirmations=None, fps=None):
     """Build a frame-grid review without compressing interior gaps or trusting estimated tails."""
-    manifest, coverage, first, end = _review_coverage(session, transcripts_dir, confirmations, fps)
-    manifest.update(mode="director_review", requested_session_frames=[first, end])
-    spans = list(_coverage_spans(session.povs, coverage, first, end))
+    manifest, _, first, end, spans = _review_coverage(session, transcripts_dir, confirmations, fps)
+    manifest.update(mode="director_review", requested_session_frames=[first, end],
+                    catalog_source=catalog_source_identity(session))
     playable = [index for index, span in enumerate(spans) if span[2]]
     if not playable:
         manifest["blockers"].append({"code": "no_angles", "message": "Review has no usable coverage."})
@@ -605,7 +647,10 @@ def compile_edit_plan(session, plan, transcripts_dir=None, confirmations=None):
             if not isinstance(refs, (tuple, list)) or any(not isinstance(ref, str) or not ref for ref in refs):
                 raise ValueError(f"Expected IDs in {key}")
 
-    manifest, coverage, _, _ = _review_coverage(session, transcripts_dir, confirmations, plan["fps"])
+    manifest, coverage, _, _, _ = _review_coverage(session, transcripts_dir, confirmations, plan["fps"])
+    if any(entry["kind"] == "source" for entry in plan["entries"]) and "source_mapping_digest" in plan:
+        if plan["source_mapping_digest"] != manifest["source_mapping_digest"]:
+            raise ValueError("Verified source mapping changed. Reconcile the catalog and save a new edit plan.")
     manifest.update(mode="director_edit_plan", edit_plan={
         "plan_id": plan["plan_id"], "revision_id": plan["revision_id"],
         "revision_history": deepcopy(list(plan["revision_history"])),
@@ -660,34 +705,58 @@ def compile_fkb_edit_plan(session, knowledge_base, plan_id, *, revision_id,
         raise ValueError("Expected one FKB edit plan with the requested ID")
     plan, = plans
     candidates = {candidate.candidate_id: candidate for candidate in getattr(knowledge_base, "candidate_moments", ())}
-    note_ids = {note.note_id for note in getattr(knowledge_base, "director_notes", ()) if not note.deleted}
+    notes = {note.note_id: note for note in knowledge_base.director_notes if not note.deleted}
+    spans = {span.span_id for span in knowledge_base.transcript_spans}
+    digest = getattr(plan, "source_mapping_digest", None)
+
+    def validate_note(note_id, revision, frames=None):
+        note = notes.get(note_id)
+        if (note is None or revision is None or note.revision != revision
+                or note.source_mapping_digest != digest or not digest
+                or (frames is not None and note.frames != frames)):
+            raise ValueError("Note anchor changed or is unverified. Select the current range or use an explicit placeholder.")
+
     entries = []
     for entry in plan.entries:
         if any(key in entry for key in ("session_in", "session_out_exclusive")):
             raise ValueError("FKB entries use frames.start and frames.end")
         projected = dict(entry)
         frames = projected.pop("frames", None)
+        if projected["kind"] != "placeholder":
+            for note_id in projected.get("note_ids", ()):
+                validate_note(note_id, plan.note_revisions.get(note_id))
         if projected["kind"] == "candidate":
             candidate = candidates.get(projected.pop("candidate_id"))
             if candidate is None or frames is not None:
                 raise ValueError("Candidate entries must reference a saved candidate without frame overrides")
             frames = candidate.frames or None
+            saved_anchor = plan.candidate_note_anchors.get(candidate.candidate_id)
+            if candidate.note_anchor_id:
+                if saved_anchor != [candidate.note_anchor_id, candidate.note_anchor_revision]:
+                    raise ValueError("Note anchor selection changed. Save a new selection or use an explicit placeholder.")
+                validate_note(candidate.note_anchor_id, candidate.note_anchor_revision, candidate.frames)
+            elif saved_anchor or (frames and candidate.evidence_ids and not spans.intersection(candidate.evidence_ids)):
+                raise ValueError("Candidate note anchor is unverified. Select it again or use an explicit placeholder.")
             projected["kind"] = "source" if frames else "placeholder"
             projected.setdefault("title", candidate.logline)
             projected["candidate_ids"] = list(dict.fromkeys(
                 [candidate.candidate_id, *projected.get("candidate_ids", ())]))
             projected["note_ids"] = list(dict.fromkeys([
-                *projected.get("note_ids", ()), *(key for key in candidate.evidence_ids if key in note_ids)
+                *projected.get("note_ids", ()), *(key for key in candidate.evidence_ids if key in notes)
             ]))
             if not frames and "provisional_frames" not in projected:
                 raise ValueError("Untimed candidates require provisional placeholder frames")
         if frames is not None:
             projected["session_in"], projected["session_out_exclusive"] = frames["start"], frames["end"]
         entries.append(projected)
+    if any(entry["kind"] == "source" for entry in entries) and (
+            not digest or digest != getattr(knowledge_base, "source_mapping_digest", None)):
+        raise ValueError("EditPlan source mapping is unverified. Reconcile the catalog and save a new edit plan.")
     projection = {
         "plan_id": plan.plan_id, "session_id": knowledge_base.session.session_id,
         "fps": knowledge_base.session.fps, "revision_id": revision_id,
         "revision_history": plan.revisions, "entries": entries,
+        "source_mapping_digest": digest,
     }
     return compile_edit_plan(session, projection, transcripts_dir, confirmations)
 

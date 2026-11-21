@@ -9,7 +9,7 @@ from shutil import copyfile
 from tempfile import gettempdir, mkdtemp
 
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, START_TIMECODE, build_export, validate_manifest
-from ..resolve_manifest import build_review_manifest
+from ..resolve_manifest import build_review_manifest, catalog_source_identity
 from ..store import _write_json, load_session
 from .core import Clock, NoteStore, connect_review, tc_frame
 
@@ -33,6 +33,7 @@ def prepare(args):
     copyfile(source, scratch / "session.json")
     print(f"Scratch directory: {scratch}", flush=True)
     session = load_session(scratch / "session.json")
+    catalog_source = catalog_source_identity(session)
     if not session.all_parts():
         raise ValueError("The session has no recordings")
     root = args.media_root.resolve(strict=True)
@@ -48,6 +49,7 @@ def prepare(args):
     session.folder = str(scratch)
     session.session_id = "DirectorA REVIEW"
     manifest = build_review_manifest(session, transcripts_dir=metadata, confirmations=confirmed, fps=args.fps)
+    manifest["catalog_source"] = catalog_source
     _write_json(scratch / "manifest.json", manifest)
     validate_manifest(manifest)
     print(f"Verified {len(manifest['segments'])} planned segments at {args.fps} fps")
@@ -77,20 +79,21 @@ def verified_review_origin(manifest, built):
 def initialize_fkb(scratch, source, manifest, built):
     from ..fkb import FKBStore
 
-    mappings = {}
-    for segment in manifest["segments"]:
-        for angle in segment["angles"]:
-            if "mic" in angle:
-                part_id = angle["part_id"]
-                mapping = mappings.setdefault(part_id, angle["mic"])
-                if mapping != angle["mic"]:
-                    raise ValueError("Conflicting assembler microphone mappings")
+    legacy_mappings = {}
+    review_manifest = manifest if manifest.get("mode") == "director_review" else None
+    if review_manifest is None:
+        for segment in manifest["segments"]:
+            for angle in segment["angles"]:
+                if "mic" in angle:
+                    mapping = legacy_mappings.setdefault(angle["part_id"], angle["mic"])
+                    if mapping != angle["mic"]:
+                        raise ValueError("Conflicting assembler microphone mappings")
     store = FKBStore(scratch)
     fps = manifest["fps"]
     store.ingest(source, fps=fps, timeline_start_frame=tc_frame(START_TIMECODE, fps),
                  review_session_start_frame=verified_review_origin(manifest, built),
                  project_id=built["project_id"], timeline_id=built["timeline_id"],
-                 audio_by_part=mappings)
+                 audio_by_part=legacy_mappings, review_manifest=review_manifest)
     return store.path
 
 

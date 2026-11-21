@@ -89,6 +89,7 @@ def search_evidence(database, query="", *, speaker=None, frames=None):
                 hits.append(EvidenceHit(note.note_id, bounds, note.text, None,
                                         Provenance.USER, 3 * score))
     return sorted(hits, key=lambda hit: (-hit.score, hit.provenance != Provenance.USER,
+                                         not database.coverage(hit.frames),
                                          hit.frames.start, hit.evidence_id))
 
 
@@ -97,9 +98,9 @@ def available_povs(database, frames):
     if database.mapping_stale or frames is None:
         return []
     return [(part.pov_id, part.part_id,
-             FrameRange(max(frames.start, part.session_range["start"]),
-                        min(frames.end, part.session_range["end"])))
-            for part in database.coverage(frames) if part.duration_source != "srt_estimate"]
+             FrameRange(max(frames.start, start), min(frames.end, end)))
+            for part in database.coverage(frames)
+            for start, end in part.playable_intervals if start < frames.end and frames.start < end]
 
 
 def _uncertainty(database, frames, spans, caveats):
@@ -249,6 +250,7 @@ def recommend(database, query, *, run_id, provider=None, speaker=None, frames=No
     evidence = search_evidence(database, query, speaker=speaker, frames=frames)
     by_id = {hit.evidence_id: hit for hit in evidence}
     spans = {span.span_id: span for span in database.transcript_spans}
+    notes = {note.note_id: note for note in _notes(database)}
     proposals = provider.propose(query, tuple(evidence)) if evidence else ()
     candidates = []
     occurrences = {}
@@ -257,6 +259,7 @@ def recommend(database, query, *, run_id, provider=None, speaker=None, frames=No
         occurrences[proposal.evidence_id] = index + 1
         hit = by_id.get(proposal.evidence_id)
         bounds = hit.frames if hit else None
+        anchor = notes.get(hit.evidence_id) if hit else None
         supporting = [spans[hit.evidence_id]] if hit and hit.evidence_id in spans else []
         caveats = [] if hit else ["Provider proposal has no matching session evidence."]
         candidates.append(CandidateMoment(
@@ -264,7 +267,9 @@ def recommend(database, query, *, run_id, provider=None, speaker=None, frames=No
             proposal.logline, bounds.to_dict() if bounds else {},
             [hit.evidence_id, *hit.context_note_ids] if hit else [],
             uncertainty=_uncertainty(database, bounds, supporting, caveats),
-            model=provider.model, run_id=run_id, model_version=provider.version))
+            model=provider.model, run_id=run_id, model_version=provider.version,
+            note_anchor_id=anchor.note_id if anchor else None,
+            note_anchor_revision=anchor.revision if anchor else None))
     if not candidates:
         candidates.append(CandidateMoment(
             stable_id(database.session.session_id, "concept-missing", run_id, query), query, {}, [],
@@ -283,7 +288,8 @@ def _with_notes(notes, span_ids, candidate):
         # The first reference is the sole anchor for a note-based proposal.
         anchor = next((note for note in notes
                        if note.note_id == candidate.evidence_ids[0]), None)
-        if anchor is None or anchor.frames != candidate.frames:
+        if (anchor is None or anchor.frames != candidate.frames
+                or anchor.revision != candidate.note_anchor_revision):
             return replace(candidate, frames={}, evidence_ids=[],
                            uncertainty="The original note was deleted or retimed. " + _VISUAL_CHECK)
         return candidate
@@ -327,6 +333,8 @@ def refresh_recommendations(database):
     saved = _upsert(database, database.candidate_moments[:])
     note_ids = {note.note_id for note in _notes(database)}
     return sorted(saved, key=lambda candidate: (-len(note_ids.intersection(candidate.evidence_ids)),
+                                                not available_povs(database, FrameRange(**candidate.frames))
+                                                if candidate.frames else True,
                                                 not bool(candidate.frames)))
 
 
