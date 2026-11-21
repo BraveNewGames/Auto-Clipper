@@ -17,7 +17,7 @@ import re
 from tempfile import gettempdir
 
 from .mapping import map_range
-from .media import probe_streams
+from .media import probe_streams, resolve_recording
 from .models import Part, POV, Session
 from .resolve_stage1 import plan_placements
 from .store import _write_json, load_session
@@ -212,7 +212,8 @@ def _video_frames(stream, fps):
 
 def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=False):
     source = folder / part.video_path if part.video_path else None
-    mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
+    resolved = resolve_recording(folder, part.video_path, require_mp4=True)
+    mp4 = resolved.path
     if not mp4 or mp4.suffix.lower() != ".mp4" or not mp4.is_file():
         return None, part, "mp4_missing", False
 
@@ -344,6 +345,12 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
         part.part_id: _part_media(folder, roots, pov, part, confirmations, fps)
         for pov, part in session.all_parts() if part.offset < last_selection_end
     }
+    for pov, part in session.all_parts():
+        if part.part_id in media_cache and resolve_recording(folder, part.video_path).status == "stale_mkv":
+            manifest["warnings"].append({
+                "code": "stale_mkv_reference", "part_id": part.part_id, "pov_name": pov.name,
+                "message": "Saved MKV is absent; using the same-stem MP4. Session JSON was not changed.",
+            })
     coverage_session = replace(session, povs=[
         replace(pov, parts=[
             replace(media_cache[part.part_id][1] if part.part_id in media_cache else part, srt_path=None)
@@ -617,6 +624,11 @@ def _review_coverage(session, transcripts_dir, confirmations, fps, *, isolated_i
             "source_path": str((folder / part.video_path).resolve()) if part.video_path else None,
             "session_start_frame": start, "media": None, "playable_intervals": [],
         }
+        if resolve_recording(folder, part.video_path).status == "stale_mkv":
+            manifest["warnings"].append({
+                "code": "stale_mkv_reference", "part_id": part.part_id, "pov_name": pov.name,
+                "message": "Saved MKV is absent; using the same-stem MP4. Session JSON was not changed.",
+            })
         first = min(first, start)
         media, _, problem, game = _part_media(folder, roots, pov, part, confirmations, fps,
                                              frame_count=True)

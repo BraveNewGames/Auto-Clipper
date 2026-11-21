@@ -637,7 +637,7 @@ class App:
         folder = Path(s.folder).resolve()
         roots = [folder / "_Transcripts", folder.parent / "_Transcripts"]
         source = folder / part.video_path if part.video_path else None
-        mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
+        mp4 = _mod("media").resolve_recording(folder, part.video_path, require_mp4=True).path
         stems = [source.stem] if source else []
         if part.srt_path:
             stems.append(Path(part.srt_path).stem)

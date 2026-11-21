@@ -296,7 +296,8 @@ class DirectorPrepareTests(unittest.TestCase):
             ]
             sdk = Mock()
             with (patch.object(sys, "argv", ["director", "prepare", str(source), str(confirmations),
-                                             str(media), "--metadata", str(metadata)]),
+                                             str(media), "--session-root", str(media),
+                                             "--metadata", str(metadata)]),
                   patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
                   patch("autoclipper.director_poc.__main__.mkdtemp", return_value=str(scratch)),
                   patch("autoclipper.resolve_manifest.probe_streams", return_value=inventory) as probe,
@@ -341,7 +342,8 @@ class DirectorPrepareTests(unittest.TestCase):
                     self.assertFalse(FKBStore(scratch).path.exists())
 
             (scratch / "build.json").write_text(json.dumps(built), encoding="utf-8")
-            with (patch.object(sys, "argv", ["director", "index-notes", str(scratch), str(source)]),
+            with (patch.object(sys, "argv", ["director", "index-notes", str(scratch), str(source),
+                                             "--session-root", str(media)]),
                   redirect_stdout(io.StringIO())):
                 main()
             store = FKBStore(scratch)

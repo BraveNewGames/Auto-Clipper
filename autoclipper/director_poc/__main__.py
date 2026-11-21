@@ -4,12 +4,15 @@ import argparse
 from datetime import datetime
 from functools import partial
 import json
+import os
+import sys
 from pathlib import Path
 from shutil import copyfile, copytree
 from tempfile import gettempdir, mkdtemp
 
 from ..resolve_builder import DIRECTOR_TEST_PREFIX, build_export, validate_manifest
 from ..resolve_manifest import build_review_manifest, catalog_source_identity, pinned_input_digest
+from ..media import resolve_recording
 from ..store import _write_json, load_session
 from .core import NoteStore, connect_review
 from .receipt import validate_review_receipt
@@ -17,6 +20,10 @@ from .receipt import validate_review_receipt
 
 _SCRATCH_RECOVERY = ("Keep the existing catalog and its backup. See the legacy recovery steps in "
                      "autoclipper/director_poc/README.md.")
+
+
+class SourceSessionError(ValueError):
+    """A copied session cannot be safely used as a Director source."""
 
 
 def read(path):
@@ -30,10 +37,55 @@ def temp_copy(path):
     return path
 
 
+def source_session(path, session_root=None):
+    """Load a temp JSON with an optional in-memory source root and SRT preflight."""
+    path = temp_copy(path)
+    session = load_session(path)
+    if session_root is not None:
+        try:
+            root = session_root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SourceSessionError(f"--session-root does not exist: {session_root}") from exc
+        if not root.is_dir():
+            raise SourceSessionError("--session-root must be an existing directory")
+        session.folder = str(root)
+    root = Path(session.folder).resolve()
+    for _, part in session.all_parts():
+        if part.srt_path:
+            reference = Path(part.srt_path)
+            srt = (root / reference).resolve()
+            if not reference.is_absolute() and not srt.is_relative_to(root):
+                raise SourceSessionError(f"SRT path escapes session root for {part.part_id}: {part.srt_path}")
+            if not srt.is_file():
+                remedy = ("Check this absolute SRT path." if reference.is_absolute() else
+                          "Supply --session-root with the recording folder.")
+                raise SourceSessionError(f"SRT missing for {part.part_id}: {part.srt_path}. {remedy}")
+        if session_root is not None and part.video_path:
+            saved = (root / part.video_path).resolve()
+            media = resolve_recording(root, part.video_path)
+            if not saved.is_relative_to(root) or media.path is None or not media.path.resolve().is_relative_to(root):
+                raise SourceSessionError(f"Recording missing or outside --session-root for {part.part_id}: "
+                                         f"{part.video_path}")
+    return session
+
+
+def source_input_identity(session):
+    """Bind indexing to the source root and exact SRT bytes used by prepare."""
+    root = Path(session.folder).resolve()
+    return {
+        "root": os.path.normcase(str(root)),
+        "srts": {part.part_id: pinned_input_digest(root / part.srt_path)
+                 for _, part in session.all_parts() if part.srt_path},
+    }
+
+
 def prepare(args):
     source = temp_copy(args.session)
     confirmations = temp_copy(args.confirmations)
     metadata = temp_copy(args.metadata) if args.metadata else None
+    session = source_session(source, args.session_root)
+    source_identity = source_input_identity(session)
+    catalog_source = catalog_source_identity(session)
     scratch = Path(mkdtemp(prefix="autoclipper-director-a-"))
     copyfile(source, scratch / "session.json")
     pinned_confirmations = scratch / "mic_confirmations.json"
@@ -47,8 +99,7 @@ def prepare(args):
         pinned_inputs["metadata"] = {"path": pinned_metadata.name,
                                      "sha256": pinned_input_digest(pinned_metadata)}
     print(f"Scratch directory: {scratch}", flush=True)
-    session = load_session(scratch / "session.json")
-    catalog_source = catalog_source_identity(session)
+    pinned_inputs["session_source"] = source_identity
     if not session.all_parts():
         raise ValueError("The session has no recordings")
     root = args.media_root.resolve(strict=True)
@@ -56,8 +107,9 @@ def prepare(args):
         if not part.video_path:
             raise ValueError("A session part has no video path")
         path = (root / part.video_path).resolve()
-        source_path = path.with_suffix(".mp4") if path.suffix.lower() == ".mkv" else path
-        if not path.is_relative_to(root) or not source_path.resolve().is_relative_to(root):
+        source_path = resolve_recording(root, part.video_path, require_mp4=True).path
+        if not path.is_relative_to(root) or (source_path is not None and
+                                             not source_path.resolve().is_relative_to(root)):
             raise ValueError("A recording path lies outside the approved media root")
         part.video_path = str(path)
     confirmed = read(pinned_confirmations)["confirmations"]
@@ -113,6 +165,7 @@ def main():
     plan.add_argument("session", type=Path)
     plan.add_argument("confirmations", type=Path)
     plan.add_argument("media_root", type=Path)
+    plan.add_argument("--session-root", type=Path, help="Existing source folder for relative SRT and video paths")
     plan.add_argument("--metadata", type=Path, help="Temp directory of approved transcriber JSON copies")
     plan.add_argument("--fps", type=int, default=60)
     build = commands.add_parser("build", help="Live, create and reopen a fresh scratch project")
@@ -120,6 +173,7 @@ def main():
     index = commands.add_parser("index-notes", help="Offline, initialize the persistent scratch catalog")
     index.add_argument("scratch", type=Path)
     index.add_argument("session", type=Path, help="Approved session JSON under system temp")
+    index.add_argument("--session-root", type=Path, help="Same source folder used by prepare")
     index.add_argument("--migrate-from", type=Path, help="Copy a verified legacy catalog from this scratch folder")
     run = commands.add_parser("companion", help="Live, attach only to the exact built timeline")
     run.add_argument("scratch", type=Path)
@@ -131,7 +185,10 @@ def main():
     run.add_argument("--out-exclusive", action="store_true", help="Use only if A1 verifies exclusive marks")
     args = parser.parse_args()
     if args.command == "prepare":
-        prepare(args)
+        try:
+            prepare(args)
+        except SourceSessionError as exc:
+            parser.error(f"Cannot prepare the source session. {exc}")
         return
     try:
         scratch = temp_copy(args.scratch)
@@ -157,7 +214,17 @@ def main():
     try:
         built = read(result_path)
         if args.command == "index-notes":
-            source = load_session(temp_copy(args.session))
+            try:
+                source = source_session(args.session, args.session_root)
+                pinned_source = (manifest.get("pinned_inputs") or {}).get("session_source")
+                if pinned_source is None:
+                    print("Warning: this older manifest has no pinned session root or SRT digests; "
+                          "index-notes cannot verify those inputs against prepare.", file=sys.stderr)
+                elif pinned_source != source_input_identity(source):
+                    raise ValueError("Session root or SRT contents differ from prepare. "
+                                     "Use the same --session-root and unchanged SRTs, or prepare a new review.")
+            except (OSError, ValueError) as exc:
+                parser.error(f"Cannot index the source session. {exc}")
             print(initialize_fkb(scratch, source, manifest, built, migrate_from=args.migrate_from))
             return
 

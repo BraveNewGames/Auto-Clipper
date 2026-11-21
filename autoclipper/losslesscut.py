@@ -6,6 +6,7 @@ import re
 import unicodedata
 
 from .mapping import map_range
+from .media import resolve_recording
 
 LOSSLESSCUT_SETUP = """Open the source video listed in the reviewer's README.
 Choose File > Import project > CSV and select one pass for that video.
@@ -124,9 +125,13 @@ def export_reviewer(session, reviewer, out_dir=None, statuses=None) -> list[Expo
             with path.open("w", encoding="utf-8", newline="") as handle:
                 for start, end, label in partition:
                     handle.write(f'{start:.3f},{end:.3f},"{label}"\r\n')
-            source = part.video_path or f"(no video found; transcript: {part.srt_path})"
+            resolved = resolve_recording(session.folder, part.video_path)
+            source = (part.video_path if resolved.status == "found" else
+                      str(Path(part.video_path).with_suffix(".mp4"))) if resolved.path else (
+                f"(missing media: {part.video_path})" if part.video_path else
+                f"(no video found; transcript: {part.srt_path})")
             manifest.append(f"{path.name} -> {source}")
-            files.append(ExportFile(reviewer, local.pov_name, part_id, part.video_path,
+            files.append(ExportFile(reviewer, local.pov_name, part_id, source if resolved.path else part.video_path,
                                     number, str(path), partition))
     (directory / "README.txt").write_text("\n".join(manifest) + "\n", encoding="utf-8")
     return files
@@ -142,7 +147,8 @@ def expected_filenames(session, reviewer) -> list[str]:
     names = []
     for part_id, (_, rows) in _plan(session, reviewer, None).items():
         video = session.part_by_id(part_id).video_path
-        extension = Path(video).suffix if video else ".mkv"
+        resolved = resolve_recording(session.folder, video)
+        extension = resolved.path.suffix if resolved.path else (Path(video).suffix if video else ".mkv")
         names.extend(label + extension for _, _, label in rows)
     return names
 

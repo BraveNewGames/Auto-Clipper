@@ -51,6 +51,11 @@ Options: `python -m autoclipper [session_folder] [--port N] [--no-browser]`.
 
 The Export tab shows the same instructions.
 
+When a saved `.mkv` reference is missing but a same-stem `.mp4` exists, the
+reviewer README points to that MP4 and expected clip filenames end in `.mp4`.
+Existing MKV files retain their `.mkv` names. CSV columns and segment timings
+do not change; a missing recording is identified in the reviewer README.
+
 ## Export to Resolve
 
 The Export tab can build a DaVinci Resolve Studio project directly from your **Keep** selections:
