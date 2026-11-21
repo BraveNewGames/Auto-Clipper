@@ -71,6 +71,7 @@ def initialize_fkb(scratch, source, manifest, built, *, migrate_from=None):
     binding = validate_review_receipt(manifest, built)
     persistent_mapping_digest(manifest)
     store = FKBStore(scratch)
+    store.verify_writable()
     options = dict(fps=manifest["fps"], timeline_start_frame=binding.start_frame,
                    review_session_start_frame=binding.session_origin, project_id=built["project_id"],
                    timeline_id=built["timeline_id"], review_manifest=manifest)

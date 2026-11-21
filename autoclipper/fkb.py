@@ -4,14 +4,17 @@ from enum import Enum
 from fractions import Fraction
 from json import loads
 from math import ceil, floor
+import json
+import os
 from pathlib import Path
+import stat
+from tempfile import NamedTemporaryFile
 from threading import RLock
 from uuid import NAMESPACE_URL, uuid5
 
 from .models import _Model
 from .reconcile import build_session_transcript
 from .resolve_manifest import catalog_source_identity, source_mapping_digest
-from .store import _write_json
 
 
 class Provenance(str, Enum):
@@ -210,20 +213,88 @@ class FKBStore:
     _lock = RLock()
 
     def __init__(self, folder):
-        self.path = Path(folder).resolve() / ".autoclipper" / "director-fkb.json"
+        self.root = Path(folder).resolve()
+        self.path = self.root / ".autoclipper" / "director-fkb.json"
         self.backup = self.path.with_suffix(".json.bak")
+
+    @staticmethod
+    def _is_link(path):
+        try:
+            attributes = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        return (os.path.islink(path) or bool(getattr(attributes, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+
+    def verify_writable(self):
+        directory = self.path.parent
+        if not self.root.is_dir():
+            raise ValueError(f"Refusing Director catalog write: scratch folder {self.root} is missing.")
+        if self._is_link(directory):
+            raise ValueError(f"Refusing Director catalog write: {directory} is a link or reparse point. "
+                             "Use a real .autoclipper directory inside the scratch folder.")
+        try:
+            directory.mkdir(exist_ok=True)
+        except FileExistsError as exc:
+            raise ValueError(f"Refusing Director catalog write: {directory} is not a real directory.") from exc
+        if (self._is_link(directory) or not directory.is_dir()
+                or not directory.resolve().is_relative_to(self.root)):
+            raise ValueError(f"Refusing Director catalog write: {directory} must be a real directory "
+                             "inside the scratch folder.")
+        for path in (self.path, self.backup):
+            if self._is_link(path):
+                raise ValueError(f"Refusing Director catalog write: {path} is a link or reparse point. "
+                                 "Remove the link from the scratch folder before retrying.")
+        return directory
+
+    @classmethod
+    def _matches_open_file(cls, path, identity):
+        if cls._is_link(path):
+            return False
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        return (current.st_dev, current.st_ino) == identity
+
+    def _write(self, path, data):
+        directory = self.verify_writable()
+        temporary = None
+        identity = None
+        try:
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                    delete=False) as handle:
+                temporary = Path(handle.name)
+                opened = os.fstat(handle.fileno())
+                identity = (opened.st_dev, opened.st_ino)
+                self.verify_writable()
+                if not self._matches_open_file(temporary, identity):
+                    raise ValueError("Refusing Director catalog write: temporary file changed during publication.")
+                json.dump(data, handle, ensure_ascii=False, indent=2, allow_nan=False)
+                handle.write("\n")
+            # Check again before publishing bytes that may contain Director notes.
+            self.verify_writable()
+            if not self._matches_open_file(temporary, identity):
+                raise ValueError("Refusing Director catalog write: temporary file changed during publication.")
+            os.replace(temporary, path)
+        finally:
+            # Unlink only the file opened above, even if its parent became a link.
+            if temporary is not None and identity is not None and self._matches_open_file(temporary, identity):
+                temporary.unlink(missing_ok=True)
 
     def load(self):
         return FootageKnowledgeBase.from_dict(loads(self.path.read_text(encoding="utf-8")))
 
     def initialize(self, database):
         with self._lock:
+            self.verify_writable()
             if self.path.exists():
                 raise FileExistsError(self.path)
-            _write_json(self.path, database.to_dict())
+            self._write(self.path, database.to_dict())
 
     def update(self, change):
         with self._lock:
+            self.verify_writable()
             data = self.load()
             previous = data.to_dict()
             existing_plans = {plan.plan_id for plan in data.edit_plans}
@@ -233,8 +304,9 @@ class FKBStore:
                     data.bind_edit_plan(plan)
             current = data.to_dict()
             if current != previous:
-                _write_json(self.backup, previous)
-                _write_json(self.path, current)
+                self.verify_writable()
+                self._write(self.backup, previous)
+                self._write(self.path, current)
             return result
 
     def ingest(self, source, *, fps, timeline_start_frame=0, review_session_start_frame=0, project_id=None,
@@ -245,6 +317,7 @@ class FKBStore:
                                   cues_by_part=cues_by_part, audio_by_part=audio_by_part,
                                   review_manifest=review_manifest)
         with self._lock:
+            self.verify_writable()
             if not self.path.exists():
                 self.initialize(incoming)
                 return
