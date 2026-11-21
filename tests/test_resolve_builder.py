@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_builder import build_export, describe_failure, import_sources, main
+from autoclipper.resolve_builder import (build_export, describe_failure, import_reference_sources,
+                                         import_sources, main, read_export, reference_xml_matches)
 from autoclipper.resolve_manifest import build_manifest, build_review_manifest, compile_edit_plan, source_mapping_digest
 
 from director_fixtures import confirmed_mics, synthetic_probe
@@ -71,7 +72,8 @@ def fake_resolve():
     project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = "scratch-project-id"
     pool = project.GetMediaPool.return_value
     timeline, reopened_timeline = pool.CreateEmptyTimeline.return_value, Mock()
-    state = {"current": None, "media": [], "video": [], "audio": [], "markers": {}}
+    state = {"current": None, "media": [], "reference_media": [], "video": [], "audio": [],
+             "audio2": [], "markers": {}, "reference_folder": None, "current_folder": "root"}
     manager.GetCurrentProject.side_effect = lambda: state["current"]
     manager.GetProjectListInCurrentFolder.return_value = []
     project.GetTimelineCount.return_value = 0
@@ -80,14 +82,34 @@ def fake_resolve():
     reopened.GetMediaPool.return_value.GetRootFolder.return_value.GetClipList.side_effect = (
         lambda: list(state["media"])
     )
+    root_folder = pool.GetRootFolder.return_value
+    root_folder.GetClipList.side_effect = lambda: list(state["media"])
+    root_folder.GetSubFolderList.side_effect = lambda: ([state["reference_folder"]]
+                                                        if state["reference_folder"] else [])
+    reopened.GetMediaPool.return_value.GetRootFolder.return_value = root_folder
+    def add_folder(_root, name):
+        folder = Mock()
+        folder.GetName.return_value = name
+        folder.GetClipList.side_effect = lambda: list(state["reference_media"])
+        state["reference_folder"] = folder
+        return folder
+    pool.AddSubFolder.side_effect = add_folder
+    pool.SetCurrentFolder.side_effect = lambda folder: state.update(
+        current_folder="root" if folder is root_folder else "reference") or True
     for item in (timeline, reopened_timeline):
         item.GetName.return_value = "synthetic-session"
         item.GetUniqueId.return_value = "review-timeline-id"
         item.GetSettings.return_value = {"timelineFrameRate": "60"}
         item.GetStartFrame.return_value = 216000
         item.GetStartTimecode.return_value = "01:00:00:00"
-        item.GetItemListInTrack.side_effect = lambda kind, index: list(state[kind])
+        item.GetItemListInTrack.side_effect = lambda kind, index: list(
+            state["audio2"] if kind == "audio" and index == 2 else state[kind])
         item.GetMarkerCustomData.side_effect = lambda offset: state["markers"][offset]
+        item.GetTrackCount.side_effect = lambda kind: 2 if kind == "audio" and state["reference_folder"] else 1
+        item.SetTrackName.side_effect = lambda kind, index, name: state.update(track_name=name) or True
+        item.GetTrackName.side_effect = lambda kind, index: state.get("track_name", "")
+        item.GetTrackSubType.return_value = "stereo"
+        item.GetIsTrackEnabled.return_value = True
 
     def create_project(name, _):
         project.GetName.return_value = reopened.GetName.return_value = name
@@ -141,7 +163,7 @@ def fake_resolve():
         clip.SetAudioMapping.side_effect = set_mapping
         clip.SetMarkInOut.side_effect = set_marks
         clip.ClearMarkInOut.side_effect = clear_marks
-        state["media"].append(clip)
+        state["reference_media" if state["current_folder"] == "reference" else "media"].append(clip)
         return [clip]
 
     def create_multicam(sources, options):
@@ -171,7 +193,7 @@ def fake_resolve():
             item.GetSourceAudioChannelMapping.return_value = json.dumps({
                 "track_mapping": {"1": {"channel_idx": [1, 2], "mute": False, "type": "stereo"}},
             })
-            state[kind].append(item)
+            state["audio2" if kind == "audio" and info["trackIndex"] == 2 else kind].append(item)
             items.append(item)
         return items
 
@@ -191,6 +213,171 @@ def fake_resolve():
 
 
 class ResolveBuilderTests(unittest.TestCase):
+    def test_reference_start_getter_discrepancy_needs_matching_xml(self):
+        sdk, _, state, project, reopened = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            manifest["segments"] = manifest["segments"][:1]
+            for angle in manifest["segments"][0]["angles"]:
+                Path(angle["mp4_path"]).touch()
+            segment = manifest["segments"][0]
+            angle = segment["angles"][0]
+            track = {"status": "verified", "mp4_audio_stream_index": 1,
+                     "mp4_audio_ordinal": 1, "mp4_audio_title": "Track1",
+                     "resolve_channels": [1, 2], "resolve_channels_status": "expected"}
+            angle["reference_track"] = track
+            segment["reference_audio"] = {
+                "pov_id": angle["pov_id"], "pov_name": angle["pov_name"],
+                "part_id": angle["part_id"], "mp4_path": angle["mp4_path"],
+                "source_in_frame": angle["source_in_frame"],
+                "source_out_frame": angle["source_out_frame"],
+                "record_start_frame": 0, "duration_frames": 60, "track": track}
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), patch(
+                    "autoclipper.resolve_builder.mkdtemp", return_value=folder):
+                build_export(manifest)
+            ref = segment["reference_audio"]
+            ref.update(source_in_frame=31113, source_out_frame=31173)
+            item = state["audio2"][0]
+            item.GetSourceStartFrame.return_value = 31112
+            item.GetSourceEndFrame.return_value = 31173
+            timeline = reopened.GetTimelineByIndex(1)
+            name = f"001 {segment['segment_id']}"
+            with patch("autoclipper.resolve_builder.reference_xml_matches", return_value=True) as xml:
+                read_export(timeline, [segment], [name])
+                xml.assert_called_once_with(timeline, ref, 216000, 60)
+            with patch("autoclipper.resolve_builder.reference_xml_matches", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "source_start.*31113.*31112"):
+                    read_export(timeline, [segment], [name])
+            for source_start, source_end, duration in ((31112, 31172, 60),
+                                                       (31111, 31173, 60),
+                                                       (31112, 31173, 59)):
+                with self.subTest(source_start=source_start, source_end=source_end,
+                                  duration=duration), patch(
+                        "autoclipper.resolve_builder.reference_xml_matches", return_value=True) as xml:
+                    item.GetSourceStartFrame.return_value = source_start
+                    item.GetSourceEndFrame.return_value = source_end
+                    item.GetDuration.return_value = duration
+                    with self.assertRaisesRegex(RuntimeError, "Reference audio source or placement differs"):
+                        read_export(timeline, [segment], [name])
+                    xml.assert_not_called()
+
+    def test_reference_xml_confirms_exact_source_and_record_range(self):
+        sdk = Mock()
+        resolve = sdk.scriptapp.return_value
+        resolve.EXPORT_FCP_7_XML = "fcp7"
+        resolve.EXPORT_NONE = "none"
+        timeline = Mock()
+        timeline.GetStartFrame.return_value = 216000
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "Andres P2.mp4"
+            ref = {"mp4_path": str(source), "source_in_frame": 31113,
+                   "source_out_frame": 33093}
+
+            xml_in = 31113
+            xml_out = 33093
+            xml_start = 50100
+            xml_end = 52080
+            xml_path = source
+            xml_track = 2
+            xml_copies = 1
+
+            def export(path, _type, _subtype):
+                clip = (f'<clipitem><start>{xml_start}</start><end>{xml_end}</end>'
+                        f'<in>{xml_in}</in><out>{xml_out}</out><file id="source"/>'
+                        '</clipitem>')
+                tracks = ['<track>' + (clip * xml_copies if index == xml_track else '')
+                          + '</track>' for index in (1, 2)]
+                Path(path).write_text(
+                    '<xmeml><sequence><media><audio>' + ''.join(tracks)
+                    + '</audio></media></sequence>'
+                    + f'<file id="source"><pathurl>{xml_path.as_uri()}</pathurl></file></xmeml>',
+                    encoding="utf-8")
+                return True
+
+            timeline.Export.side_effect = export
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
+                self.assertTrue(reference_xml_matches(timeline, ref, 266100, 1980))
+                for wrong in ("in_early", "in_late", "out_early", "out_late",
+                              "start", "end", "path", "track", "duplicate"):
+                    with self.subTest(wrong=wrong):
+                        xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                        xml_path, xml_track, xml_copies = source, 2, 1
+                        if wrong == "in_early":
+                            xml_in = 31112
+                        elif wrong == "in_late":
+                            xml_in = 31114
+                        elif wrong == "out_early":
+                            xml_out = 33092
+                        elif wrong == "out_late":
+                            xml_out = 33094
+                        elif wrong == "start":
+                            xml_start = 50101
+                        elif wrong == "end":
+                            xml_end = 52079
+                        elif wrong == "path":
+                            xml_path = Path(folder) / "other.mp4"
+                        elif wrong == "track":
+                            xml_track = 1
+                        else:
+                            xml_copies = 2
+                        self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+
+                xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                xml_path, xml_track, xml_copies = source, 2, 1
+
+                def export_false(path, _type, _subtype):
+                    export(path, _type, _subtype)
+                    return False
+
+                timeline.Export.side_effect = export_false
+                self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+                timeline.Export.side_effect = RuntimeError("Resolve export failed")
+                self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+
+    def test_reference_audio_uses_separate_item_and_track_after_reopen(self):
+        sdk, _, state, project, _ = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            manifest["segments"] = manifest["segments"][:1]
+            for angle in manifest["segments"][0]["angles"]:
+                (Path(angle["mp4_path"])).touch()
+            segment = manifest["segments"][0]
+            angle = segment["angles"][0]
+            track = {"status": "verified", "mp4_audio_stream_index": 1,
+                     "mp4_audio_ordinal": 1, "mp4_audio_title": "Track1",
+                     "resolve_channels": [1, 2], "resolve_channels_status": "expected"}
+            angle["reference_track"] = track
+            segment["reference_audio"] = {
+                "pov_id": angle["pov_id"], "pov_name": angle["pov_name"],
+                "part_id": angle["part_id"], "mp4_path": angle["mp4_path"],
+                "source_in_frame": angle["source_in_frame"],
+                "source_out_frame": angle["source_out_frame"],
+                "record_start_frame": 0, "duration_frames": 60, "track": track}
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), patch(
+                    "autoclipper.resolve_builder.mkdtemp", return_value=folder):
+                result = build_export(manifest)
+            self.assertEqual(len(state["audio"]), 1)
+            self.assertEqual(len(state["audio2"]), 1)
+            self.assertEqual(state["track_name"], "GROUP REFERENCE AUDIO")
+            project.GetMediaPool.return_value.CreateEmptyTimeline.return_value.AddTrack.assert_called_once_with(
+                "audio", "stereo")
+            ref = result["segments"][0]["reference_audio"]
+            self.assertEqual((ref["path"], ref["source_start"], ref["record_start"], ref["channels"]),
+                             (angle["mp4_path"], angle["source_in_frame"], 216000, [1, 2]))
+            self.assertEqual(len(state["media"]), 2)
+            self.assertEqual(len(state["reference_media"]), 1)
+
+    def test_reference_import_rejects_reused_mic_item(self):
+        pool, clip = Mock(), Mock()
+        path = Path("source.mp4").resolve()
+        pool.ImportMedia.return_value = [clip]
+        angle = {"mp4_path": str(path), "reference_track": {"mp4_audio_ordinal": 1}}
+        segment = {"reference_audio": {"mp4_path": str(path), "track": angle["reference_track"]}}
+        with self.assertRaisesRegex(RuntimeError, "reused the mic-mapped item"):
+            import_reference_sources(pool, [segment], {path: clip}, 60)
+
     def test_session_to_manifest_to_builder_dry_run(self):
         sdk = Mock()
         with tempfile.TemporaryDirectory() as folder:

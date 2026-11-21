@@ -177,6 +177,38 @@ def _mic(metadata, streams, part_id, speaker, confirmations):
         mic["evidence"] += " (overrides conflicting transcriber metadata)"
     return mic, None
 
+
+def _reference_track(metadata, streams, mic):
+    """Resolve the OBS Track1 mix only when its identity and stereo mapping agree."""
+    audio = sorted((s for s in streams if s.get("codec_type") == "audio"),
+                   key=lambda s: s["index"])
+    matches = [s for s in audio if _normalized((s.get("tags") or {}).get("title")).replace(" ", "") == "track1"]
+    reason = None
+    if len(matches) != 1:
+        reason = "Track1 is missing or ambiguous in the MP4 audio inventory."
+    else:
+        stream = matches[0]
+        ordinal = audio.index(stream) + 1
+        counts = [s.get("channels") for s in audio[:ordinal]]
+        labels = [row["speaker"] for row in _tracks(metadata)
+                  if row["track"] == 1 and _normalized(row.get("speaker"))]
+        if mic and (stream["index"] == mic["mp4_audio_stream_index"]
+                      or ordinal == mic["mp4_audio_ordinal"]):
+            reason = "Track1 is the verified owner mic, not a separate group mix."
+        elif len(labels) > 1 or any(_normalized(label).strip("[]") not in
+                                  {"team", "game audio", "system audio", "desktop audio",
+                                   "discord", "discord audio", "mix", "group mix"}
+                                  for label in labels):
+            reason = f"Metadata labels Track1 as {', '.join(repr(label) for label in labels)}; its group/system mix identity is unverified."
+        elif not all(_track_number(count) for count in counts) or counts[-1] != 2:
+            reason = "Track1 is not a verified stereo pair."
+        else:
+            return {"status": "verified", "mp4_audio_stream_index": stream["index"],
+                    "mp4_audio_ordinal": ordinal, "mp4_audio_title": "Track1",
+                    "resolve_channels": list(range(sum(counts[:-1]) + 1, sum(counts) + 1)),
+                    "resolve_channels_status": "expected", "evidence": "MP4 Track1 title + stereo stream inventory"}
+    return {"status": "omitted", "reason": reason}
+
 def _rate(stream):
     for key in ("r_frame_rate", "avg_frame_rate"):
         try:
@@ -210,7 +242,7 @@ def _video_frames(stream, fps):
     return max(0, floor(duration * fps))
 
 
-def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=False):
+def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=False, reference=False):
     source = folder / part.video_path if part.video_path else None
     resolved = resolve_recording(folder, part.video_path, require_mp4=True)
     mp4 = resolved.path
@@ -236,6 +268,8 @@ def _part_media(folder, roots, pov, part, confirmations, fps, *, frame_count=Fal
     game = any(_normalized(track.get("speaker")).strip("[]") == "game audio"
                for track in _tracks(metadata))
     media = {"mp4_path": str(mp4.resolve()), "mic": mic}
+    if reference:
+        media["reference_track"] = _reference_track(metadata, streams, mic)
     if frame_count:
         media["source_frame_count"] = frames
     return media, source_part, problem, game
@@ -342,7 +376,7 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
     # determine coverage. Keep the session duration only for unavailable media.
     last_selection_end = max(end for _, end, _, _ in selected)
     media_cache = {
-        part.part_id: _part_media(folder, roots, pov, part, confirmations, fps)
+        part.part_id: _part_media(folder, roots, pov, part, confirmations, fps, reference=True)
         for pov, part in session.all_parts() if part.offset < last_selection_end
     }
     for pov, part in session.all_parts():
@@ -452,6 +486,35 @@ def build_manifest(session, transcripts_dir=None, confirmations=None, fps=None) 
     if not manifest["segments"] or any(not segment["angles"] for segment in manifest["segments"]):
         manifest["blockers"].append({"code": "no_angles", "part_id": None, "pov_name": None,
                                      "message": "An export needs an angle in every segment."})
+    # Prefer the POV with the most selected frames, then use a covered valid POV.
+    totals = Counter()
+    for segment in manifest["segments"]:
+        for angle in segment["angles"]:
+            totals[angle["pov_id"]] += segment["duration_frames"]
+    preference = sorted(totals, key=lambda pov_id: (-totals[pov_id], pov_id))
+    warned_parts = set()
+    for segment in manifest["segments"]:
+        for angle in segment["angles"]:
+            ref = angle["reference_track"]
+            if ref["status"] != "verified" and angle["part_id"] not in warned_parts:
+                warned_parts.add(angle["part_id"])
+                manifest["warnings"].append({"code": "reference_track_unverified",
+                    "part_id": angle["part_id"], "pov_name": angle["pov_name"],
+                    "message": f"GROUP REFERENCE AUDIO omitted for this part: {ref['reason']}"})
+        choice = next((angle for pov_id in preference for angle in segment["angles"]
+                       if angle["pov_id"] == pov_id and angle["reference_track"]["status"] == "verified"), None)
+        if choice:
+            segment["reference_audio"] = {key: choice[key] for key in
+                ("pov_id", "pov_name", "part_id", "mp4_path", "source_in_frame", "source_out_frame")}
+            segment["reference_audio"].update(
+                record_start_frame=segment["record_start_frame"],
+                duration_frames=segment["duration_frames"],
+                track=choice["reference_track"])
+        else:
+            segment["reference_audio"] = None
+            manifest["warnings"].append({"code": "reference_audio_gap",
+                "event_id": segment["event_id"], "segment_id": segment["segment_id"],
+                "message": f"GROUP REFERENCE AUDIO has a gap for {segment['segment_id']}: no covered verified mix."})
     if not game_identified:
         manifest["warnings"].append({"code": "game_audio_unidentified", "message": "Game audio not identified."})
     return manifest
@@ -938,6 +1001,7 @@ def render_report(manifest) -> str:
         return str(value).replace("|", r"\|").replace("\r", " ").replace("\n", " ")
 
     segments = manifest["segments"]
+    reference_mode = manifest.get("mode") not in {"director_review", "director_edit_plan"}
     selected = {segment["suggestion_id"] for segment in segments}
     label = {"director_review": "Full-session review", "director_edit_plan": "Director edit plan"}.get(
         manifest.get("mode"), f"{len(selected)} timed Keep selections")
@@ -949,9 +1013,15 @@ def render_report(manifest) -> str:
         "",
         "Multicam audio uses Resolve Source mode with one switchable owner-mic pair.",
         "",
-        "| Segment | Selection | Session seconds | Record frame | Frames | Angles and mics | Unavailable |",
-        "| --- | --- | --- | ---: | ---: | --- | --- |",
     ]
+    if reference_mode:
+        lines.insert(-1, "GROUP REFERENCE AUDIO is a separate enabled track from a verified Track1 mix; disable or mute it before the final render if it is not wanted.")
+    lines.extend((
+        "| Segment | Selection | Session seconds | Record frame | Frames | Angles and mics |"
+        + (" Group reference audio |" if reference_mode else "") + " Unavailable |",
+        "| --- | --- | --- | ---: | ---: | --- |"
+        + (" --- |" if reference_mode else "") + " --- |",
+    ))
     for segment in segments:
         angles = ", ".join(
             f"{angle['pov_name']} P{angle['part_index']} ({angle['mic']['status']}, "
@@ -960,8 +1030,13 @@ def render_report(manifest) -> str:
         missing = ", ".join(f"{pov['pov_name']} ({pov['reason']})" for pov in segment["unavailable"])
         session_span = (f"{segment['session_start']:.3f}–{segment['session_end']:.3f}"
                         if "session_start" in segment else "Placeholder")
+        reference = segment.get("reference_audio")
+        reference_text = (f"{reference['pov_name']} / {reference['part_id']} "
+                          f"(ch {', '.join(map(str, reference['track']['resolve_channels']))})"
+                          if reference else "gap" if "reference_audio" in segment else "—")
         row = (segment["segment_id"], f"{segment['title']} ({segment['range_source']})", session_span,
-               segment["record_start_frame"], segment["duration_frames"], angles or "—", missing or "—")
+               segment["record_start_frame"], segment["duration_frames"], angles or "—",
+               *((reference_text,) if reference_mode else ()), missing or "—")
         lines.append("| " + " | ".join(map(cell, row)) + " |")
     for heading in ("blockers", "warnings"):
         lines.extend(("", f"## {heading.title()}", ""))

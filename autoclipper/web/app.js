@@ -906,7 +906,7 @@ function resolveSegmentsTable(man) {
   const warn = {};
   for (const w of man.warnings) if (w.event_id) (warn[w.event_id] = warn[w.event_id] || []).push(w);
   return h("table", { class: "t resolve-segs" },
-    h("thead", null, h("tr", null, ["#", "Event", "Title", "Session range", "Angles", "Unavailable", "Notes"].map((x) => h("th", null, x)))),
+    h("thead", null, h("tr", null, ["#", "Event", "Title", "Session range", "Angles", "Group reference audio", "Unavailable", "Notes"].map((x) => h("th", null, x)))),
     h("tbody", null, man.segments.map((sg, i) => {
       const notes = [];
       if (sg.pieces > 1) notes.push(h("span", { class: "badge warn" }, `piece ${sg.piece}/${sg.pieces}`));
@@ -918,6 +918,7 @@ function resolveSegmentsTable(man) {
         h("td", null, sg.title, " ", h("span", { class: "muted small" }, `(${sg.range_source})`)),
         h("td", { class: "mono small" }, `${fmt(sg.session_start)} – ${fmt(sg.session_end)}`, h("div", { class: "muted" }, fmtDur(sg.session_end - sg.session_start))),
         h("td", null, sg.angles.length ? sg.angles.map((a) => h("span", { class: "badge good" }, `${a.pov_name} P${a.part_index}`)) : h("span", { class: "bad-text" }, "none")),
+        h("td", null, sg.reference_audio ? `${sg.reference_audio.pov_name} / ${sg.reference_audio.part_id}` : h("span", { class: "warn-text" }, "gap")),
         h("td", null, sg.unavailable.map((u) => h("span", { class: "badge bad", title: u.reason }, `${u.pov_name}: ${RESOLVE_REASONS[u.reason] || u.reason}`))),
         h("td", null, notes));
     })));
