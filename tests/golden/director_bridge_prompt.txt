@@ -1,0 +1,114 @@
+You are the editor of a short highlight edit built from ONE multiplayer playtest session. A human
+reviewer marked NOTES on moments while watching the review timeline. Choose clips that are anchored
+to those notes and put them in the order they should PLAY. Auto-Clipper validates your answer
+strictly and assembles it in a new DaVinci Resolve project; the human editor refines it afterwards.
+
+SESSION
+Schema: autoclipper.director_bridge_prompt.v1
+Session id: synthetic
+Frame rate: 60 fps (non-drop). Frames are integers; a range [In, Out) includes In and excludes Out.
+Review window: 01:00:00:00-01:01:00:00 (frames [0, 3600))
+Source mapping digest: <masked>
+Transcript context: +/-20 s around each note
+EXPORT ID: <masked>
+
+RULES
+- Clips play in the order you list them. They need not be chronological.
+- Every source clip cites at least one note in note_ids (use the aliases N01, N02, ... below).
+  Anchor each clip with exactly ONE of:
+  (a) note: one of its note_ids; the clip is that note's range, widened by pad_before/pad_after (0-10 s);
+  (b) start_line + end_line: transcript line aliases (S0001 ...); the clip runs from the start of
+      start_line to the end of end_line, widened by the pads;
+  (c) session_in_frame + session_out_frame (exclusive) plus in_tc + out_tc (the timecodes below);
+      no pads. Use only when you need exact frames.
+  The clip must overlap the transcript context shown for a note it cites.
+- quotes: for (b) and (c) give at least one verbatim quote {"line", "text"} from inside the clip.
+  Copy the text exactly. Never invent note aliases, line aliases, quotes or pov ids.
+- pov: null (recommended) = multicam of every camera covering the clip; or one pov id with verified
+  video for the WHOLE clip. audio_pov: null (recommended) = each angle's own mic; or one pov id whose
+  own mic covers the WHOLE clip. A range outside COVERAGE is rejected, not replaced by a slate.
+- Clips are 0.5-300 s each. Use a placeholder (0.5-30 s) only for a beat that must be filmed or a
+  title card; it becomes a labelled slate. ids are short and unique (C01, C02, P01).
+- Provide the COMPLETE answer in one JSON object. Any problem rejects the whole answer.
+
+OUTPUT
+Return ONLY one JSON object (no prose before or after) shaped like this (<...> are placeholders):
+{
+ "schema": "autoclipper.director_bridge.v1",
+ "export_id": "<EXPORT ID>",
+ "title": "<working title>",
+ "summary": "<one sentence>",
+ "clips": [
+  {
+   "id": "C01",
+   "kind": "source",
+   "title": "<what this clip shows>",
+   "note_ids": [
+    "<note alias>"
+   ],
+   "note": "<note alias>",
+   "pad_before": 1.5,
+   "pad_after": 2.0,
+   "pov": null,
+   "audio_pov": null,
+   "quotes": [
+    {
+     "line": "<line alias>",
+     "text": "<verbatim transcript text>"
+    }
+   ],
+   "why": "<editorial reason>"
+  },
+  {
+   "id": "C02",
+   "kind": "source",
+   "title": "<title>",
+   "note_ids": [
+    "<note alias>"
+   ],
+   "start_line": "<line alias>",
+   "end_line": "<line alias>",
+   "pad_before": 0,
+   "pad_after": 1,
+   "pov": "<pov id>",
+   "audio_pov": "<pov id>",
+   "quotes": [
+    {
+     "line": "<line alias>",
+     "text": "<verbatim text>"
+    }
+   ]
+  },
+  {
+   "id": "P01",
+   "kind": "placeholder",
+   "title": "<missing beat or title card>",
+   "seconds": 3
+  }
+ ]
+}
+
+JSON schema: {"$schema":"http://json-schema.org/draft-07/schema#","title":"AutoClipper Director notes edit plan","type":"object","additionalProperties":false,"required":["schema","export_id","title","clips"],"properties":{"schema":{"const":"autoclipper.director_bridge.v1"},"export_id":{"type":"string","description":"Copy EXPORT ID exactly"},"title":{"type":"string","maxLength":120},"summary":{"type":"string"},"clips":{"type":"array","minItems":1,"maxItems":60,"items":{"oneOf":[{"type":"object","additionalProperties":false,"required":["id","kind","title","note_ids"],"properties":{"id":{"type":"string"},"kind":{"const":"source"},"title":{"type":"string"},"note_ids":{"type":"array","minItems":1,"items":{"type":"string"}},"note":{"type":"string","description":"Anchor: one of note_ids; the clip is that note's range"},"start_line":{"type":"string"},"end_line":{"type":"string"},"session_in_frame":{"type":"integer"},"session_out_frame":{"type":"integer"},"in_tc":{"type":"string"},"out_tc":{"type":"string"},"pad_before":{"type":"number","minimum":0,"maximum":10},"pad_after":{"type":"number","minimum":0,"maximum":10},"pov":{"type":["string","null"]},"audio_pov":{"type":["string","null"]},"quotes":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["line","text"],"properties":{"line":{"type":"string"},"text":{"type":"string"},"speaker":{"type":"string"}}}},"why":{"type":"string"},"uncertainty":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["id","kind","title","seconds"],"properties":{"id":{"type":"string"},"kind":{"const":"placeholder"},"title":{"type":"string"},"seconds":{"type":"number","minimum":0.5,"maximum":30},"why":{"type":"string"}}}]}}}}
+
+COVERAGE (timecodes are the review timeline)
+- pov id "ada" (Ada): VIDEO and own MIC verified during 01:00:00:00-01:01:00:00
+- pov id "bob" (Bob): VIDEO and own MIC verified during 01:00:10:00-01:00:40:00; GAPS (cannot be used): 01:00:00:00-01:00:10:00, 01:00:40:00-01:01:00:00
+
+NOTES (3)
+N01 rev 0 | 01:00:20:00-01:00:23:00 | frames [1200, 1380) | "" | povs: ada, bob
+  text: Truck flip near the bridge
+N02 rev 0 | 01:00:21:40-01:00:25:00 | frames [1300, 1500) | "" | povs: ada, bob
+  text: Second angle on the flip
+N03 rev 0 | 01:00:40:00-01:00:42:00 | frames [2400, 2520) | "" | povs: ada
+  text: Recovery moment
+
+TRANSCRIPT
+Format: <line alias> [In, Out) <In timecode> <speaker>: <text>
+Speaker names come from that player's own microphone (reliable). "Team?" = heard over voice chat, speaker unknown (never guess who). "(?)" = wording uncertain. Cite line aliases in quotes.
+
+WINDOW 1: 01:00:00:00-01:01:02:00 (notes N01, N02, N03)
+S0001 [300, 480) 01:00:05:00 Ada: Truck staging near the bridge.
+S0002 [1200, 1380) 01:00:20:00 Ada: We are going to flip that truck.
+S0003 [1320, 1500) 01:00:22:00 Bob: I saw that from the other side.
+S0004 [1560, 1680) 01:00:26:00 Team?: Everyone behind the bridge.
+S0005 [2400, 2520) 01:00:40:00 Ada: Nice recovery everyone.
