@@ -36,25 +36,26 @@ The default interprets Resolve video Out as inclusive and stores `[In, Out + 1)`
    $env:RESOLVE_SCRIPT_API = "$env:ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"
    $env:RESOLVE_SCRIPT_LIB = "$env:ProgramFiles\Blackmagic Design\DaVinci Resolve\fusionscript.dll"
    $env:PYTHONPATH = "$env:RESOLVE_SCRIPT_API\Modules;$env:PYTHONPATH"
-   python -m autoclipper.director_poc prepare $sessionCopy $confirmationsCopy $mediaRoot --fps 60
+   python -m autoclipper.director_poc prepare $sessionCopy $confirmationsCopy $mediaRoot --session-root $mediaRoot --fps 60
    # Append --metadata $metadataCopies to prepare when supplied.
-   # If the copied JSON has a stale folder, append --session-root $mediaRoot.
    python -m autoclipper.director_poc build $scratch
+   python -m autoclipper.director_poc index-notes $scratch $sessionCopy --session-root $mediaRoot
    python -m autoclipper.director_poc companion $scratch --hz 10
    ```
 
-Use the same `--session-root` for `index-notes` when it was used for `prepare`.
-The override affects memory only and requires an existing source directory with
-the referenced recordings and SRTs. Missing SRTs stop preparation or indexing
-with a part-specific message. Preparation pins the resolved root and SRT content
-digests; indexing refuses a different root or changed SRT. For a copied JSON
-with an empty `folder`, both commands derive the root from the original copy's
-location; use `--session-root` if the recordings live elsewhere. Absolute SRT
-paths may lie outside that root; their contents are still pinned by digest.
-Older manifests without this source binding remain indexable, with a warning
-that their root and SRTs cannot be checked against preparation. A saved MKV
-reference uses its same-stem MP4 when
-the MKV is gone; the source JSON is not rewritten. A different recording
+Pass the approved unmodified session JSON copy and the same approved media/session
+folder as `--session-root` to both offline commands. No hand edit of the JSON
+`folder` is needed. The override affects memory only. An MP4-only session with
+stale same-stem `.mkv` references is supported natively; the JSON is not rewritten.
+Preparation pins the resolved root and SRT content digests. A missing relative
+SRT refuses before scratch creation with `SRT missing for <part-id>: <srt-path>.
+Supply --session-root with the recording folder.` (For a missing absolute SRT,
+the final sentence is `Check this absolute SRT path.`) Indexing refuses a changed
+root or SRT with `Cannot index the source session. Session root or SRT contents
+differ from prepare. Use the same --session-root and unchanged SRTs, or prepare
+a new review.` Older manifests without this source binding remain indexable but
+print `Warning: this older manifest has no pinned session root or SRT digests;
+index-notes cannot verify those inputs against prepare.` A different recording
 reference changes catalog identity and is rejected during indexing.
 
 3. **Capture (5 min).** Keep automatic polling Off. With playback paused, owner sets known distinct video marks in Resolve and presses the displayed hotkey with Resolve focused. Compare the displayed and saved range with the UI endpoints and duration. Clear both marks, then test equal In and Out. A1 first measured polling stalls in the original `playhead.csv` and isolated the timecode read in `rpc-probe.csv`. The child-process companion uses `rpc-probe.csv` for subsequent capture and diagnostic timings.
