@@ -10,8 +10,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from autoclipper.director_notes import NotesCatalog
 from autoclipper.director_poc.__main__ import initialize_fkb, main
 from autoclipper.fkb import FKBStore, FootageKnowledgeBase, Session
+from autoclipper.models import Session as SourceSession
 
 
 class DirectorWriteSafetyTests(unittest.TestCase):
@@ -26,19 +28,20 @@ class DirectorWriteSafetyTests(unittest.TestCase):
         self.outside_marker = self.outside / "preserve.txt"
         self.outside_marker.write_bytes(b"outside bytes")
 
-    def link_directory(self, kind):
+    def link_directory(self, kind, target=None):
         link = self.scratch / ".autoclipper"
+        target = target or self.outside
         if kind == "junction":
             if os.name != "nt":
                 self.skipTest("Windows junctions only")
-            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(self.outside)],
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
                                     capture_output=True, text=True)
             if result.returncode:
                 self.fail(result.stderr or result.stdout)
             self.addCleanup(lambda: os.rmdir(link) if os.path.lexists(link) else None)
         else:
             try:
-                link.symlink_to(self.outside, target_is_directory=True)
+                link.symlink_to(target, target_is_directory=True)
             except (OSError, NotImplementedError) as exc:
                 self.skipTest(f"Directory symlink unavailable: {exc}")
             self.addCleanup(lambda: link.unlink() if os.path.lexists(link) else None)
@@ -98,6 +101,65 @@ class DirectorWriteSafetyTests(unittest.TestCase):
             store.update(lambda data: setattr(data, "mapping_stale", True))
         self.assertEqual((real / "director-fkb.json").read_bytes(), original)
         self.assertFalse((real / "director-fkb.json.bak").exists())
+        self.assert_outside_untouched()
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions only")
+    def test_swap_before_temporary_creation_never_writes_catalog_outside(self):
+        store = FKBStore(self.scratch)
+        original_verify = store.verify_writable
+        calls = 0
+
+        def swap_on_second_verify():
+            nonlocal calls
+            calls += 1
+            directory = original_verify()
+            if calls == 2:
+                directory.rename(self.scratch / "saved-real-directory")
+                self.link_directory("junction")
+            return directory
+
+        with (patch.object(store, "verify_writable", side_effect=swap_on_second_verify),
+              self.assertRaisesRegex(ValueError, "real .autoclipper directory")):
+            store.initialize(FootageKnowledgeBase(Session("private catalog note", 24)))
+        self.assertGreaterEqual(calls, 3)
+        self.assert_outside_untouched()
+
+    def test_ingest_refresh_refuses_swapped_directory(self):
+        store = FKBStore(self.scratch)
+        source = SourceSession(session_id="synthetic", folder=str(self.scratch), povs=[])
+        store.ingest(source, fps=24)
+        original = store.path.read_bytes()
+        real = self.scratch / "saved-real-directory"
+        store.path.parent.rename(real)
+        self.link_directory("junction" if os.name == "nt" else "symlink")
+        with self.assertRaisesRegex(ValueError, "real .autoclipper directory"):
+            store.ingest(source, fps=24)
+        self.assertEqual((real / "director-fkb.json").read_bytes(), original)
+        self.assert_outside_untouched()
+
+    def test_persistent_notes_refuse_swapped_directory(self):
+        store = FKBStore(self.scratch)
+        store.initialize(FootageKnowledgeBase(Session("synthetic", 24)))
+        original = store.path.read_bytes()
+        real = self.scratch / "saved-real-directory"
+        store.path.parent.rename(real)
+        self.link_directory("junction" if os.name == "nt" else "symlink")
+        with self.assertRaisesRegex(ValueError, "real .autoclipper directory"):
+            NotesCatalog(store).create(None, "private note", playback="paused")
+        self.assertEqual((real / "director-fkb.json").read_bytes(), original)
+        self.assert_outside_untouched()
+
+    def test_dangling_directory_symlink_is_refused(self):
+        self.link_directory("symlink", self.base / "missing")
+        with self.assertRaisesRegex(ValueError, "real .autoclipper directory"):
+            FKBStore(self.scratch).initialize(FootageKnowledgeBase(Session("test", 24)))
+        self.assert_outside_untouched()
+
+    @unittest.skipUnless(os.name == "nt", "Windows junctions only")
+    def test_missing_target_junction_is_refused(self):
+        self.link_directory("junction", self.base / "missing")
+        with self.assertRaisesRegex(ValueError, "real .autoclipper directory"):
+            FKBStore(self.scratch).initialize(FootageKnowledgeBase(Session("test", 24)))
         self.assert_outside_untouched()
 
     def test_catalog_and_backup_symlinks_block_publication(self):

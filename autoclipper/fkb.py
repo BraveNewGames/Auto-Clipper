@@ -228,6 +228,8 @@ class FKBStore:
 
     def verify_writable(self):
         directory = self.path.parent
+        if not self.root.is_dir():
+            raise ValueError(f"Refusing Director catalog write: scratch folder {self.root} is missing.")
         if self._is_link(directory):
             raise ValueError(f"Refusing Director catalog write: {directory} is a link or reparse point. "
                              "Use a real .autoclipper directory inside the scratch folder.")
@@ -245,23 +247,39 @@ class FKBStore:
                                  "Remove the link from the scratch folder before retrying.")
         return directory
 
+    @classmethod
+    def _matches_open_file(cls, path, identity):
+        if cls._is_link(path):
+            return False
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        return (current.st_dev, current.st_ino) == identity
+
     def _write(self, path, data):
         directory = self.verify_writable()
         temporary = None
+        identity = None
         try:
             with NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
                                     delete=False) as handle:
                 temporary = Path(handle.name)
+                opened = os.fstat(handle.fileno())
+                identity = (opened.st_dev, opened.st_ino)
+                self.verify_writable()
+                if not self._matches_open_file(temporary, identity):
+                    raise ValueError("Refusing Director catalog write: temporary file changed during publication.")
                 json.dump(data, handle, ensure_ascii=False, indent=2, allow_nan=False)
                 handle.write("\n")
-            # A directory can be replaced after construction or during serialization.
+            # Check again before publishing bytes that may contain Director notes.
             self.verify_writable()
-            if temporary.parent.resolve() != directory.resolve():
-                raise ValueError("Refusing Director catalog write: scratch directory changed during publication.")
+            if not self._matches_open_file(temporary, identity):
+                raise ValueError("Refusing Director catalog write: temporary file changed during publication.")
             os.replace(temporary, path)
         finally:
-            # If the directory was replaced, do not clean up through its new link.
-            if temporary is not None and not self._is_link(directory):
+            # Unlink only the file opened above, even if its parent became a link.
+            if temporary is not None and identity is not None and self._matches_open_file(temporary, identity):
                 temporary.unlink(missing_ok=True)
 
     def load(self):
