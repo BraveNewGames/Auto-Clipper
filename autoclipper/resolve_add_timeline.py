@@ -122,7 +122,6 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
     root = require(pool.GetRootFolder(), "Media pool root is unavailable")
     before_timelines = list_timelines(project)
     before_clips = walk_clips(root)
-    before_ids = {uid for uid, _ in before_clips}
     segments = manifest["segments"]
     timeline_name, names = unique_names(
         timeline_base, [n for _, n in before_timelines], [n for _, n in before_clips],
@@ -148,12 +147,16 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
             reference_clips[path] = found
     require(still_active(), "The open project changed before the build started")
 
-    created = {"timeline": None, "folder": None}
+    # Imports, the timeline and multicams land in the selected bin: use the root bin, then put the
+    # user's selection back (also on failure).
+    previous_folder = require(pool.GetCurrentFolder(), "Could not read the selected media pool bin")
+    require(pool.SetCurrentFolder(root), "Could not select the root media pool bin")
+    created = {"timeline": None, "folder": None, "clips": []}
     try:
         timeline = require(pool.CreateEmptyTimeline(timeline_name, START_TIMECODE), "Could not create the timeline")
         created["timeline"] = timeline
         require(Fraction(timeline.GetSettings()["timelineFrameRate"]) == fps, "New timeline rate differs")
-        clips.update(import_sources(pool, to_import, fps))
+        clips.update(import_sources(pool, to_import, fps, created=created["clips"]))
         if reference_import:
             folder = reference_folder
             if folder is None:
@@ -162,7 +165,8 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
             require(pool.SetCurrentFolder(folder), "Could not select reference audio bin")
             try:
                 for path, track in reference_import.items():
-                    reference_clips[path] = import_one_reference(pool, path, track, clips[path], fps)
+                    reference_clips[path] = import_one_reference(pool, path, track, clips[path], fps,
+                                                                       created=created["clips"])
             finally:
                 require(pool.SetCurrentFolder(root), "Could not restore source media bin")
         if references:
@@ -175,10 +179,12 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
                     "Could not enable GROUP REFERENCE AUDIO track")
         for segment, multicam_name in zip(segments, names):
             if segment["angles"]:
-                build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps)
+                build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps,
+                              created=created["clips"])
                 append_reference(pool, timeline, segment, reference_clips)
             elif segment.get("kind") == "placeholder":
-                build_placeholder(project, pool, timeline, segment, slates[segment["segment_id"]])
+                build_placeholder(project, pool, timeline, segment, slates[segment["segment_id"]],
+                                  created=created["clips"])
         read_export(timeline, segments, names, slates)
         require(still_active(), "The open project is no longer active")
         require(manager.SaveProject(), f"Could not save {project_name}")
@@ -205,8 +211,14 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
                     f"Source media name, status or mic mapping differs for {path}")
             sources.append({"path": str(path), "pov_name": binding[1], "mic_channels": list(binding[5]),
                             "reused": path not in to_import})
+        require(pool.SetCurrentFolder(previous_folder), "Could not restore the selected media pool bin")
     except BaseException as original:
-        failures = rollback(pool, root, project, created, before_ids)
+        failures = rollback(pool, root, project, created)
+        try:
+            if not pool.SetCurrentFolder(previous_folder):
+                failures.append("could not restore the media pool bin you had selected")
+        except Exception as exc:
+            failures.append(f"could not restore the media pool bin you had selected ({exc})")
         original.cleanup_failures = [*getattr(original, "cleanup_failures", []), *failures]
         raise
     return {"project": project_name, "timeline": timeline_name, "added_timeline": True, "fps": fps,
@@ -217,8 +229,8 @@ def build_into_open_project(manifest, resolve, manager, media, slates, timeline_
             "sources": sources, "segments": rows}
 
 
-def rollback(pool, root, project, created, before_ids):
-    """Remove only what this run created and can identify exactly. Return what could not be removed."""
+def rollback(pool, root, project, created):
+    """Remove only the items this run created, as returned by the Resolve calls. Return what was left."""
     failures = []
 
     def attempt(label, action):
@@ -230,15 +242,18 @@ def rollback(pool, root, project, created, before_ids):
 
     if created["timeline"] is not None:
         attempt("new timeline", lambda: pool_delete_timeline(project, pool, created["timeline"]))
-    try:
-        new_items = [clip for clip in clips_below(root) if clip.GetUniqueId() not in before_ids]
-    except Exception as exc:
-        failures.append(f"could not list new media pool items ({exc}); any items created by this run were left")
-        new_items = []
-    if new_items:
-        attempt(f"{len(new_items)} new media pool item(s)", lambda: pool.DeleteClips(new_items))
-    if created["folder"] is not None:
-        attempt(f"new {REFERENCE_TRACK_NAME} bin", lambda: pool.DeleteFolders([created["folder"]]))
+    if created["clips"]:
+        attempt(f"{len(created['clips'])} new media pool item(s)", lambda: pool.DeleteClips(list(created["clips"])))
+    folder = created["folder"]
+    if folder is not None:
+        def delete_folder():
+            leftover = clips_below(folder)
+            if leftover:
+                failures.append(f"new {REFERENCE_TRACK_NAME} bin: it contains {len(leftover)} item(s) this run did "
+                                "not create; the bin and those items were left in the project")
+                return True
+            return pool.DeleteFolders([folder])
+        attempt(f"new {REFERENCE_TRACK_NAME} bin", delete_folder)
     return failures
 
 

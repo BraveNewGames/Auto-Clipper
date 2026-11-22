@@ -229,12 +229,14 @@ def _track_label(value):
     return f"track{match[1]}" if match else label
 
 
-def import_sources(pool, media, fps):
+def import_sources(pool, media, fps, created=None):
     clips = {}
     for path, (_, name, track, ordinal, title, channels) in media.items():
         items = pool.ImportMedia([str(path)])
         require(items and len(items) == 1, f"Expected one imported clip for {path}")
         clip = items[0]
+        if created is not None:
+            created.append(clip)
         require(Path(clip.GetClipProperty("File Path")).resolve() == path, f"Imported path differs for {path}")
         require(Fraction(clip.GetClipProperty("FPS")) == fps, f"Unexpected imported rate for {path}")
         audio = json.loads(clip.GetAudioMapping())
@@ -264,11 +266,13 @@ def import_sources(pool, media, fps):
     return clips
 
 
-def import_one_reference(pool, path, track, mic_clip, fps):
+def import_one_reference(pool, path, track, mic_clip, fps, created=None):
     """Import one separate reference item into the pool's current bin and map it to the mix pair."""
     items = pool.ImportMedia([str(path)])
     require(items and len(items) == 1, f"Could not import separate reference item for {path}")
     clip = items[0]
+    if created is not None:
+        created.append(clip)
     require(clip.GetUniqueId() != mic_clip.GetUniqueId(),
             f"Resolve reused the mic-mapped item for reference audio: {path}")
     require(Path(clip.GetClipProperty("File Path")).resolve() == path
@@ -317,7 +321,7 @@ def append_reference(pool, timeline, segment, clips):
                 timeline.GetStartFrame() + ref["record_start_frame"], 2, audio_only=True)
 
 
-def build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps):
+def build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps, created=None):
     sources = []
     for angle in segment["angles"]:
         clip = clips[Path(angle["mp4_path"]).resolve()]
@@ -355,6 +359,8 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
         raise
     else:
         restore_source_marks(modified)
+    if created is not None and items:
+        created.extend(items)
     require(items and len(items) == 1, f"Resolve did not create one multicam for {multicam_name}")
     multicam = items[0]
     length = segment["duration_frames"]
@@ -395,8 +401,10 @@ def render_placeholder(folder, segment, fps):
     return target
 
 
-def build_placeholder(project, pool, timeline, segment, path):
+def build_placeholder(project, pool, timeline, segment, path, created=None):
     clips = pool.ImportMedia([str(path)])
+    if created is not None and clips:
+        created.extend(clips)
     require(clips and len(clips) == 1, "Could not import the missing-footage slate")
     clip = clips[0]
     name = f"MISSING FOOTAGE: {segment['title']}"

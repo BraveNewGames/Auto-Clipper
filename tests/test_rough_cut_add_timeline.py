@@ -85,6 +85,24 @@ class Scene:
                         state[key].remove(clip)
             return True
 
+        # The user's selected bin; every import/creation records which bin was selected at that moment.
+        self.user_bin = Mock(name="user bin")
+        self.selected = self.user_bin
+        self.selected_during = []
+        pool.GetCurrentFolder.side_effect = lambda: self.selected
+        set_folder = pool.SetCurrentFolder.side_effect
+
+        def select(folder):
+            self.selected = folder
+            return set_folder(folder)
+
+        pool.SetCurrentFolder.side_effect = select
+        import_media = pool.ImportMedia.side_effect
+        pool.ImportMedia.side_effect = lambda paths: (self.selected_during.append(self.selected),
+                                                      import_media(paths))[1]
+        create_timeline_now = pool.CreateEmptyTimeline.side_effect
+        pool.CreateEmptyTimeline.side_effect = lambda *a: (self.selected_during.append(self.selected),
+                                                           create_timeline_now(*a))[1]
         pool.DeleteClips.side_effect = delete_clips
         pool.DeleteTimelines.side_effect = lambda items: [self.timelines.remove(t) for t in items] and True
         pool.DeleteFolders.side_effect = lambda folders: state.update(reference_folder=None) or True
@@ -268,6 +286,80 @@ class AddTimelineTests(unittest.TestCase):
         self.assertEqual(getattr(caught.exception, "cleanup_failures", []), [])
         deleted = scene.pool.DeleteClips.call_args.args[0]
         self.assertNotIn(kept[0], deleted)
+
+    def test_builds_in_the_root_bin_and_restores_the_users_selected_bin(self):
+        scene = Scene()
+        root = scene.pool.GetRootFolder.return_value
+        scene.build(rough_manifest(self.root))
+        self.assertTrue(scene.selected_during)
+        self.assertTrue(all(folder is root for folder in scene.selected_during))
+        self.assertIs(scene.selected, scene.user_bin)
+
+    def test_selected_bin_is_restored_after_a_failed_build(self):
+        scene = Scene()
+        scene.pool.CreateMulticamClip.side_effect = RuntimeError("boom")
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            scene.build(rough_manifest(self.root))
+        self.assertIs(scene.selected, scene.user_bin)
+        self.assertTrue(all(folder is scene.pool.GetRootFolder.return_value for folder in scene.selected_during))
+
+    def test_unrestorable_bin_selection_is_reported(self):
+        scene = Scene()
+        scene.pool.CreateMulticamClip.side_effect = RuntimeError("boom")
+        set_folder = scene.pool.SetCurrentFolder.side_effect
+        scene.pool.SetCurrentFolder.side_effect = lambda f: False if f is scene.user_bin else set_folder(f)
+        with self.assertRaisesRegex(RuntimeError, "boom") as caught:
+            scene.build(rough_manifest(self.root))
+        self.assertTrue(any("restore the media pool bin" in text for text in caught.exception.cleanup_failures))
+
+    def test_rollback_keeps_items_the_user_adds_during_the_build(self):
+        scene = Scene(preload=[(self.root / "a1.mp4", "A", [3, 4])])
+        multicam = scene.pool.CreateMulticamClip.side_effect
+        user_item = Mock()
+        user_item.GetUniqueId.return_value = "user-added"
+        user_item.GetName.return_value = "User added during build"
+        calls = []
+
+        def user_adds_then_fail(sources, options):
+            calls.append(options["name"])
+            if len(calls) == 2:
+                scene.state["media"].append(user_item)
+                raise RuntimeError("Resolve refused")
+            made = multicam(sources, options)
+            scene.state["media"].extend(made)
+            return made
+
+        scene.pool.CreateMulticamClip.side_effect = user_adds_then_fail
+        with self.assertRaisesRegex(RuntimeError, "Resolve refused") as caught:
+            scene.build(rough_manifest(self.root))
+        self.assertIn(user_item, scene.state["media"])
+        self.assertNotIn(user_item, scene.pool.DeleteClips.call_args.args[0])
+        self.assertEqual(getattr(caught.exception, "cleanup_failures", []), [])
+
+    def test_rollback_deletes_a_failed_segments_multicam_and_new_imports(self):
+        scene = Scene()
+        scene.pool.CreateMulticamClip.side_effect = None
+        multicam_clip = Mock()
+        multicam_clip.GetName.return_value = "x"
+        multicam_clip.GetTimeline.return_value = None
+        multicam_clip.GetClipProperty.side_effect = {"Type": "NotMulticam"}.get  # fails the type check after creation
+        scene.pool.CreateMulticamClip.return_value = [multicam_clip]
+        with self.assertRaises(RuntimeError):
+            scene.build(rough_manifest(self.root))
+        deleted = scene.pool.DeleteClips.call_args.args[0]
+        self.assertIn(multicam_clip, deleted)
+        self.assertEqual(scene.state["media"], [])  # the three imports were created by this run
+
+    def test_new_reference_bin_is_kept_when_it_holds_foreign_items(self):
+        scene = Scene(preload=[(self.root / "a1.mp4", "A", [3, 4])])
+        scene.pool.CreateMulticamClip.side_effect = RuntimeError("boom")
+        foreign = Mock()
+        foreign.GetUniqueId.return_value = "foreign"
+        scene.state["reference_media"].append(foreign)  # user drops a clip into the new bin
+        with self.assertRaisesRegex(RuntimeError, "boom") as caught:
+            scene.build(rough_manifest(self.root, reference=True))
+        scene.pool.DeleteFolders.assert_not_called()
+        self.assertTrue(any("did not create" in text for text in caught.exception.cleanup_failures))
 
     def test_rollback_failure_is_reported_not_hidden(self):
         scene = Scene()

@@ -151,7 +151,11 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
    existing item that does not match is left alone and the build stops. The project's timeline frame
    rate must match the cut. The project is saved (not closed or reopened) and only the new timeline is
    read back. If a step fails, only the timeline and media pool items created by that run are
-   removed; anything that cannot be removed is listed in the error. Regular **Export to Resolve** and
+   removed (items are tracked as the Resolve calls return them, so anything you add meanwhile is kept);
+   anything that cannot be removed is listed in the error. The build selects the root media pool bin and
+   restores your selected bin afterwards. Known limits: if the build process is killed on timeout, items
+   it had already created stay in the project; and a failure after the project was saved is not rolled
+   back on disk, so check Resolve and delete any leftover timeline by hand. Regular **Export to Resolve** and
    Director builds are unchanged.
 
 Rough cuts never change `session.json`.
