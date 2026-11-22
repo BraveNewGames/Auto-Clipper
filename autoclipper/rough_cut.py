@@ -304,8 +304,8 @@ def _target(value):
 
 # --------------------------------------------------------------------------- extraction
 
-def extract_json(text):
-    """Return the pasted rough-cut object. Accepts code fences, prose and smart quotes."""
+def extract_json(text, *, key="clips"):
+    """Return the pasted answer object that has a ``key`` list. Accepts code fences, prose and smart quotes."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Paste the AI's JSON answer.")
     if len(text) > MAX_RESPONSE_CHARS:
@@ -319,17 +319,17 @@ def extract_json(text):
                 value = json.loads(variant)
             except ValueError:
                 value = None
-            if isinstance(value, dict) and "clips" in value:
+            if isinstance(value, dict) and key in value:
                 return value
             for match in re.finditer(r"\{", variant):
                 try:
                     value, end = decoder.raw_decode(variant, match.start())
                 except ValueError:
                     continue
-                if isinstance(value, dict) and "clips" in value:
+                if isinstance(value, dict) and key in value:
                     candidates.append((end - match.start(), value))
     if not candidates:
-        raise ValueError('Could not find a JSON object with a "clips" list in the pasted answer.')
+        raise ValueError(f'Could not find a JSON object with a "{key}" list in the pasted answer.')
     return max(candidates, key=lambda item: item[0])[1]
 
 
@@ -388,12 +388,18 @@ def _range_problems(context, first, end, pov, audio_pov):
     return problems
 
 
-def _validate_clip(context, clip, where, errors):
-    """Validate one entry and return its edit-plan projection, or None when it has errors."""
+def _validate_clip(context, clip, where, errors, anchors=None):
+    """Validate one entry and return its edit-plan projection, or None when it has errors.
+
+    ``anchors`` is an optional hook for extra anchor kinds (the Director bridge's note anchors). It has
+    ``keys`` (the full allowed source keys), ``hint`` (the anchor-missing message) and
+    ``resolve(clip, where, errors, pads, rate)`` returning ``(anchor, first, end, extra)``; ``anchor`` is
+    None when the clip uses none of its kinds, and ``extra`` entries are merged into the projection.
+    """
     count = len(errors)
     fps, rate = context["fps"], Fraction(context["fps"])
     kind = clip.get("kind")
-    allowed = _PLACEHOLDER_KEYS if kind == "placeholder" else _SOURCE_KEYS
+    allowed = _PLACEHOLDER_KEYS if kind == "placeholder" else (anchors.keys if anchors else _SOURCE_KEYS)
     if kind not in ("source", "placeholder"):
         errors.append(f"{where}: \"kind\" must be \"source\" or \"placeholder\".")
         return None
@@ -422,7 +428,8 @@ def _validate_clip(context, clip, where, errors):
             errors.append(f"{where}: suggestion {sid!r} has no timed range.")
             suggestion = None
     has_lines = any(key in clip for key in ("start_line", "end_line"))
-    has_frames = any(key in clip for key in ("session_in_frame", "session_out_frame", "start_time", "end_time"))
+    has_frames = anchors is None and any(
+        key in clip for key in ("session_in_frame", "session_out_frame", "start_time", "end_time"))
     pads = {}
     for key in ("pad_before", "pad_after"):
         value = clip.get(key, 0)
@@ -435,7 +442,14 @@ def _validate_clip(context, clip, where, errors):
 
     first = end = None
     anchor = None
-    if has_lines and has_frames:
+    hook_anchor, extra = None, {}
+    if anchors is not None:
+        hook_anchor, hook_first, hook_end, extra = anchors.resolve(clip, where, errors, pads, rate)
+    if hook_anchor and (has_lines or has_frames):
+        errors.append(f"{where}: use exactly one anchor kind.")
+    elif hook_anchor:
+        anchor, first, end = hook_anchor, hook_first, hook_end
+    elif has_lines and has_frames:
         errors.append(f"{where}: use either start_line/end_line or session frames, not both.")
     elif has_lines:
         anchor = "lines"
@@ -476,7 +490,8 @@ def _validate_clip(context, clip, where, errors):
         first = _seconds_to_frame(Fraction(str(start)) - pads["pad_before"], rate)
         end = _seconds_to_frame(Fraction(str(stop)) + pads["pad_after"], rate)
     elif clip.get("suggestion_id") is None:
-        errors.append(f"{where}: anchor the clip with start_line/end_line, suggestion_id or session frames.")
+        errors.append(f"{where}: " + (anchors.hint if anchors else
+                      "anchor the clip with start_line/end_line, suggestion_id or session frames."))
 
     pov = _pov(context, clip.get("pov"), "pov", where, errors)
     audio_pov = _pov(context, clip.get("audio_pov"), "audio_pov", where, errors)
@@ -527,29 +542,80 @@ def _validate_clip(context, clip, where, errors):
     return {"kind": "source", "title": title, "session_in": first, "session_out_exclusive": end,
             "pov_id": pov, "audio_pov_id": audio_pov,
             "candidate_ids": [suggestion.suggestion_id] if suggestion else [],
-            "_anchor": anchor, "_quotes": cited}
+            "_anchor": anchor, "_quotes": cited, **extra}
 
 
-def _repair_prompt(context, errors, stale=False, export_id=None):
+def _repair_prompt(context, errors, stale=False, export_id=None, *, schema=None, reminders=None,
+                   label="rough-cut"):
     if stale:
         return ""
+    schema = schema or SCHEMA
     povs = ", ".join(f'"{pov.pov_id}" ({pov.name})' for pov in context["session"].povs)
     problems = "\n".join(f"{number}. {error}" for number, error in enumerate(errors, 1))
     export_id = export_id or context["export_id"]
-    return f"""Auto-Clipper rejected your rough-cut JSON for export {export_id}. Nothing was saved.
-Fix EVERY problem below and return the COMPLETE corrected JSON object only, with "schema": "{SCHEMA}"
+    if reminders is None:
+        reminders = f"""- Valid pov ids: {povs}. pov and audio_pov may be null (recommended).
+- Anchor each source clip with start_line + end_line, OR suggestion_id, OR session_in_frame +
+  session_out_frame with matching start_time/end_time. Pads are 0-{MAX_PAD_SECONDS} s.
+- Quotes must be copied verbatim with the line id of a line inside the clip.
+- Only use times inside the COVERAGE listed in the original prompt; never invent ids."""
+    return f"""Auto-Clipper rejected your {label} JSON for export {export_id}. Nothing was saved.
+Fix EVERY problem below and return the COMPLETE corrected JSON object only, with "schema": "{schema}"
 and "export_id": "{export_id}". Keep the clips that had no problems unchanged and in order.
 
 PROBLEMS
 {problems}
 
 REMINDERS
-- Valid pov ids: {povs}. pov and audio_pov may be null (recommended).
-- Anchor each source clip with start_line + end_line, OR suggestion_id, OR session_in_frame +
-  session_out_frame with matching start_time/end_time. Pads are 0-{MAX_PAD_SECONDS} s.
-- Quotes must be copied verbatim with the line id of a line inside the clip.
-- Only use times inside the COVERAGE listed in the original prompt; never invent ids.
+{reminders}
 """
+
+
+def gate_plan(context, plan, result, *, compile_fn, repair, require_reference=False):
+    """Compile ``plan`` dry-run and check what the compiled manifest actually does.
+
+    Returns the manifest, or None after appending to ``result["errors"]`` (and setting ``result["stale"]``
+    or ``result["repair_prompt"]`` where a repair is possible). ``compile_fn(context, plan)`` is the
+    caller's compiler; ``repair()`` builds the caller's repair prompt.
+    """
+    errors = result["errors"]
+    try:
+        manifest = compile_fn(context, plan)
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"Compile dry run failed: {exc}")
+        return None
+    if manifest["source_mapping_digest"] != context["source_mapping_digest"]:
+        result["stale"] = True
+        errors.append("Recordings or mic confirmations changed during validation. Copy a new prompt.")
+        return None
+    unavailable = [s["event_id"] for s in manifest["segments"] if s.get("placeholder_reason") == "source_unavailable"]
+    if unavailable:
+        errors.append(f"Compile dry run found unavailable footage in {', '.join(dict.fromkeys(unavailable))}.")
+        result["repair_prompt"] = repair()
+        return None
+    if require_reference:
+        reference_gaps = [s["event_id"] for s in manifest["segments"]
+                          if s.get("kind") == "media" and s.get("reference_audio") is None]
+        if reference_gaps:
+            errors.append("No verified GROUP REFERENCE AUDIO mix covers the whole range of "
+                          + ", ".join(dict.fromkeys(reference_gaps)) + ". Choose ranges with a verified group mix.")
+            result["repair_prompt"] = repair()
+            return None
+    # Parts that failed verification only remove their coverage; other blockers remain fatal.
+    if any(not blocker.get("part_id") for blocker in manifest["blockers"]):
+        errors.extend(f"Compile dry run blocked: {blocker['message']}" for blocker in manifest["blockers"]
+                      if not blocker.get("part_id"))
+        return None
+    for blocker in manifest["blockers"]:
+        manifest["warnings"].append({**blocker, "code": "part_excluded", "excluded_code": blocker["code"],
+                                     "message": f"Excluded from coverage: {blocker['message']}"})
+    manifest["blockers"] = []
+    used = {a["part_id"] for s in manifest["segments"]
+            for a in (*s["angles"], *(s[k] for k in ("audio_angle", "reference_angle") if s.get(k)))}
+    if used & {item["part_id"] for item in excluded_parts(context)}:
+        errors.append("Compile dry run used an excluded recording part.")
+        return None
+    return manifest
 
 
 def validate_response(context, text, *, brief="", target_seconds=None):
@@ -642,41 +708,12 @@ def validate_response(context, text, *, brief="", target_seconds=None):
         "entries": [{key: value for key, value in entry.items() if not key.startswith("_")} for entry in entries],
     }
     # Final gate: compile with the shared edit-plan compiler and run the builder's own preflight.
-    try:
-        manifest = rm.compile_edit_plan(context["session"], plan, context["transcripts_dir"],
-                                         context["confirmations"], reference_audio=True)
-    except (KeyError, TypeError, ValueError) as exc:
-        errors.append(f"Compile dry run failed: {exc}")
-        return result
-    if manifest["source_mapping_digest"] != context["source_mapping_digest"]:
-        result["stale"] = True
-        errors.append("Recordings or mic confirmations changed during validation. Copy a new prompt.")
-        return result
-    unavailable = [s["event_id"] for s in manifest["segments"] if s.get("placeholder_reason") == "source_unavailable"]
-    if unavailable:
-        errors.append(f"Compile dry run found unavailable footage in {', '.join(dict.fromkeys(unavailable))}.")
-        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
-        return result
-    reference_gaps = [s["event_id"] for s in manifest["segments"]
-                      if s.get("kind") == "media" and s.get("reference_audio") is None]
-    if reference_gaps:
-        errors.append("No verified GROUP REFERENCE AUDIO mix covers the whole range of "
-                      + ", ".join(dict.fromkeys(reference_gaps)) + ". Choose ranges with a verified group mix.")
-        result["repair_prompt"] = _repair_prompt(context, errors, export_id=export_id)
-        return result
-    # Parts that failed verification only remove their coverage; other blockers remain fatal.
-    if any(not blocker.get("part_id") for blocker in manifest["blockers"]):
-        errors.extend(f"Compile dry run blocked: {blocker['message']}" for blocker in manifest["blockers"]
-                      if not blocker.get("part_id"))
-        return result
-    for blocker in manifest["blockers"]:
-        manifest["warnings"].append({**blocker, "code": "part_excluded", "excluded_code": blocker["code"],
-                                     "message": f"Excluded from coverage: {blocker['message']}"})
-    manifest["blockers"] = []
-    used = {a["part_id"] for s in manifest["segments"]
-            for a in (*s["angles"], *(s[k] for k in ("audio_angle", "reference_angle") if s.get(k)))}
-    if used & {item["part_id"] for item in excluded_parts(context)}:
-        errors.append("Compile dry run used an excluded recording part.")
+    manifest = gate_plan(
+        context, plan, result, require_reference=True,
+        compile_fn=lambda ctx, proposed: rm.compile_edit_plan(
+            ctx["session"], proposed, ctx["transcripts_dir"], ctx["confirmations"], reference_audio=True),
+        repair=lambda: _repair_prompt(context, errors, export_id=export_id))
+    if manifest is None:
         return result
     manifest["rough_cut"] = {"schema": SCHEMA, "export_id": export_id, "title": title,
                              "brief": brief, "target_seconds": target,

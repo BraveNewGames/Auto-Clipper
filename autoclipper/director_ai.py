@@ -15,7 +15,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .fkb import FKBStore, FrameRange
-from .rough_cut import _clock, _digest, _intervals, _is_link, safe_directory
+from .rough_cut import _is_link, safe_directory
 
 SCHEMA = "autoclipper.director_bridge.v1"
 RECORD_SCHEMA = "autoclipper.director_bridge_export.v1"
@@ -482,3 +482,448 @@ def load_export_record(binding, export_id):
     if not isinstance(record, dict) or record.get("schema") != RECORD_SCHEMA or record.get("export_id") != export_id:
         raise DirectorError("E_EXPORT_UNKNOWN", f"The export record for {export_id} is malformed.")
     return record
+
+
+# --------------------------------------------------------------------------- import: validation context
+
+REMINDERS = """- Valid pov ids: {povs}. pov and audio_pov may be null (recommended).
+- Every source clip needs note_ids (aliases from NOTES) and exactly one anchor: note, OR start_line +
+  end_line, OR session_in_frame + session_out_frame with in_tc + out_tc. Pads are 0-10 s.
+- Quotes must be copied verbatim with the line alias of a line inside the clip.
+- The clip must overlap the transcript context shown for a note it cites.
+- Only use ranges inside COVERAGE from the original prompt; never invent aliases or ids."""
+
+_SOURCE_KEYS = {"id", "kind", "title", "note", "note_ids", "start_line", "end_line", "session_in_frame",
+                "session_out_frame", "in_tc", "out_tc", "pad_before", "pad_after", "pov", "audio_pov",
+                "quotes", "why", "uncertainty"}
+_TOP_KEYS = {"schema", "export_id", "title", "summary", "clips"}
+_TOKEN = object()
+
+
+class _NoteAnchors:
+    """The rough-cut validator's extra-anchor hook: note anchors, TC-checked frames and note citations."""
+    keys = _SOURCE_KEYS
+    hint = "anchor the clip with note, start_line/end_line or session frames with timecodes."
+
+    def __init__(self, binding, record):
+        self.binding, self.record = binding, record
+
+    def _frame_of(self, value, key, where, errors):
+        from .director_poc.core import tc_frame
+        try:
+            return tc_frame(value, self.binding.fps) - self.binding.origin
+        except ValueError:
+            errors.append(f"{where}: \"{key}\" must be a timecode HH:MM:SS:FF on the review timeline.")
+            return None
+
+    def resolve(self, clip, where, errors, pads, rate):
+        from fractions import Fraction
+        from .resolve_manifest import _record_frame
+        aliases = clip.get("note_ids")
+        known = self.record["notes"]
+        cited = []
+        if not isinstance(aliases, list) or not aliases or len(aliases) > 20 or not all(
+                isinstance(a, str) and _NOTE_ALIAS.match(a) for a in aliases):
+            errors.append(f"{where}: E_UNANCHORED: \"note_ids\" must cite at least one note alias such as N01.")
+        else:
+            for alias in dict.fromkeys(aliases):
+                if alias not in known:
+                    errors.append(f"{where}: E_NOTE_UNKNOWN: {alias} was not exported in this prompt.")
+                else:
+                    cited.append(alias)
+        extra = {"_note_aliases": cited}
+        kinds = [name for name, present in (
+            ("note", "note" in clip),
+            ("frames", any(k in clip for k in ("session_in_frame", "session_out_frame", "in_tc", "out_tc")))) if present]
+        if len(kinds) > 1:
+            errors.append(f"{where}: use exactly one anchor kind.")
+            return None, None, None, extra
+        if kinds == ["note"]:
+            alias = clip["note"]
+            if not isinstance(alias, str) or not isinstance(aliases, list) or alias not in aliases:
+                errors.append(f"{where}: \"note\" must be one of this clip's note_ids.")
+                return "note", None, None, extra
+            if alias not in known:
+                return "note", None, None, extra
+            frames = known[alias]["frames"]
+            return ("note", frames["start"] - _record_frame(pads["pad_before"], 0, rate),
+                    frames["end"] + _record_frame(pads["pad_after"], 0, rate), extra)
+        if kinds == ["frames"]:
+            first, end = clip.get("session_in_frame"), clip.get("session_out_frame")
+            if any(clip.get(k, 0) not in (0, None) for k in ("pad_before", "pad_after")):
+                errors.append(f"{where}: frame-anchored clips cannot use pads; widen the frames instead.")
+            if type(first) is not int or type(end) is not int:
+                errors.append(f"{where}: session_in_frame and session_out_frame must be integers.")
+                return "frames", None, None, extra
+            for key, frame in (("in_tc", first), ("out_tc", end)):
+                claimed = self._frame_of(clip.get(key), key, where, errors) if isinstance(clip.get(key), str) else None
+                if claimed is None:
+                    if not isinstance(clip.get(key), str):
+                        errors.append(f"{where}: frame anchors need \"{key}\" as a review-timeline timecode.")
+                    return "frames", None, None, extra
+                if claimed != frame:
+                    errors.append(f"{where}: \"{key}\" {clip[key]} is frame {claimed}, which disagrees with "
+                                  f"frame {frame}. Recheck the timecode or the frame number.")
+                    return "frames", None, None, extra
+            return "frames", first, end, extra
+        return None, None, None, extra
+
+
+def _context(binding, record):
+    """The shared validator's context, built from the verified catalog (never from the main session)."""
+    from types import SimpleNamespace
+    from .resolve_manifest import _CoveredPart
+    kb, fps = binding.kb, binding.fps
+    names = pov_names(kb)
+    povs = [SimpleNamespace(pov_id=pid, name=names[pid]) for pid in dict.fromkeys(
+        part.pov_id for part in kb.recording_parts)]
+    coverage = {pid: [] for pid in names}
+    for pid, intervals in video_intervals(kb).items():
+        coverage[pid] = [_CoveredPart(f"{pid}-{n}", n, a, b, {}) for n, (a, b) in enumerate(intervals, 1)]
+    current = {span.span_id: span for span in kb.transcript_spans}
+    lines = {}
+    for alias, row in record["spans"].items():
+        span = current.get(row["span_id"])
+        if span is not None and span.frames == row["frames"]:
+            lines[alias] = Line(alias, row["frames"]["start"] / fps, row["frames"]["end"] / fps, span.text,
+                                span.speaker or "Team?")
+    first, end = binding.review_frames
+    return {"session": SimpleNamespace(session_id=kb.session.session_id, povs=povs, suggestions=[]),
+            "fps": fps, "first": first, "end": end, "coverage": coverage, "line_index": lines,
+            "mapping": {"blockers": []}, "source_mapping_digest": kb.source_mapping_digest,
+            "transcripts_dir": None, "confirmations": None, "export_id": record["export_id"]}
+
+
+# --------------------------------------------------------------------------- import: gate and save
+
+class GatedPlan:
+    """A plan that passed every check. Only ``import_response`` can create one (it holds the token)."""
+    __slots__ = ("plan", "snapshot", "export_id", "response_sha256", "provider", "title")
+
+    def __init__(self, token, **fields):
+        if token is not _TOKEN:
+            raise TypeError("GatedPlan can only be created by a validated import.")
+        for name in self.__slots__:
+            object.__setattr__(self, name, fields[name])
+
+    def __setattr__(self, name, value):
+        raise AttributeError("GatedPlan is immutable")
+
+
+def _provider(value):
+    text = " ".join(str(value or "").split())[:40]
+    return text or "unspecified"
+
+
+def _entry_projection(entry, note_uuid):
+    from .rough_cut import _CONTROL
+    if entry["kind"] == "placeholder":
+        return {"entry_id": entry["entry_id"], "kind": "placeholder", "title": entry["title"],
+                "provisional_frames": entry["provisional_frames"]}
+    return {"entry_id": entry["entry_id"], "kind": "source", "title": entry["title"],
+            "frames": {"start": entry["session_in"], "end": entry["session_out_exclusive"]},
+            "pov_id": entry["pov_id"], "audio_pov_id": entry["audio_pov_id"],
+            "note_ids": [note_uuid[a] for a in entry["_note_aliases"]]}
+
+
+def _save_validated(binding, gated, response_text, save_response):
+    """The only function that persists an AI plan. Requires a GatedPlan from ``import_response``."""
+    if not isinstance(gated, GatedPlan):
+        raise TypeError("Only a validated plan can be saved.")
+    from .fkb import EditPlan
+
+    plan = EditPlan(gated.plan["plan_id"], list(gated.plan["entries"]), revisions=list(gated.plan["revisions"]))
+
+    def change(data):
+        # Optimistic check: nothing may have changed the catalog since this plan was validated.
+        if data.to_dict() != gated.snapshot:
+            raise DirectorError("E_FKB_CHANGED", "The Director catalog changed while the answer was being "
+                                "validated (is the companion still running?). Nothing was saved; try again.")
+        data.edit_plans.append(plan)
+
+    binding.store.update(change)
+    warning = None
+    if save_response:
+        try:
+            _write_new(binding, ("responses",), f"{gated.export_id}-{gated.response_sha256[:12]}.txt", response_text)
+        except (OSError, ValueError) as exc:
+            warning = f"The plan was saved, but the response copy could not be written: {exc}"
+    return warning
+
+
+def import_response(binding, text, *, provider, save_response=True, companion_closed=False):
+    """Validate a pasted answer completely and, only if it passes, save it as a new AI EditPlan."""
+    from fractions import Fraction
+    from . import resolve_manifest as rm
+    from . import rough_cut as rc
+    from .fkb import EditPlan, Provenance
+    from .resolve_builder import validate_manifest
+
+    if companion_closed is not True:
+        raise DirectorError("E_COMPANION", "Confirm that the Director companion for this scratch folder is closed; "
+                            "it is the only other writer of the catalog.")
+    provider = _provider(provider)
+    result = {"ok": False, "export_id": None, "errors": [], "warnings": [], "stale": False,
+              "repair_prompt": "", "report": ""}
+    errors = result["errors"]
+
+    def finish():
+        result["report"] = _failure_report(result)
+        return result
+
+    try:
+        data = rc.extract_json(text)
+    except ValueError as exc:
+        message = str(exc)
+        if '"suggestions"' in text and '"clips"' not in text:
+            message = "This looks like an AI Review answer (suggestions), not a Director plan."
+        errors.append(f"E_SCHEMA: {message}")
+        return finish()
+    try:
+        record = load_export_record(binding, data.get("export_id"))
+    except DirectorError as exc:
+        errors.append(str(exc))
+        return finish()
+    export_id = result["export_id"] = record["export_id"]
+    kb = binding.kb
+    if (record["session_id"], record["fps"]) != (kb.session.session_id, kb.session.fps) or \
+            record["clock_origin"] != binding.origin:
+        errors.append("E_SESSION: This export belongs to another session or frame clock.")
+        return finish()
+    if kb.mapping_stale or record["source_mapping_digest"] != kb.source_mapping_digest:
+        result["stale"] = True
+        errors.append("E_MAPPING_CHANGED: The verified source mapping changed since this prompt was copied. "
+                      "Copy a new prompt.")
+        return finish()
+
+    context = _context(binding, record)
+    fps = binding.fps
+    repair = lambda: rc._repair_prompt(context, errors, export_id=export_id, schema=SCHEMA, label="Director plan",
+                                       reminders=REMINDERS.format(povs=", ".join(
+                                           f'"{p.pov_id}" ({p.name})' for p in context["session"].povs)))
+    if data.get("schema") != SCHEMA:
+        errors.append(f'E_SCHEMA: "schema" must be "{SCHEMA}".')
+    unknown = sorted(set(data) - _TOP_KEYS)
+    if unknown:
+        errors.append(f"Unsupported top-level keys {', '.join(unknown)}; allowed: {', '.join(sorted(_TOP_KEYS))}.")
+    title = rc._text_field(data, "title", "Answer", errors)
+    if "summary" in data and not isinstance(data["summary"], str):
+        errors.append('"summary" must be text.')
+    clips = data.get("clips")
+    if not isinstance(clips, list) or not clips:
+        errors.append('"clips" must be a nonempty list.')
+        clips = []
+    elif len(clips) > rc.MAX_CLIPS:
+        errors.append(f'"clips" has {len(clips)} entries; the limit is {rc.MAX_CLIPS}.')
+        clips = []
+
+    hook = _NoteAnchors(binding, record)
+    notes_now = {n.note_id: n for n in kb.director_notes}
+    entries, seen = [], set()
+    for number, clip in enumerate(clips, 1):
+        if not isinstance(clip, dict):
+            errors.append(f"Clip #{number}: must be an object.")
+            continue
+        clip_id = clip.get("id")
+        where = f"Clip #{number} ({clip_id})" if isinstance(clip_id, str) else f"Clip #{number}"
+        if not isinstance(clip_id, str) or not rc._ID.match(clip_id):
+            errors.append(f'{where}: "id" must be a short id such as C01 (letters, digits, _ . -).')
+        elif clip_id in seen:
+            errors.append(f"{where}: E_DUPLICATE: duplicate id.")
+        seen.add(clip_id)
+        entry = rc._validate_clip(context, clip, where, errors, anchors=hook)
+        if entry is None:
+            continue
+        if entry["kind"] == "source":
+            before = len(errors)
+            window_hit = False
+            for alias in entry["_note_aliases"]:
+                row = record["notes"][alias]
+                current = notes_now.get(row["note_id"])
+                if current is None:
+                    errors.append(f"{where}: E_NOTE_UNKNOWN: {alias} no longer exists in the catalog.")
+                elif current.deleted:
+                    errors.append(f"{where}: E_NOTE_DELETED: {alias} was deleted after the prompt was copied.")
+                elif current.revision != row["revision"]:
+                    errors.append(f"{where}: E_NOTE_STALE: {alias} was exported at revision {row['revision']} "
+                                  f"but is now revision {current.revision}. Copy a new prompt.")
+                elif current.source_mapping_digest != kb.source_mapping_digest:
+                    errors.append(f"{where}: E_NOTE_UNVERIFIED: {alias} is not bound to the verified source mapping.")
+                else:
+                    window = row["window"]
+                    window_hit |= entry["session_in"] < window["end"] and window["start"] < entry["session_out_exclusive"]
+            if len(errors) == before and not window_hit:
+                errors.append(f"{where}: E_UNANCHORED: the clip does not overlap the context window of any note "
+                              "it cites.")
+            if len(errors) > before:
+                continue
+        entries.append({"entry_id": clip_id, **entry})
+
+    sources = [e for e in entries if e["kind"] == "source"]
+    if clips and not any(isinstance(c, dict) and c.get("kind") == "source" for c in clips):
+        errors.append("A plan needs at least one source clip.")
+    if clips and not errors:
+        total = sum(e["session_out_exclusive"] - e["session_in"] for e in sources) + \
+            sum(e["provisional_frames"] for e in entries if e["kind"] == "placeholder")
+        if total > rc.MAX_TOTAL_SECONDS * fps:
+            errors.append(f"The plan is {total / fps:.1f} s; the limit is {rc.MAX_TOTAL_SECONDS} s.")
+    if errors:
+        result["repair_prompt"] = repair()
+        return finish()
+
+    warnings = []
+    ordered = sorted(sources, key=lambda e: e["session_in"])
+    for left, right in zip(ordered, ordered[1:]):
+        if right["session_in"] < left["session_out_exclusive"]:
+            warnings.append({"code": "W_OVERLAP", "event_id": right["entry_id"],
+                             "message": f"W_OVERLAP: {right['entry_id']} overlaps {left['entry_id']} in session time."})
+    for entry in sources:
+        if entry["session_out_exclusive"] - entry["session_in"] < fps:
+            warnings.append({"code": "W_SHORT_CLIP", "event_id": entry["entry_id"],
+                             "message": f"W_SHORT_CLIP: {entry['entry_id']} is under one second."})
+    positions = [e["session_in"] for e in sources]
+    if positions != sorted(positions):
+        warnings.append({"code": "W_ORDER", "message": "W_ORDER: clips are not in session order (allowed)."})
+    total_s = sum(e["session_out_exclusive"] - e["session_in"] for e in sources) / fps
+    if total_s > 900:
+        warnings.append({"code": "W_LONG_PLAN", "message": f"W_LONG_PLAN: source clips total {total_s:.0f} s."})
+
+    note_uuid = {alias: row["note_id"] for alias, row in record["notes"].items()}
+    response_sha = sha256(text.encode("utf-8")).hexdigest()
+    taken = sum(1 for p in kb.edit_plans if p.plan_id.startswith(f"ai-{export_id}-"))
+    plan_id = f"ai-{export_id}-{taken + 1}"
+    revision = {"revision_id": response_sha[:16], "provenance": Provenance.AI_INFERENCE.value,
+                "source": "director_ai_bridge", "provider": provider, "schema": SCHEMA, "export_id": export_id,
+                "prompt_sha256": record["prompt_sha256"], "response_sha256": response_sha, "title": title,
+                "summary": data.get("summary") if isinstance(data.get("summary"), str) else "",
+                "warnings": [w["message"] for w in warnings],
+                "created_at": datetime.now(timezone.utc).isoformat()}
+    projected = [_entry_projection(e, note_uuid) for e in entries]
+    plan = EditPlan(plan_id, projected, revisions=[revision])
+    snapshot = kb.to_dict()
+
+    def compile_fn(_context, proposed):
+        import copy
+        candidate = copy.deepcopy(kb)
+        candidate.edit_plans.append(copy.deepcopy(proposed))
+        candidate.bind_edit_plan(candidate.edit_plans[-1])
+        return rm.compile_fkb_edit_plan(binding.source, candidate, plan_id, revision_id=revision["revision_id"])
+
+    manifest = rc.gate_plan(context, plan, result, compile_fn=compile_fn, repair=repair)
+    if manifest is None:
+        return finish()
+    try:
+        validate_manifest(manifest)
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"Resolve builder preflight failed: {exc}")
+        return finish()
+    manifest["warnings"].extend(warnings)
+    gated = GatedPlan(_TOKEN, plan={"plan_id": plan_id, "entries": projected, "revisions": [revision]},
+                      snapshot=snapshot, export_id=export_id, response_sha256=response_sha, provider=provider,
+                      title=title)
+    save_warning = _save_validated(binding, gated, text, bool(save_response))
+    if save_warning:
+        warnings.append({"code": "W_RESPONSE_NOT_SAVED", "message": save_warning})
+    all_warnings = [*manifest["warnings"]]
+    result.update(ok=True, plan_id=plan_id, title=title, provider=provider, warnings=all_warnings,
+                  segments=len(manifest["segments"]),
+                  clips=[{"id": e["entry_id"], "kind": e["kind"], "title": e["title"],
+                          **({"anchor": e["_anchor"], "notes": e["_note_aliases"], "quotes": e["_quotes"],
+                              "pov_id": e["pov_id"], "audio_pov_id": e["audio_pov_id"],
+                              "tc_in": tc(binding, e["session_in"]), "tc_out": tc(binding, e["session_out_exclusive"]),
+                              "session_start": e["session_in"] / fps, "session_end": e["session_out_exclusive"] / fps}
+                             if e["kind"] == "source" else {"seconds": e["provisional_frames"] / fps})}
+                         for e in entries])
+    result["report"] = _success_report(result, manifest)
+    return result
+
+
+def _failure_report(result):
+    if result["ok"] or not result["errors"]:
+        return ""
+    rows = [f"Rejected: {len(result['errors'])} problem(s). Nothing was saved."]
+    rows += [f"{number}. {error}" for number, error in enumerate(result["errors"], 1)]
+    return "\n".join(rows)
+
+
+def _success_report(result, manifest):
+    from . import resolve_manifest as rm
+    rows = [f"# Director AI plan: {result['title']}", "",
+            f"Plan {result['plan_id']} from export {result['export_id']} ({result['provider']}), "
+            f"{len(result['clips'])} entries, {len(manifest['segments'])} timeline segments.", "",
+            "| # | Clip | Title | Anchor | Review TC | POV | Mic | Notes |",
+            "| ---: | --- | --- | --- | --- | --- | --- | --- |"]
+    for number, clip in enumerate(result["clips"], 1):
+        title = clip["title"].replace("|", r"\|")
+        if clip["kind"] == "placeholder":
+            rows.append(f"| {number} | {clip['id']} | {title} | placeholder | {clip['seconds']:.2f} s slate | — | — | — |")
+            continue
+        rows.append(f"| {number} | {clip['id']} | {title} | {clip['anchor']} | {clip['tc_in']}-{clip['tc_out']} | "
+                    f"{clip['pov_id'] or 'multicam'} | {clip['audio_pov_id'] or 'per angle'} | "
+                    f"{', '.join(clip['notes'])} |")
+    return "\n".join(rows) + "\n\n" + rm.render_report(manifest)
+
+
+# --------------------------------------------------------------------------- plans, preview, build files
+
+def _ai_revision(plan):
+    return next((r for r in plan.revisions if isinstance(r, dict) and r.get("provenance") == "ai_inference"), None)
+
+
+def list_plans(binding):
+    rows = []
+    for plan in binding.kb.edit_plans:
+        revision = _ai_revision(plan)
+        sources = sum(1 for e in plan.entries if e.get("kind") == "source")
+        rows.append({"plan_id": plan.plan_id, "ai": revision is not None,
+                     "title": (revision or {}).get("title"), "provider": (revision or {}).get("provider"),
+                     "export_id": (revision or {}).get("export_id"), "clips": sources,
+                     "placeholders": len(plan.entries) - sources,
+                     "warnings": len((revision or {}).get("warnings", [])),
+                     "created_at": (revision or {}).get("created_at")})
+    return rows
+
+
+def compile_plan(binding, plan_id):
+    """Dry-run compile of a saved plan from the pinned inputs. Never contacts Resolve."""
+    import copy
+    from . import resolve_manifest as rm
+    from .resolve_builder import validate_manifest
+    plans = [p for p in binding.kb.edit_plans if p.plan_id == plan_id]
+    if len(plans) != 1:
+        raise DirectorError("E_PLAN_UNKNOWN", "Unknown plan.")
+    plan, = plans
+    if not plan.revisions:
+        raise DirectorError("E_PLAN_UNKNOWN", "The plan has no revision to compile.")
+    try:
+        manifest = rm.compile_fkb_edit_plan(binding.source, copy.deepcopy(binding.kb), plan_id,
+                                            revision_id=str(plan.revisions[-1]["revision_id"]))
+        validate_manifest(manifest)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DirectorError("E_COMPILE", str(exc)) from None
+    segments = manifest["segments"]
+    return manifest, {"plan_id": plan_id, "segments": len(segments),
+                      "slates": sum(1 for s in segments if s.get("kind") == "placeholder"),
+                      "blockers": len(manifest["blockers"]), "warnings": manifest["warnings"],
+                      "blocker_rows": manifest["blockers"]}
+
+
+def new_project_name(now=None):
+    from .resolve_builder import DIRECTOR_TEST_PREFIX
+    return f"{DIRECTOR_TEST_PREFIX}{(now or datetime.now()):%Y%m%d-%H%M%S}"
+
+
+def write_edit_files(binding, plan_id, manifest, stamp=None):
+    """Write edit-<plan>-<stamp>/{manifest.json,report.md} in a NEW folder inside scratch; never reused."""
+    from . import resolve_manifest as rm
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"edit-{plan_id}-{stamp}"
+    target = binding.scratch / name
+    if target.exists() or _is_link(target):
+        raise DirectorError("E_WRITE", f"{name} already exists. Try again in a second.")
+    folder = safe_directory(binding.scratch, name)
+    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    for filename, content in (("manifest.json", manifest_text), ("report.md", rm.render_report(manifest))):
+        with open(folder / filename, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    return folder
