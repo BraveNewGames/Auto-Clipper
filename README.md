@@ -141,6 +141,18 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
    unless a fixed `audio_pov` is chosen, and labelled slates for placeholders. The
    **GROUP REFERENCE AUDIO** track uses one POV's verified Track1 mix for the whole cut where it is
    covered, even under a fixed single-POV clip.
+4. **Add to open Auto-Clipper project** (opt-in) adds the cut as a **new timeline** to the Resolve
+   project that is open now, so you do not have to return to the Project Manager. It runs only if the
+   open project's name is `AutoClipper Export <session id> <timestamp>` (a project an Auto-Clipper
+   rough cut or export created); with no open project or any other project it refuses and changes
+   nothing. The timeline is named after the cut's title and ID (`(2)`, `(3)`… if taken). Existing
+   timelines, bins, media and clips are never renamed, overwritten or deleted. Source MP4s and the
+   GROUP REFERENCE AUDIO item already in the project with the exact mic mapping are reused; an
+   existing item that does not match is left alone and the build stops. The project's timeline frame
+   rate must match the cut. The project is saved (not closed or reopened) and only the new timeline is
+   read back. If a step fails, only the timeline and media pool items created by that run are
+   removed; anything that cannot be removed is listed in the error. Regular **Export to Resolve** and
+   Director builds are unchanged.
 
 Rough cuts never change `session.json`.
 
