@@ -107,6 +107,10 @@ class App:
         self.builder_timeout = 1800  # seconds; a Resolve export of many segments can be slow
         self.builder_command = [sys.executable, "-m", "autoclipper.resolve_builder"]
         self._builder_proc = None
+        # Director tab binding: in memory only and independent of self.session (never opens, creates
+        # or remembers a session; Director scratch folders keep session.json at their root).
+        self.director = None
+        self._director_lock = threading.RLock()
         atexit.register(self.stop_builder)
 
     # ------------------------------------------------------------ helpers
@@ -956,6 +960,157 @@ class App:
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+    # ------------------------------------------------------------ Director notes AI bridge
+    # Everything here works on a verified scratch folder (director_ai.open_scratch is re-run on every
+    # request). The server writes only below that scratch folder; paths arrive in POST bodies only.
+    _DIRECTOR_CONFLICT = {"E_COMPANION", "E_FKB_CHANGED", "E_TOO_LARGE", "E_NO_NOTES", "E_WRITE", "E_PLAN_UNKNOWN"}
+
+    def _director_error(self, exc):
+        d = _mod("director_ai")
+        if isinstance(exc, d.DirectorError):
+            return ApiError(str(exc), 409 if exc.code in self._DIRECTOR_CONFLICT else 400, code=exc.code)
+        return ApiError(f"{type(exc).__name__}: {exc}", 409)
+
+    def _director_binding(self):
+        d = _mod("director_ai")
+        if not self.director:
+            raise ApiError("Open a Director scratch folder first", 409)
+        try:
+            return d.open_scratch(self.director["scratch"], self.director["root"])
+        except (OSError, ValueError) as exc:
+            raise self._director_error(exc)
+
+    def director_scratches(self, _q=None):
+        import tempfile
+        d = _mod("director_ai")
+        rows = []
+        base = Path(tempfile.gettempdir())
+        try:
+            candidates = sorted(base.glob(d.SCRATCH_PREFIX + "*"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                notes = None
+                fkb = path / ".autoclipper" / "director-fkb.json"
+                if fkb.is_file():
+                    try:
+                        data = json.loads(fkb.read_text(encoding="utf-8"))
+                        notes = sum(1 for n in data.get("director_notes", []) if not n.get("deleted"))
+                    except (OSError, ValueError):
+                        notes = None
+                rows.append({"name": path.name, "path": str(path), "modified": path.stat().st_mtime,
+                             "built": (path / "build.json").is_file(), "fkb": fkb.is_file(), "notes": notes})
+            except OSError:
+                continue
+        return sorted(rows, key=lambda row: -row["modified"])
+
+    def director_open(self, body):
+        d = _mod("director_ai")
+        with self._director_lock:
+            try:
+                binding = d.open_scratch(body.get("scratch"), body.get("session_root"))
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+            self.director = {"scratch": str(binding.scratch), "root": str(binding.root)}
+            return dict(binding.summary)
+
+    def director_state(self, _q=None):
+        d = _mod("director_ai")
+        with self._director_lock:
+            binding = self._director_binding()
+            notes = d.list_notes(binding)
+            return {"binding": dict(binding.summary), "notes": notes,
+                    "tags": sorted({tag for note in notes for tag in note["tags"]}),
+                    "coverage": [{**row, "tc": {"video": [d.tc_range(binding, a, b) for a, b in row["video"]],
+                                                "gaps": [d.tc_range(binding, a, b) for a, b in row["gaps"]]}}
+                                 for row in d.coverage_summary(binding)],
+                    "plans": d.list_plans(binding)}
+
+    def director_export(self, body):
+        d = _mod("director_ai")
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                out = d.export_packet(
+                    binding, note_ids=body.get("note_ids"), tag=body.get("tag") or None,
+                    query=body.get("query") or None, full_transcript=bool(body.get("full_transcript")),
+                    save_prompt=body.get("save_prompt", True) is not False)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+            return out
+
+    def director_import(self, body):
+        d = _mod("director_ai")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError("Paste the AI's JSON answer")
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                result = d.import_response(binding, text, provider=body.get("provider"),
+                                           save_response=body.get("save_response", True) is not False,
+                                           companion_closed=body.get("companion_closed") is True)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+        if not result["ok"]:
+            raise ApiError("Validation failed. Nothing was saved.", 422, report=result["report"],
+                           repair_prompt=result["repair_prompt"], errors=result["errors"],
+                           warnings=result["warnings"], stale=result["stale"], export_id=result["export_id"])
+        return {key: result[key] for key in ("ok", "export_id", "plan_id", "title", "provider", "clips",
+                                             "segments", "warnings", "report")}
+
+    def director_plan_preview(self, q):
+        d = _mod("director_ai")
+        plan_id = ((q or {}).get("plan_id") or [""])[0]
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                _, summary = d.compile_plan(binding, plan_id)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+        return {**summary, "warnings": [w.get("message", str(w)) for w in summary["warnings"]],
+                "blocker_rows": [b.get("message", str(b)) for b in summary["blocker_rows"]]}
+
+    def director_build(self, body):
+        d = _mod("director_ai")
+        if body.get("confirm_project_manager") is not True:
+            raise ApiError("Confirm that Resolve is on the Project Manager with your project saved and closed", 409)
+        plan_id = body.get("plan_id")
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            with self._director_lock:
+                binding = self._director_binding()
+                try:
+                    manifest, summary = d.compile_plan(binding, plan_id)
+                    if summary["blockers"]:
+                        raise ApiError("Build blocked: " + "; ".join(
+                            b.get("message", str(b)) for b in summary["blocker_rows"]), 409)
+                    now = datetime.now()
+                    folder = d.write_edit_files(binding, plan_id, manifest, now.strftime("%Y%m%d-%H%M%S"))
+                except (OSError, ValueError) as exc:
+                    raise self._director_error(exc)
+            job = {
+                "state": "running", "kind": "director_plan", "plan_id": plan_id,
+                "project": d.new_project_name(now), "out_dir": str(folder),
+                "manifest_path": str(folder / "manifest.json"), "report_path": str(folder / "report.md"),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
+        threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
+        return job
+
     # ------------------------------------------------------------ OS helpers
     def open_path(self, body):
         raw = (body.get("path") or "").strip()
@@ -1018,6 +1173,9 @@ GET_ROUTES = {
     "/api/export/info": "export_info",
     "/api/resolve/preview": "resolve_preview",
     "/api/resolve/status": "resolve_status",
+    "/api/director/scratches": "director_scratches",
+    "/api/director/state": "director_state",
+    "/api/director/plan-preview": "director_plan_preview",
 }
 POST_ROUTES = {
     "/api/session/open": "open",
@@ -1040,6 +1198,10 @@ POST_ROUTES = {
     "/api/rough-cut/prompt": "rough_cut_prompt",
     "/api/rough-cut/import": "rough_cut_import",
     "/api/rough-cut/build": "rough_cut_build",
+    "/api/director/open": "director_open",
+    "/api/director/export": "director_export",
+    "/api/director/import": "director_import",
+    "/api/director/build": "director_build",
 }
 
 
