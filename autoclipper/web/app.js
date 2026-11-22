@@ -938,7 +938,8 @@ function resolveJobBox(job, box) {
   // The Director tab shows its own job box (plain paths): open-path only serves the open session folder.
   if (job.state === "running") {
     return h("div", { class: "resolve-job" }, h("b", null, "Exporting to Resolve… "),
-      `creating project “${job.project}”. Do not touch Resolve until this finishes.`, links);
+      (job.mode === "add_timeline" ? `adding a timeline to ${job.project}.` : `creating project “${job.project}”.`) +
+      " Do not touch Resolve until this finishes.", links);
   }
   if (job.state === "done") {
     const rb = job.readback || {};
@@ -1091,8 +1092,15 @@ function roughResult(r, box) {
         r.job = await api("/api/rough-cut/build", { cut_id: r.cut_id });
         fillRough(box);
       }) }, "Build into new Resolve project"),
+      h("button", { class: "btn", disabled: running ? true : null,
+        title: "Adds a new timeline to the Resolve project that is open now (it must be an Auto-Clipper project). Existing timelines and media are not changed.",
+        onclick: action(async () => {
+          r.job = await api("/api/rough-cut/build", { cut_id: r.cut_id, mode: "add_timeline" });
+          fillRough(box);
+        }) }, "Add to open Auto-Clipper project"),
       openBtn("Open report.md", r.report_path), openBtn("Open folder", r.cut_dir),
-      h("span", { class: "muted small" }, "Save and close your Resolve project and leave the Project Manager open first.")),
+      h("span", { class: "muted small" }, "New project: save and close your Resolve project and leave the Project Manager open first. ",
+        "Add to open project: keep the Auto-Clipper project you created earlier open.")),
     job && job.cut_id === r.cut_id ? resolveJobBox(job, box) : null);
 }
 

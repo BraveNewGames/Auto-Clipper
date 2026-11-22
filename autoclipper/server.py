@@ -858,6 +858,10 @@ class App:
         return out
 
     def rough_cut_build(self, body):
+        mode = body.get("mode", "new_project")
+        if mode not in ("new_project", "add_timeline"):
+            raise ApiError("Unknown rough-cut build mode", 400)
+        add_timeline = mode == "add_timeline"
         with self._resolve_lock:
             if self._resolve_job.get("state") in ("preparing", "running"):
                 raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
@@ -891,6 +895,10 @@ class App:
                 "out_dir": str(out), "manifest_path": str(folder / "manifest.json"),
                 "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
             }
+            if add_timeline:
+                title = " ".join(str(options.get("title") or "").split())[:80]
+                job.update(mode="add_timeline", project="the open Auto-Clipper project",
+                           timeline_name=f"{title} {folder.name}".strip() if title else folder.name)
         except BaseException:
             with self._resolve_lock:
                 self._resolve_job = previous
@@ -904,7 +912,10 @@ class App:
         result = {"state": "failed"}
         readback = Path(job["out_dir"]) / "readback.json"
         try:
-            code, stdout, stderr = self.run_builder(Path(job["manifest_path"]), job["project"], readback)
+            extra = (("--add-to-open", "--timeline-name", job["timeline_name"])
+                     if job.get("mode") == "add_timeline" else None)
+            args = (Path(job["manifest_path"]), job["project"], readback)
+            code, stdout, stderr = self.run_builder(*args, extra_args=extra) if extra else self.run_builder(*args)
             if code == 0 and readback.is_file():
                 result = {"state": "done", "readback": json.loads(readback.read_text(encoding="utf-8")),
                           "readback_path": str(readback)}
@@ -920,7 +931,7 @@ class App:
         with self._resolve_lock:
             self._resolve_job = {**job, **result, "finished_at": datetime.now(timezone.utc).isoformat()}
 
-    def run_builder(self, manifest_path: Path, project: str, result_path: Path):
+    def run_builder(self, manifest_path: Path, project: str, result_path: Path, extra_args=None):
         """Run the builder in a separate process so a Resolve hang cannot wedge the UI.
 
         The builder writes its JSON result to result_path. The process is killed on timeout
@@ -932,8 +943,8 @@ class App:
         if modules.is_dir():
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH"), str(modules)]))
         proc = subprocess.Popen(
-            [*self.builder_command, str(manifest_path), "--execute", "--project", project,
-             "--result-file", str(result_path)],
+            [*self.builder_command, str(manifest_path), "--execute",
+             *(extra_args if extra_args else ("--project", project)), "--result-file", str(result_path)],
             cwd=str(Path(__file__).resolve().parent.parent), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         with self._resolve_lock:

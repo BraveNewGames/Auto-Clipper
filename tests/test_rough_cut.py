@@ -472,6 +472,42 @@ class RoughCutApiTests(unittest.TestCase):
         self.assertEqual(result_path.parent.parent, cuts / saved["cut_id"])
         self.assertEqual(self.session_json, (self.folder / ".autoclipper" / "session.json").read_bytes())
 
+    def test_add_timeline_mode_passes_builder_flags_and_default_does_not(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        saved = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})
+        seen = []
+
+        def run(manifest_path, project, result_path, extra_args=None):
+            seen.append((project, extra_args))
+            result_path.write_text(json.dumps({"project": "open", "added_timeline": True}), encoding="utf-8")
+            return 0, "", ""
+
+        self.app.run_builder = run
+        self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"], "mode": "bogus"}, expect=400)
+        self.assertEqual(self.call("/api/resolve/status")["state"], "idle")
+        job = self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"], "mode": "add_timeline"})
+        self.assertEqual(job["mode"], "add_timeline")
+        self.assertTrue(job["timeline_name"].endswith(saved["cut_id"]))
+        self.assertEqual(self.wait_job()["state"], "done")
+        time.sleep(1.1)  # build folders are stamped to the second
+        self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]})
+        self.assertEqual(self.wait_job()["state"], "done")
+        self.assertEqual(seen[0][1][:2], ("--add-to-open", "--timeline-name"))
+        self.assertEqual(seen[0][1][2], job["timeline_name"])
+        self.assertRegex(seen[1][0], r"^AutoClipper Export synthetic-cut \d{8}-\d{6}$")
+        self.assertIsNone(seen[1][1])
+
+    def test_run_builder_add_timeline_command_line_has_no_project_argument(self):
+        with patch("autoclipper.server.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = ("{}", "")
+            popen.return_value.returncode = 0
+            self.app.run_builder(Path("m.json"), "ignored", Path("r.json"),
+                                 extra_args=("--add-to-open", "--timeline-name", "T"))
+        command = popen.call_args.args[0]
+        self.assertNotIn("--project", command)
+        self.assertEqual(command[-6:], ["--execute", "--add-to-open", "--timeline-name", "T",
+                                        "--result-file", "r.json"])
+
     def test_build_refuses_unknown_tampered_or_stale_cuts(self):
         info = self.call("/api/rough-cut/prompt", {})
         saved = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})
