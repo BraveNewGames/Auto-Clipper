@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from autoclipper.resolve_add_timeline import safe_timeline_name
 from autoclipper.resolve_builder import build_export, main
 from test_resolve_builder import add_fixture_media_mapping, fake_resolve, make_manifest
 
@@ -376,6 +377,33 @@ class AddTimelineTests(unittest.TestCase):
         self.assertEqual([t.GetName() for t in scene.timelines],
                          ["Old cut", "Same title cut-1", "Same title cut-3"])
         self.assertEqual(scene.timelines[0], scene.old_timelines[0])
+
+    def test_timeline_names_never_carry_characters_resolve_rejects(self):
+        self.assertEqual(safe_timeline_name("Money Grab: Poop Hat, Rich, and Dora 20261122-060154"),
+                         "Money Grab Poop Hat Rich and Dora 20261122-060154")
+        self.assertEqual(safe_timeline_name('  a/b\c*d?e"f<g>h|i;j  '), "a b c d e f g h i j")
+        self.assertEqual(safe_timeline_name("Plain title 20261122-060154"), "Plain title 20261122-060154")
+        self.assertEqual(safe_timeline_name(":::"), "")
+
+    def test_a_title_with_punctuation_builds_when_resolve_rejects_special_names(self):
+        scene = Scene()
+        create = scene.pool.CreateEmptyTimeline.side_effect
+        names = []
+
+        def strict(title, timecode):
+            names.append(title)
+            return None if any(ch in title for ch in ':,/\*?"<>|;') else create(title, timecode)
+
+        scene.pool.CreateEmptyTimeline.side_effect = strict
+        result = scene.build(rough_manifest(self.root),
+                             timeline_name="Money Grab: Poop Hat, Rich, and Dora 20261122-060154")
+        self.assertEqual(result["timeline"], "Money Grab Poop Hat Rich and Dora 20261122-060154")
+        self.assertEqual(names, ["Money Grab Poop Hat Rich and Dora 20261122-060154"])
+        self.assertTrue(all(ch not in row["multicam"] for row in result["segments"] for ch in ":,"))
+        # With no timeline name given, the cut's own title is cleaned too.
+        manifest = rough_manifest(self.root)
+        manifest["rough_cut"]["title"] = "Odd: title, here"
+        self.assertEqual(Scene().build(manifest, timeline_name=None)["timeline"], "Odd title here")
 
     def test_rollback_failure_is_reported_not_hidden(self):
         scene = Scene()

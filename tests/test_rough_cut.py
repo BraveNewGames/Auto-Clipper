@@ -488,6 +488,8 @@ class RoughCutApiTests(unittest.TestCase):
         job = self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"], "mode": "add_timeline"})
         self.assertEqual(job["mode"], "add_timeline")
         self.assertTrue(job["timeline_name"].endswith(saved["cut_id"]))
+        for ch in ':,/*?"<>|;':
+            self.assertNotIn(ch, job["timeline_name"])
         self.assertEqual(self.wait_job()["state"], "done")
         time.sleep(1.1)  # build folders are stamped to the second
         self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]})

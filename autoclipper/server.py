@@ -962,7 +962,7 @@ class App:
             "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
         }
         if add_timeline:
-            title = " ".join(str(options.get("title") or "").split())[:80]
+            title = _mod("resolve_add_timeline").safe_timeline_name(options.get("title") or "")[:80].strip()
             job.update(mode="add_timeline", project="the open Auto-Clipper project",
                        timeline_name=f"{title} {folder.name}".strip() if title else folder.name)
         return job

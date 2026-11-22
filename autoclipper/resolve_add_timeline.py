@@ -20,6 +20,13 @@ from .resolve_stage1 import require
 
 OWNED_PROJECT = re.compile(re.escape(EXPORT_PREFIX) + r"\S.* \d{8}-\d{6}")
 MAX_NAME = 120
+_UNSAFE_NAME = re.compile(r'[\x00-\x1f\\/:*?"<>|,;]+')
+
+
+def safe_timeline_name(text):
+    """Plain text Resolve accepts as a timeline name: no colons, commas, slashes or other special characters."""
+    cleaned = _UNSAFE_NAME.sub(" ", str(text))
+    return re.sub(r"\s+", " ", cleaned).strip(" .")
 
 
 def is_rough_cut(manifest):
@@ -287,6 +294,6 @@ def add_timeline_to_open_project(manifest, timeline_base):
 
     resolve = require(DaVinciResolveScript.scriptapp("Resolve"), "Resolve is unavailable")
     manager = require(resolve.GetProjectManager(), "Resolve project manager is unavailable")
-    base = re.sub(r"\s+", " ", str(timeline_base or manifest["rough_cut"].get("title") or manifest["session_id"])).strip()
-    result = build_into_open_project(manifest, resolve, manager, media, slates, base[:MAX_NAME] or manifest["session_id"])
+    base = safe_timeline_name(timeline_base or manifest["rough_cut"].get("title") or manifest["session_id"])
+    result = build_into_open_project(manifest, resolve, manager, media, slates, base[:MAX_NAME].strip() or safe_timeline_name(manifest["session_id"]) or "Rough cut")
     return result
