@@ -144,6 +144,40 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
 
 Rough cuts never change `session.json`.
 
+## Director notes to AI edit
+
+The **7 · Director** tab turns the notes you captured in a Director scratch folder into an AI-suggested
+edit plan. It works without an open Auto-Clipper session and never opens, creates or remembers one. It
+is manual copy and paste only: no provider calls, no API keys.
+
+1. **Open** a scratch folder (the `autoclipper-director-a-*` folder printed by `director_poc prepare`,
+   under system temp) together with the **recording folder** that was used as `--session-root` at
+   prepare. Every request re-checks the build receipt, the frame clock, the verified source mapping and
+   the pinned SRT digests. The recording folder is only read.
+2. Select notes (all by default) and **Generate AI packet**. The prompt holds each note with its
+   revision, review-timeline timecodes and current text, a transcript window of +/-20 s around each
+   note (it shrinks towards 5 s to stay under 120k characters; above 400k the export is refused),
+   and each POV's verified video and mic coverage with its gaps. It contains **no file paths or part
+   IDs**, but it does contain your note and transcript text, so paste it only into a chat you approve.
+3. Paste the answer, tick **The companion for this scratch is closed**, and **Validate and save**. Every
+   clip must cite exported notes (`note_ids`) whose current revision is unchanged and not deleted, and
+   must be anchored to a note (`note`), transcript line aliases (`start_line`/`end_line`) or frames with
+   matching timecodes, overlapping a cited note's window. POV and mic coverage, verbatim quotes, pads and
+   limits are checked with the same rules as the rough cut, then the plan is compiled as a dry run. **Any
+   problem saves nothing** (the catalog stays byte-identical) and shows a report with a **repair prompt**.
+   A valid answer is saved as a new `ai-dx-<id>-<n>` plan with AI provenance (provider, export ID, prompt
+   and response hashes). Plans are never overwritten.
+4. **Preview** a saved plan, then **Build into NEW Resolve project...** (Resolve on the Project
+   Manager, your project saved and closed). It creates **AutoClipper DirectorA Test `<timestamp>`** through
+   the same single job slot as Export to Resolve. Group Reference Audio is not added to these builds.
+
+Headless equivalents: `python -m autoclipper.director_ai {export,import,plan-build} SCRATCH --session-root FOLDER`
+(see `--help`; `plan-build` needs `--dry-run` or `--confirm-project-manager`).
+
+Known limits: close the Director companion first, because the catalog has one writer per session
+(a change made between the final check and the write is refused as `E_FKB_CHANGED` when detected, but a
+write inside the few milliseconds of the swap is not); mic availability is inferred from video coverage.
+
 ## Where files go
 
 | What | Where |
@@ -151,6 +185,7 @@ Rough cuts never change `session.json`.
 | Session project (offsets, reviews, decisions) | `<session folder>\.autoclipper\session.json` |
 | Resolve export manifest, report and readback | `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\` |
 | AI rough cut (prompt, answer, plan, manifest, report, validation) | `<session folder>\autoclipper_exports\rough-cuts\<YYYYMMDD-HHMMSS>\`; each build adds `build-<timestamp>\readback.json` |
+| Director AI bridge (exports, optional prompt/response copies) | `<scratch>\.autoclipper\director-ai\{exports,prompts,responses}\dx-<id>*`; plans go into the scratch catalog; each build adds `<scratch>\edit-<plan>-<timestamp>\{manifest.json,report.md,readback.json}` |
 | Owner mic confirmations | `<session folder>\.autoclipper\mic_confirmations.json` |
 | LosslessCut CSVs + README per reviewer | `<session folder>\autoclipper_exports\<reviewer>\<POV>_part<N>_pass<K>.csv` |
 | Recent sessions list | `%APPDATA%\AutoClipper\recent.json` |
