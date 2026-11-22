@@ -4,11 +4,15 @@ import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_manifest import build_manifest, main, render_report
+from autoclipper.resolve_manifest import (
+    _reference_track, _video_frames, build_manifest, build_review_manifest, compile_edit_plan, compile_fkb_edit_plan, main,
+    render_report,
+)
 from autoclipper.store import save_session
 
 
@@ -108,6 +112,118 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual([x["reason"] for x in segments[1]["unavailable"]], ["recording_gap", "no_coverage"])
         self.assertEqual([x["pov_id"] for x in segments[1]["angles"]], ["alpha"])
 
+    def test_review_clips_uncovered_edges_preserves_internal_gap_and_short_tail(self):
+        self.add_part("Alpha", offset=1, duration=4, video_duration=1)
+        self.add_part("Alpha", 2, offset=3, duration=3, video_duration=2)
+        self.add_part("Bravo", offset=3.1, duration=1)
+        self.session.povs.append(POV("charlie", "Charlie"))
+        manifest = build_review_manifest(self.session)
+        self.assertEqual(manifest["blockers"], [])
+        self.assertEqual(manifest["requested_session_frames"], [0, 360])
+        self.assertEqual(manifest["review_session_frames"], [60, 300])
+        self.assertEqual([(s["session_start_frame"], s["session_end_frame"]) for s in manifest["uncovered_edges"]],
+                         [(0, 60), (300, 360)])
+        segments = manifest["segments"]
+        self.assertEqual([(s["record_start_frame"], s["duration_frames"], s["kind"]) for s in segments],
+                         [(0, 60, "media"), (60, 60, "coverage_gap"), (120, 6, "media"),
+                          (126, 60, "media"), (186, 54, "media")])
+        self.assertEqual(segments[1]["unavailable"][0]["reason"], "recording_gap")
+        self.assertEqual(segments[2]["angles"][0]["part_id"], "alpha-2")
+        self.assertEqual([a["source_in_frame"] for a in segments[3]["angles"]], [6, 0])
+        self.assertEqual(segments[-1]["angles"][0]["source_out_frame"], 120)
+        self.assertEqual(self.probe.call_count, 3)
+
+    def test_review_omits_ambiguous_overlapping_angle_and_keeps_resolved_frames(self):
+        self.add_part("Alpha", offset=-0.01, duration=2)
+        self.add_part("Alpha", 2, offset=1, duration=2)
+        self.add_part("Bravo", duration=3)
+        manifest = build_review_manifest(self.session)
+        self.assertEqual(manifest["blockers"], [])
+        self.assertEqual(manifest["review_session_frames"], [-1, 180])
+        overlap = next(s for s in manifest["segments"] if s["session_start_frame"] == 60)
+        self.assertEqual([a["pov_id"] for a in overlap["angles"]], ["bravo"])
+        self.assertEqual(overlap["unavailable"][0]["reason"], "overlapping_parts")
+        recovered = next(s for s in manifest["segments"] if s["session_start_frame"] == 119)
+        self.assertEqual(recovered["angles"][0]["source_in_frame"], 59)
+
+    def test_review_does_not_guess_missing_media_or_mic(self):
+        self.add_part("Alpha", mp4=False)
+        self.add_part("Bravo", inferred=True)
+        manifest = build_review_manifest(self.session)
+        self.assertEqual({row["code"] for row in manifest["blockers"]},
+                         {"mp4_missing", "mic_unverified", "no_angles"})
+        self.assertEqual(manifest["segments"], [])
+
+    def test_review_uses_reported_frame_count_or_exact_timestamp_duration(self):
+        self.assertEqual(_video_frames({"nb_frames": "2", "duration": "0.033333"}, 60), 2)
+        self.assertEqual(_video_frames({"duration_ts": 2, "time_base": "1/60"}, 60), 2)
+        self.assertEqual(_video_frames({"duration": "0.033333"}, 60), 1)
+
+    def test_edit_plan_preserves_order_choices_and_provenance_across_split_and_gaps(self):
+        self.add_part("Alpha", duration=2)
+        self.add_part("Alpha", 2, offset=2, duration=2)
+        self.add_part("Bravo", duration=3)
+        entries = [
+            {"entry_id": "later", "kind": "source", "title": "Later first", "session_in": 100,
+             "session_out_exclusive": 190, "pov_id": "alpha", "audio_pov_id": "bravo",
+             "note_ids": ["note-a"], "candidate_ids": ["candidate-a"]},
+            {"entry_id": "missing", "kind": "placeholder", "title": "Intended beat", "provisional_frames": 15},
+            {"entry_id": "early", "kind": "source", "title": "Earlier last", "session_in": 5,
+             "session_out_exclusive": 10},
+        ]
+        plan = {"plan_id": "plan", "revision_id": "r2", "session_id": self.session.session_id, "fps": 60,
+                "revision_history": [{"revision_id": "r1"}], "entries": entries}
+        manifest = compile_edit_plan(self.session, plan)
+        self.assertEqual(manifest["blockers"], [])
+        self.assertEqual(manifest["edit_plan"]["revision_history"], [{"revision_id": "r1"}])
+        plan["revision_history"][0]["revision_id"] = "changed"
+        self.assertEqual(manifest["edit_plan"]["revision_history"][0]["revision_id"], "r1")
+        segments = manifest["segments"]
+        self.assertEqual([s["kind"] for s in segments], ["media", "media", "placeholder", "placeholder", "media"])
+        self.assertEqual([(s["record_start_frame"], s["duration_frames"]) for s in segments],
+                         [(0, 20), (20, 60), (80, 10), (90, 15), (105, 5)])
+        self.assertEqual([segments[i]["angles"][0]["part_id"] for i in (0, 1)], ["alpha-1", "alpha-2"])
+        self.assertEqual(segments[1]["audio_angle"]["source_in_frame"], 120)
+        self.assertEqual(segments[1]["note_ids"], ["note-a"])
+        self.assertEqual(segments[2]["candidate_ids"], ["candidate-a"])
+        for segment in segments[2:4]:
+            self.assertNotIn("session_start_frame", segment)
+            self.assertNotIn("session_end", segment)
+        self.assertEqual([s["placeholder_reason"] for s in segments[2:4]],
+                         ["source_unavailable", "planned_missing_beat"])
+        self.assertEqual([a["pov_id"] for a in segments[-1]["angles"]], ["alpha", "bravo"])
+        self.assertIn("Intended beat", render_report(manifest))
+
+    def test_edit_plan_rejects_placeholder_with_source_coordinates(self):
+        plan = {"plan_id": "plan", "revision_id": "r1", "session_id": self.session.session_id, "fps": 60,
+                "revision_history": [], "entries": [{"entry_id": "missing", "kind": "placeholder",
+                    "title": "Missing", "provisional_frames": 10, "session_in": 0}]}
+        with self.assertRaisesRegex(ValueError, "no source range"):
+            compile_edit_plan(self.session, plan)
+        self.probe.assert_not_called()
+
+    def test_fkb_adapter_uses_session_clock_and_existing_revision_history(self):
+        self.add_part("Alpha")
+        plan = SimpleNamespace(plan_id="plan", timeline_id="prior-timeline", revisions=[{"revision_id": "r1"}],
+                               entries=[{"entry_id": "cut", "kind": "source", "title": "Grounded cut",
+                                         "frames": {"start": 9, "end": 19}, "pov_id": "alpha"}])
+        digest = build_review_manifest(self.session)["source_mapping_digest"]
+        knowledge = SimpleNamespace(mapping_stale=False, edit_plans=[plan], director_notes=[],
+                                    transcript_spans=[], source_mapping_digest=digest,
+                                    session=SimpleNamespace(session_id=self.session.session_id, fps=60))
+        with self.assertRaisesRegex(ValueError, "source mapping is unverified"):
+            compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
+        plan.source_mapping_digest = digest
+        manifest = compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
+        segment, = manifest["segments"]
+        self.assertEqual((segment["session_start_frame"], segment["session_end_frame"]), (9, 19))
+        self.assertEqual(manifest["edit_plan"], {"plan_id": "plan", "revision_id": "r2",
+                                                "revision_history": [{"revision_id": "r1"}]})
+        self.assertEqual(plan.entries[0]["frames"], {"start": 9, "end": 19})
+        knowledge.mapping_stale = True
+        with self.assertRaisesRegex(ValueError, "stale FKB source mapping"):
+            compile_fkb_edit_plan(self.session, knowledge, "plan", revision_id="r2")
+
     def test_selection_ranges_order_warnings_and_report(self):
         self.add_part("Alpha")
         self.select("z", "EV-02", 4, 5, approved=(1, 2))
@@ -120,11 +236,82 @@ class ResolveManifestTests(unittest.TestCase):
         self.assertEqual([s["range_source"] for s in manifest["segments"]], ["ai", "ai", "approved"])
         self.assertEqual(len({s["segment_id"] for s in manifest["segments"]}), 3)
         codes = {w["code"] for w in manifest["warnings"]}
-        self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection", "game_audio_unidentified"})
+        self.assertEqual(codes, {"untimed", "duplicate_event", "overlapping_selection",
+                                 "game_audio_unidentified", "stale_mkv_reference",
+                                 "reference_track_unverified", "reference_audio_gap"})
         report = render_report(manifest)
         for value in ("3 timed Keep selections", "Alpha P1 (verified, expected ch 2, 3)",
                       r"Test \| Clip (approved)", "Game audio not identified", "Source mode"):
             self.assertIn(value, report)
+
+    def test_reference_mix_selection_split_and_fallback(self):
+        self.streams[1]["channels"] = 2
+        self.add_part("Alpha", offset=0, duration=2)
+        self.add_part("Alpha", 2, offset=2, duration=3)
+        self.add_part("Bravo", offset=0, duration=5)
+        self.select("pick", "EV-01", 1, 3)
+        manifest = build_manifest(self.session)
+        left, right = manifest["segments"]
+        self.assertEqual([s["reference_audio"]["part_id"] for s in (left, right)],
+                         ["alpha-1", "alpha-2"])
+        for segment in (left, right):
+            ref = segment["reference_audio"]
+            angle = next(a for a in segment["angles"] if a["part_id"] == ref["part_id"])
+            self.assertEqual((ref["source_in_frame"], ref["source_out_frame"],
+                              ref["record_start_frame"], ref["duration_frames"]),
+                             (angle["source_in_frame"], angle["source_out_frame"],
+                              segment["record_start_frame"], segment["duration_frames"]))
+        self.assertEqual(left["reference_audio"]["track"]["resolve_channels"], [1, 2])
+        metadata_path = self.transcripts / "alpha-2" / "alpha-2.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["speaker_tracks"].append({"track": 1, "speaker": "Other player"})
+        self.write_metadata("alpha-2", metadata)
+        fallback = build_manifest(self.session)["segments"]
+        self.assertEqual([s["reference_audio"]["pov_name"] for s in fallback], ["Alpha", "Bravo"])
+
+    def test_reference_rejects_mic_label_and_ambiguous_stream(self):
+        self.streams[1]["channels"] = 2
+        part = self.add_part("Alpha")
+        self.select("pick", "EV-01", 1, 2)
+        metadata = {"speaker_tracks": [
+            {"track": 1, "speaker": "Other player"},
+            {"track": 2, "speaker": "Alpha", "speaker_template": "{Recorder}",
+             "index": 7, "title": "Track2"}],
+            "recorder": {"name": "Alpha", "source": "filename", "tracks": [2]}}
+        self.write_metadata(part, metadata)
+        manifest = build_manifest(self.session)
+        self.assertIsNone(manifest["segments"][0]["reference_audio"])
+        self.assertIn("'Other player'", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        metadata["speaker_tracks"][0]["speaker"] = "Team"
+        self.write_metadata(part, metadata)
+        manifest = build_manifest(self.session)
+        self.assertEqual(manifest["segments"][0]["reference_audio"]["pov_name"], "Alpha")
+        metadata["speaker_tracks"] = metadata["speaker_tracks"][1:]
+        self.write_metadata(part, metadata)
+        self.streams.append({"index": 8, "codec_type": "audio", "channels": 2,
+                             "tags": {"title": "Track1"}})
+        manifest = build_manifest(self.session)
+        self.assertIn("ambiguous", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+        self.streams[1]["tags"] = {}
+        self.streams.pop()
+        manifest = build_manifest(self.session)
+        self.assertIn("missing", manifest["segments"][0]["angles"][0]["reference_track"]["reason"])
+
+    def test_reference_rejects_track1_when_it_is_verified_mic(self):
+        streams = [{"index": 1, "codec_type": "audio", "channels": 2,
+                    "tags": {"title": "Track1"}}]
+        mic = {"mp4_audio_stream_index": 1, "mp4_audio_ordinal": 1}
+        result = _reference_track({"speaker_tracks": {"audio_track_1": "Team"}}, streams, mic)
+        self.assertEqual(result["status"], "omitted")
+        self.assertIn("verified owner mic", result["reason"])
+
+    def test_reference_prefers_pov_with_most_selected_frames(self):
+        self.streams[1]["channels"] = 2
+        self.add_part("Alpha", offset=0, duration=2)
+        self.add_part("Bravo", offset=0, duration=4)
+        self.select("pick", "EV-01", 1, 4)
+        segments = build_manifest(self.session)["segments"]
+        self.assertEqual([s["reference_audio"]["pov_name"] for s in segments], ["Bravo", "Bravo"])
 
     def test_inferred_requires_matching_owner_confirmation(self):
         part_id = self.add_part("Alpha", inferred=True)
@@ -237,17 +424,45 @@ class ResolveManifestTests(unittest.TestCase):
         part_id = self.add_part("Alpha", inferred=True)
         self.select("pick", "EV-01", 1, 2)
         save_session(self.session)
-        output = self.root / "output"
         confirmations = self.folder / ".autoclipper" / "mic_confirmations.json"
-        args = [str(self.folder), "--out", str(output), "--confirm-mic", part_id, "2", "Alpha"]
+        export_root = self.folder / "autoclipper_exports" / "resolve"
+        args = [str(self.folder), "--confirm-mic", part_id, "2", "Alpha"]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main([*args, "--dry-run"]), 0)
-            self.assertFalse(output.exists())
+            self.assertFalse(export_root.exists())
             self.assertFalse(confirmations.exists())
             self.assertEqual(main(args), 0)
         self.assertTrue(confirmations.is_file())
+        output, = export_root.iterdir()
         self.assertTrue((output / "manifest.json").is_file())
         self.assertTrue((output / "report.md").is_file())
+
+    def test_director_cli_requires_separate_scratch_output_and_keeps_confirmations_there(self):
+        part_id = self.add_part("Alpha", inferred=True)
+        save_session(self.session)
+        source_files = sorted(self.folder.rglob("*"))
+        scratch_root = self.root / "temp"
+        output = scratch_root / "director"
+        args = [str(self.folder), "--full-session", "--transcripts", str(self.transcripts),
+                "--confirm-mic", part_id, "2", "Alpha"]
+        with (contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors,
+              patch("autoclipper.resolve_manifest.gettempdir", return_value=str(scratch_root))):
+            for destination in ([], ["--out", str(self.folder / "output")],
+                                ["--out", str(self.root / "elsewhere")]):
+                with self.subTest(destination=destination), self.assertRaises(SystemExit) as raised:
+                    main([*args, *destination])
+                self.assertEqual(raised.exception.code, 2)
+            self.assertIn("requires an explicit --out", errors.getvalue())
+            self.assertIn("separate from the source session", errors.getvalue())
+            self.assertEqual(sorted(self.folder.rglob("*")), source_files)
+            self.assertEqual(main([*args, "--dry-run"]), 0)
+            self.assertFalse(scratch_root.exists())
+            self.assertEqual(main([*args, "--out", str(output)]), 0)
+        confirmations = json.loads((output / "mic_confirmations.json").read_text(encoding="utf-8"))
+        self.assertEqual(confirmations["confirmations"][0]["part_id"], part_id)
+        self.assertTrue((output / "manifest.json").is_file())
+        self.assertTrue((output / "report.md").is_file())
+        self.assertEqual(sorted(self.folder.rglob("*")), source_files)
 
 
 class MP4InventoryTests(unittest.TestCase):

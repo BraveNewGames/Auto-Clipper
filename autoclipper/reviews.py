@@ -375,6 +375,8 @@ def _quotes(v):
                     "source": _text(_first(q, "source", "src", "provenance"))}
             if line_id:
                 item["line"] = line_id
+            if isinstance(q.get("span_id"), str) and q["span_id"].strip():
+                item["span_id"] = q["span_id"].strip()
             out.append(item)
     return out
 

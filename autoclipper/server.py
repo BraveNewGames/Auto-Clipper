@@ -107,6 +107,10 @@ class App:
         self.builder_timeout = 1800  # seconds; a Resolve export of many segments can be slow
         self.builder_command = [sys.executable, "-m", "autoclipper.resolve_builder"]
         self._builder_proc = None
+        # Director tab binding: in memory only and independent of self.session (never opens, creates
+        # or remembers a session; Director scratch folders keep session.json at their root).
+        self.director = None
+        self._director_lock = threading.RLock()
         atexit.register(self.stop_builder)
 
     # ------------------------------------------------------------ helpers
@@ -637,7 +641,7 @@ class App:
         folder = Path(s.folder).resolve()
         roots = [folder / "_Transcripts", folder.parent / "_Transcripts"]
         source = folder / part.video_path if part.video_path else None
-        mp4 = source.with_suffix(".mp4") if source and source.suffix.lower() == ".mkv" else source
+        mp4 = _mod("media").resolve_recording(folder, part.video_path, require_mp4=True).path
         stems = [source.stem] if source else []
         if part.srt_path:
             stems.append(Path(part.srt_path).stem)
@@ -799,6 +803,103 @@ class App:
         threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
         return job
 
+    # ------------------------------------------------------------ AI rough cut
+    # Rough cuts never change session.json; accepted cuts go to autoclipper_exports/rough-cuts/.
+    def _rough_context(self):
+        rc = _mod("rough_cut")
+        snap, fingerprint = self._snapshot()
+        try:
+            context = rc.prepare(snap)
+        except (OSError, ValueError) as exc:
+            raise ApiError(f"Could not read the session's transcript and recordings: {exc}", 409)
+        return rc, snap, fingerprint, context
+
+    def rough_cut_prompt(self, body):
+        rc, snap, fingerprint, context = self._rough_context()
+        try:
+            prompt = rc.build_prompt(context, brief=body.get("brief"), target_seconds=body.get("target_seconds"))
+        except rc.RoughCutError as exc:
+            raise ApiError(str(exc))
+        mics = self._mic_rows(snap, context["mapping"])
+        with self.lock:
+            self._unchanged(fingerprint)
+        return {"prompt": prompt, "export_id": rc.prompt_export_id(
+                    context, brief=body.get("brief"), target_seconds=body.get("target_seconds")),
+                "fps": context["fps"],
+                "filename": f"{snap.session_id}_rough_cut_prompt.txt",
+                "excluded": rc.excluded_parts(context), "mics": mics,
+                "povs": [{"pov_id": pov.pov_id, "name": pov.name} for pov in snap.povs]}
+
+    def rough_cut_import(self, body):
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError("Paste the AI's JSON answer")
+        rc, snap, fingerprint, context = self._rough_context()
+        try:
+            result = rc.validate_response(context, text, brief=body.get("brief"),
+                                          target_seconds=body.get("target_seconds"))
+        except rc.RoughCutError as exc:
+            raise ApiError(str(exc))
+        except OSError as exc:
+            raise ApiError(f"Could not compile the rough cut from verified inputs: {exc}", 409)
+        out = {key: result[key] for key in ("ok", "export_id", "errors", "warnings", "stale", "repair_prompt")}
+        if not result["ok"]:
+            return out
+        with self.lock:
+            self._unchanged(fingerprint)
+            try:
+                folder = rc.save_cut(rc.session_cuts_root(snap), result, text)
+            except (OSError, rc.RoughCutError) as exc:
+                raise ApiError(f"Could not save the rough cut (nothing was saved): {exc}", 409)
+        out.update(cut_id=folder.name, cut_dir=str(folder), report_path=str(folder / "report.md"),
+                   title=result["title"], clips=result["clips"], segments=len(result["manifest"]["segments"]),
+                   reference_gaps=sum(1 for s in result["manifest"]["segments"]
+                                      if "reference_audio" in s and s["reference_audio"] is None))
+        return out
+
+    def rough_cut_build(self, body):
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            rc, snap, fingerprint, context = self._rough_context()
+            try:
+                folder, manifest, record = rc.load_cut(rc.session_cuts_root(snap), body.get("cut_id"))
+                _mod("resolve_builder").validate_manifest(manifest)
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise ApiError(f"Cannot build this rough cut: {exc}", 409)
+            options = manifest.get("rough_cut", {})
+            if record.get("export_id") != rc.prompt_export_id(
+                    context, brief=options.get("brief"), target_seconds=options.get("target_seconds")):
+                raise ApiError("The session, transcript, mic confirmations or recordings changed since this rough "
+                               "cut was validated. Copy a new prompt and import a new answer.", 409)
+            with self.lock:
+                self._unchanged(fingerprint)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                name = f"build-{stamp}"
+                if (folder / name).exists():
+                    raise ApiError(f"Build folder already exists: {folder / name}. Try again in a second.", 409)
+                try:
+                    out = rc.safe_directory(folder, name)
+                except (OSError, rc.RoughCutError) as exc:
+                    raise ApiError(str(exc), 409)
+            job = {
+                "state": "running", "kind": "rough_cut", "cut_id": folder.name,
+                "project": f"AutoClipper Export {manifest['session_id']} {stamp}",
+                "out_dir": str(out), "manifest_path": str(folder / "manifest.json"),
+                "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
+        threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
+        return job
+
     def _run_resolve_job(self, job):
         result = {"state": "failed"}
         readback = Path(job["out_dir"]) / "readback.json"
@@ -858,6 +959,157 @@ class App:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    # ------------------------------------------------------------ Director notes AI bridge
+    # Everything here works on a verified scratch folder (director_ai.open_scratch is re-run on every
+    # request). The server writes only below that scratch folder; paths arrive in POST bodies only.
+    _DIRECTOR_CONFLICT = {"E_COMPANION", "E_FKB_CHANGED", "E_TOO_LARGE", "E_NO_NOTES", "E_WRITE", "E_PLAN_UNKNOWN"}
+
+    def _director_error(self, exc):
+        d = _mod("director_ai")
+        if isinstance(exc, d.DirectorError):
+            return ApiError(str(exc), 409 if exc.code in self._DIRECTOR_CONFLICT else 400, code=exc.code)
+        return ApiError(f"{type(exc).__name__}: {exc}", 409)
+
+    def _director_binding(self):
+        d = _mod("director_ai")
+        if not self.director:
+            raise ApiError("Open a Director scratch folder first", 409)
+        try:
+            return d.open_scratch(self.director["scratch"], self.director["root"])
+        except (OSError, ValueError) as exc:
+            raise self._director_error(exc)
+
+    def director_scratches(self, _q=None):
+        import tempfile
+        d = _mod("director_ai")
+        rows = []
+        base = Path(tempfile.gettempdir())
+        try:
+            candidates = sorted(base.glob(d.SCRATCH_PREFIX + "*"))
+        except OSError:
+            candidates = []
+        for path in candidates:
+            try:
+                if not path.is_dir() or _mod("rough_cut")._is_link(path):
+                    continue
+                notes = None
+                fkb = path / ".autoclipper" / "director-fkb.json"
+                if fkb.is_file():
+                    try:
+                        data = json.loads(fkb.read_text(encoding="utf-8"))
+                        notes = sum(1 for n in data.get("director_notes", []) if not n.get("deleted"))
+                    except (OSError, ValueError):
+                        notes = None
+                rows.append({"name": path.name, "path": str(path), "modified": path.stat().st_mtime,
+                             "built": (path / "build.json").is_file(), "fkb": fkb.is_file(), "notes": notes})
+            except OSError:
+                continue
+        return sorted(rows, key=lambda row: -row["modified"])
+
+    def director_open(self, body):
+        d = _mod("director_ai")
+        with self._director_lock:
+            try:
+                binding = d.open_scratch(body.get("scratch"), body.get("session_root"))
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+            self.director = {"scratch": str(binding.scratch), "root": str(binding.root)}
+            return dict(binding.summary)
+
+    def director_state(self, _q=None):
+        d = _mod("director_ai")
+        with self._director_lock:
+            binding = self._director_binding()
+            notes = d.list_notes(binding)
+            return {"binding": dict(binding.summary), "notes": notes,
+                    "tags": sorted({tag for note in notes for tag in note["tags"]}),
+                    "coverage": [{**row, "tc": {"video": [d.tc_range(binding, a, b) for a, b in row["video"]],
+                                                "gaps": [d.tc_range(binding, a, b) for a, b in row["gaps"]]}}
+                                 for row in d.coverage_summary(binding)],
+                    "plans": d.list_plans(binding)}
+
+    def director_export(self, body):
+        d = _mod("director_ai")
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                out = d.export_packet(
+                    binding, note_ids=body.get("note_ids"), tag=body.get("tag") or None,
+                    query=body.get("query") or None, full_transcript=bool(body.get("full_transcript")),
+                    save_prompt=body.get("save_prompt", True) is not False)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+            return out
+
+    def director_import(self, body):
+        d = _mod("director_ai")
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError("Paste the AI's JSON answer")
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                result = d.import_response(binding, text, provider=body.get("provider"),
+                                           save_response=body.get("save_response", True) is not False,
+                                           companion_closed=body.get("companion_closed") is True)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+        if not result["ok"]:
+            raise ApiError("Validation failed. Nothing was saved.", 422, report=result["report"],
+                           repair_prompt=result["repair_prompt"], errors=result["errors"],
+                           warnings=result["warnings"], stale=result["stale"], export_id=result["export_id"])
+        return {key: result[key] for key in ("ok", "export_id", "plan_id", "title", "provider", "clips",
+                                             "segments", "warnings", "report")}
+
+    def director_plan_preview(self, q):
+        d = _mod("director_ai")
+        plan_id = ((q or {}).get("plan_id") or [""])[0]
+        with self._director_lock:
+            binding = self._director_binding()
+            try:
+                _, summary = d.compile_plan(binding, plan_id)
+            except (OSError, ValueError) as exc:
+                raise self._director_error(exc)
+        return {**summary, "warnings": [w.get("message", str(w)) for w in summary["warnings"]],
+                "blocker_rows": [b.get("message", str(b)) for b in summary["blocker_rows"]]}
+
+    def director_build(self, body):
+        d = _mod("director_ai")
+        if body.get("confirm_project_manager") is not True:
+            raise ApiError("Confirm that Resolve is on the Project Manager with your project saved and closed", 409)
+        plan_id = body.get("plan_id")
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            with self._director_lock:
+                binding = self._director_binding()
+                try:
+                    manifest, summary = d.compile_plan(binding, plan_id)
+                    if summary["blockers"]:
+                        raise ApiError("Build blocked: " + "; ".join(
+                            b.get("message", str(b)) for b in summary["blocker_rows"]), 409)
+                    now = datetime.now()
+                    folder = d.write_edit_files(binding, plan_id, manifest, now.strftime("%Y%m%d-%H%M%S"))
+                except (OSError, ValueError) as exc:
+                    raise self._director_error(exc)
+            job = {
+                "state": "running", "kind": "director_plan", "plan_id": plan_id,
+                "project": d.new_project_name(now), "out_dir": str(folder),
+                "manifest_path": str(folder / "manifest.json"), "report_path": str(folder / "report.md"),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
+        threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
+        return job
 
     # ------------------------------------------------------------ OS helpers
     def open_path(self, body):
@@ -921,6 +1173,9 @@ GET_ROUTES = {
     "/api/export/info": "export_info",
     "/api/resolve/preview": "resolve_preview",
     "/api/resolve/status": "resolve_status",
+    "/api/director/scratches": "director_scratches",
+    "/api/director/state": "director_state",
+    "/api/director/plan-preview": "director_plan_preview",
 }
 POST_ROUTES = {
     "/api/session/open": "open",
@@ -940,6 +1195,13 @@ POST_ROUTES = {
     "/api/open-path": "open_path",
     "/api/resolve/confirm-mic": "resolve_confirm_mic",
     "/api/resolve/export": "resolve_export",
+    "/api/rough-cut/prompt": "rough_cut_prompt",
+    "/api/rough-cut/import": "rough_cut_import",
+    "/api/rough-cut/build": "rough_cut_build",
+    "/api/director/open": "director_open",
+    "/api/director/export": "director_export",
+    "/api/director/import": "director_import",
+    "/api/director/build": "director_build",
 }
 
 

@@ -65,7 +65,11 @@ async function api(path, body) {
   const res = await fetch(path, opts);
   const ct = res.headers.get("Content-Type") || "";
   const data = ct.includes("json") ? await res.json() : await res.text();
-  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    err.status = res.status; err.data = data;  // lets callers read structured refusals (e.g. a 422 report)
+    throw err;
+  }
   return data;
 }
 
@@ -92,6 +96,8 @@ const state = {
   focusIdx: -1,
   exportResult: null, exportInfo: null, exportMode: "exclude_rejected",
   resolve: null,
+  roughCut: { brief: "", target: "", info: null, answer: "", result: null },
+  director: null,  // created on first use of the Director tab; independent of the open session
 };
 
 function applyPayload(p) {
@@ -99,6 +105,7 @@ function applyPayload(p) {
     if (!state.session || state.session.folder !== p.session.folder) {
       state.exportResult = null; state.alignSuggestions = null; state.transcriptQ = "";
       state.resolve = null;
+      state.roughCut = { brief: "", target: "", info: null, answer: "", result: null };
     }
     state.exportInfo = null;
     state.session = p.session; state.coverage = p.coverage; state.reviewers = p.reviewers || [];
@@ -111,14 +118,14 @@ function updateChrome() {
   const s = state.session;
   $$("#tabs button").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === state.tab);
-    b.disabled = !s && b.dataset.tab !== "session";
+    b.disabled = !s && !["session", "director"].includes(b.dataset.tab);
   });
   $("#session-badge").textContent = s ? `${s.session_id || "(unnamed)"} — ${s.folder}` : "No session open";
   $("#session-badge").title = s ? s.folder : "";
 }
 
 function setTab(tab) {
-  if (!state.session && tab !== "session") return;
+  if (!state.session && !["session", "director"].includes(tab)) return;
   state.tab = tab;
   location.hash = tab;
   updateChrome();
@@ -129,7 +136,7 @@ function render() {
   const main = $("#main");
   main.innerHTML = "";
   const fn = { session: renderSession, recordings: renderRecordings, transcript: renderTranscript,
-    reviews: renderReviews, guide: renderGuide, export: renderExport }[state.tab];
+    reviews: renderReviews, guide: renderGuide, export: renderExport, director: renderDirector }[state.tab];
   fn(main);
 }
 
@@ -847,7 +854,7 @@ function micOptionLabel(o, m) {
 // Pick one of the MP4's real audio tracks and confirm it in-page (no native dialogs): the
 // button stays disabled until the owner ticks "I listened", so a stray click or double-click
 // can never record a confirmation. Re-confirming replaces the earlier choice for the part.
-function micConfirmControl(m, box) {
+function micConfirmControl(m, box, refresh) {
   const options = m.options || [];
   if (!m.mp4_found) return h("div", { class: "bad-text small" }, "No OBS-remuxed MP4 found for this part.");
   if (!options.length) {
@@ -864,7 +871,7 @@ function micConfirmControl(m, box) {
     if (!(track > 0)) throw new Error("Choose the mic track first");
     await api("/api/resolve/confirm-mic", { part_id: m.part_id, transcriber_track: track, speaker: m.pov_name });
     toast(`Mic confirmed for ${m.pov_name} part ${m.part_index}: track ${track}`, "ok");
-    await loadResolvePreview(box);
+    await (refresh ? refresh() : loadResolvePreview(box));
   }) }, "Confirm mic");
   const sync = () => { button.disabled = !listened.checked || !pick.value; };
   listened.addEventListener("change", sync);
@@ -873,15 +880,15 @@ function micConfirmControl(m, box) {
     h("label", { class: "small" }, listened, " I listened: this is ", m.pov_name, "'s own mic"), button);
 }
 
-function resolveMicRow(m, box) {
+function resolveMicRow(m, box, refresh) {
   const verified = m.status === "verified" || m.status === "owner_confirmed";
   let control = null;
   if (m.status === "unverified" || m.status === "unmapped") {
-    control = micConfirmControl(m, box);
+    control = micConfirmControl(m, box, refresh);
   } else if (m.status === "owner_confirmed") {
     // Let the owner correct a wrong pick without a dialog: reveal the same control on demand.
     control = h("div", null);
-    control.appendChild(h("button", { class: "btn small", onclick: () => control.replaceChildren(micConfirmControl(m, box)) }, "Change…"));
+    control.appendChild(h("button", { class: "btn small", onclick: () => control.replaceChildren(micConfirmControl(m, box, refresh)) }, "Change…"));
   }
   const expected = m.expected_track
     ? ` · metadata expects track ${m.expected_track}` +
@@ -906,7 +913,7 @@ function resolveSegmentsTable(man) {
   const warn = {};
   for (const w of man.warnings) if (w.event_id) (warn[w.event_id] = warn[w.event_id] || []).push(w);
   return h("table", { class: "t resolve-segs" },
-    h("thead", null, h("tr", null, ["#", "Event", "Title", "Session range", "Angles", "Unavailable", "Notes"].map((x) => h("th", null, x)))),
+    h("thead", null, h("tr", null, ["#", "Event", "Title", "Session range", "Angles", "Group reference audio", "Unavailable", "Notes"].map((x) => h("th", null, x)))),
     h("tbody", null, man.segments.map((sg, i) => {
       const notes = [];
       if (sg.pieces > 1) notes.push(h("span", { class: "badge warn" }, `piece ${sg.piece}/${sg.pieces}`));
@@ -918,6 +925,7 @@ function resolveSegmentsTable(man) {
         h("td", null, sg.title, " ", h("span", { class: "muted small" }, `(${sg.range_source})`)),
         h("td", { class: "mono small" }, `${fmt(sg.session_start)} – ${fmt(sg.session_end)}`, h("div", { class: "muted" }, fmtDur(sg.session_end - sg.session_start))),
         h("td", null, sg.angles.length ? sg.angles.map((a) => h("span", { class: "badge good" }, `${a.pov_name} P${a.part_index}`)) : h("span", { class: "bad-text" }, "none")),
+        h("td", null, sg.reference_audio ? `${sg.reference_audio.pov_name} / ${sg.reference_audio.part_id}` : h("span", { class: "warn-text" }, "gap")),
         h("td", null, sg.unavailable.map((u) => h("span", { class: "badge bad", title: u.reason }, `${u.pov_name}: ${RESOLVE_REASONS[u.reason] || u.reason}`))),
         h("td", null, notes));
     })));
@@ -927,6 +935,7 @@ function resolveJobBox(job, box) {
   if (!job || job.state === "idle") return null;
   const links = h("div", { class: "row" }, openBtn("Open report.md", job.report_path), openBtn("Open export folder", job.out_dir),
     job.readback_path ? openBtn("Open readback.json", job.readback_path) : null);
+  // The Director tab shows its own job box (plain paths): open-path only serves the open session folder.
   if (job.state === "running") {
     return h("div", { class: "resolve-job" }, h("b", null, "Exporting to Resolve… "),
       `creating project “${job.project}”. Do not touch Resolve until this finishes.`, links);
@@ -1002,9 +1011,155 @@ function resolvePanel() {
   return box;
 }
 
+// ---------------------------------------------------------------- Rough cut (AI)
+// Copy a prompt, paste the AI's ordered clip list back, validate it strictly, then build it into a
+// new Resolve project through the same single export job as Export to Resolve.
+const jobPolls = {};
+
+function roughBody() {
+  const rc = state.roughCut;
+  return { brief: rc.brief, target_seconds: rc.target === "" ? null : rc.target };
+}
+
+async function loadRoughPrompt(box) {
+  state.roughCut.info = await api("/api/rough-cut/prompt", roughBody());
+  fillRough(box);
+  return state.roughCut.info;
+}
+
+// Poll the single Resolve job slot until it finishes. setJob stores the job for the caller's panel.
+function pollJob(kind, setJob, box, fill, labels) {
+  if (jobPolls[kind]) return;
+  jobPolls[kind] = setInterval(async () => {
+    try {
+      const job = await api("/api/resolve/status");
+      if (job.state !== "running" && job.state !== "preparing") { clearInterval(jobPolls[kind]); jobPolls[kind] = null; }
+      setJob(job);
+      if (box.isConnected) fill(box);
+      if (job.state === "done") toast(labels.done, "ok");
+      if (job.state === "failed") toast(labels.failed, "error");
+    } catch (e) { clearInterval(jobPolls[kind]); jobPolls[kind] = null; toast(e.message, "error"); }
+  }, 1500);
+}
+
+function pollRough(box) {
+  pollJob("rough", (job) => { if (state.roughCut.result) state.roughCut.result.job = job; }, box, fillRough,
+    { done: "Rough cut built in Resolve", failed: "Rough-cut build stopped — see the Export tab" });
+}
+
+function roughRejected(r) {
+  return h("div", { class: "resolve-blockers" },
+    h("b", { class: "bad-text" }, r.stale ? "This answer belongs to an older prompt. Nothing was saved."
+      : `Rejected (${r.errors.length} problem(s)). Nothing was saved.`),
+    h("ul", { class: "issues bad-text" }, r.errors.map((e) => h("li", null, e))),
+    r.repair_prompt ? h("div", null,
+      h("div", { class: "row" }, h("button", { class: "btn", onclick: action(async () => {
+        await navigator.clipboard.writeText(r.repair_prompt);
+        toast("Repair prompt copied — paste it into the same chat", "ok");
+      }) }, "Copy repair prompt"), h("span", { class: "muted small" }, "Paste it into the same chat, then paste the corrected answer above.")),
+      h("pre", { class: "setup small" }, r.repair_prompt))
+      : h("div", { class: "muted small" }, "Copy a new prompt and ask again."));
+}
+
+function roughClipRow(c, i) {
+  const cells = c.kind === "placeholder"
+    ? [h("td", { colspan: 4, class: "warn-text small" }, `Labelled slate, ${c.seconds.toFixed(2)} s`)]
+    : [h("td", { class: "mono small" }, `${fmt(c.session_start)} – ${fmt(c.session_end)}`),
+      h("td", null, c.pov_id || "multicam"), h("td", null, c.audio_pov_id || "per angle"),
+      h("td", { class: "mono small" }, (c.quotes || []).join(", ") || "—")];
+  return h("tr", null, h("td", { class: "muted" }, i + 1), h("td", { class: "mono" }, c.id), h("td", null, c.title), cells);
+}
+
+function roughResult(r, box) {
+  if (!r) return null;
+  if (!r.ok) return roughRejected(r);
+  const job = r.job;
+  const running = job && (job.state === "running" || job.state === "preparing");
+  if (running) pollRough(box);
+  return h("div", null,
+    h("div", { class: "good-text" }, h("b", null, `Validated “${r.title}”: `),
+      `${r.clips.length} entries → ${r.segments} timeline segment(s)` +
+      (r.reference_gaps ? `, ${r.reference_gaps} without group reference audio` : "") + ". Saved to ",
+      h("span", { class: "mono small" }, r.cut_dir)),
+    h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["#", "Clip", "Title", "Session range", "Video", "Mic", "Quotes"].map((x) => h("th", null, x)))),
+      h("tbody", null, r.clips.map(roughClipRow))),
+    r.warnings.length ? h("details", null, h("summary", { class: "warn-text small" }, `${r.warnings.length} warning(s)`),
+      issueList(r.warnings, "warn-text")) : null,
+    h("div", { class: "row resolve-go" },
+      h("button", { class: "btn primary", disabled: running ? true : null, onclick: action(async () => {
+        r.job = await api("/api/rough-cut/build", { cut_id: r.cut_id });
+        fillRough(box);
+      }) }, "Build into new Resolve project"),
+      openBtn("Open report.md", r.report_path), openBtn("Open folder", r.cut_dir),
+      h("span", { class: "muted small" }, "Save and close your Resolve project and leave the Project Manager open first.")),
+    job && job.cut_id === r.cut_id ? resolveJobBox(job, box) : null);
+}
+
+function fillRough(box) {
+  while (box.childNodes.length > 3) box.lastChild.remove();
+  const rc = state.roughCut;
+  const info = rc.info;
+  const answer = h("textarea", { rows: 8, class: "mono", placeholder: "Paste the AI's JSON answer here (code fences are fine)…" });
+  answer.value = rc.answer;
+  answer.addEventListener("input", () => { rc.answer = answer.value; });
+  appendAll(box,
+    info ? h("div", { class: "muted small" }, "Export ID ", h("span", { class: "mono" }, info.export_id),
+      ". Answers are accepted only for this session state and brief/target; changing any of these needs a new prompt.") : null,
+    info && info.excluded.length ? h("div", null, h("b", { class: "warn-text small" }, "Recordings left out of the prompt (unverified):"),
+      issueList(info.excluded, "warn-text")) : null,
+    info && info.mics.length ? h("div", null, h("h3", null, "Microphones to confirm"),
+      h("table", { class: "t" }, h("thead", null, h("tr", null, ["Player", "Part", "Status", "Metadata says", ""].map((x) => h("th", null, x)))),
+        h("tbody", null, info.mics.map((m) => resolveMicRow(m, box, () => loadRoughPrompt(box)))))) : null,
+    h("h3", null, "2. Paste the AI's answer"),
+    h("div", { class: "row" }, answer),
+    h("div", { class: "row" },
+      h("button", { class: "btn primary", onclick: action(async () => {
+        rc.result = await api("/api/rough-cut/import", { ...roughBody(), text: answer.value });
+        toast(rc.result.ok ? "Rough cut validated and saved" : "Rough cut rejected — see the problems below", rc.result.ok ? "ok" : "warn");
+        fillRough(box);
+      }) }, "Validate answer"),
+      h("span", { class: "muted small" }, "Every clip is checked against the transcript and verified footage. Any problem saves nothing.")),
+    roughResult(rc.result, box));
+}
+
+function roughCutPanel() {
+  const rc = state.roughCut;
+  const brief = h("textarea", { rows: 2, placeholder: "Optional editorial brief, e.g. a 90-second cut of the funniest disasters" });
+  brief.value = rc.brief;
+  brief.addEventListener("input", () => { rc.brief = brief.value; });
+  const target = h("input", { type: "number", min: 5, max: 1800, placeholder: "seconds", style: { width: "100px" } });
+  target.value = rc.target;
+  target.addEventListener("input", () => { rc.target = target.value; });
+  const box = h("div", { class: "panel" },
+    h("h2", null, "Rough cut (AI)"),
+    h("div", { class: "muted small" }, "An AI picks transcript-supported moments from anywhere in the verified session and orders them. ",
+      "Auto-Clipper validates every clip against the transcript and footage, then builds a new Resolve project with ",
+      "multicam angles, Source-mode mics and the GROUP REFERENCE AUDIO track. session.json is not changed."),
+    h("div", null,
+      h("h3", null, "1. Copy the prompt"),
+      h("div", { class: "row" }, h("label", { class: "f", style: { flex: "1" } }, "Brief", brief), h("label", { class: "f" }, "Target length (s)", target)),
+      h("div", { class: "row" },
+        h("button", { class: "btn primary", onclick: action(async () => {
+          const info = await loadRoughPrompt(box);
+          await navigator.clipboard.writeText(info.prompt);
+          toast("Rough-cut prompt copied — paste it into a new chat", "ok");
+        }) }, "Copy prompt"),
+        h("button", { class: "btn", onclick: action(async () => {
+          const info = await loadRoughPrompt(box);
+          const url = URL.createObjectURL(new Blob([info.prompt], { type: "text/plain" }));
+          const a = h("a", { href: url, download: info.filename });
+          document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+        }) }, "Download prompt"),
+        h("span", { class: "muted small" }, "Paste it into a fresh ChatGPT or Claude chat. Keep the same brief when validating."))));
+  fillRough(box);
+  return box;
+}
+
 function renderExport(main) {
   const s = state.session;
   main.appendChild(resolvePanel());
+  main.appendChild(roughCutPanel());
   const modes = h("div", { class: "row" }, Object.entries(EXPORT_MODES).map(([k, m]) =>
     h("label", null, h("input", { type: "radio", name: "xmode", value: k, checked: state.exportMode === k,
       onchange: () => { state.exportMode = k; } }), " ", m.label)));
@@ -1052,6 +1207,240 @@ function renderExport(main) {
   else api("/api/export/info").then((i) => { state.exportInfo = i; fill(i); }).catch((e) => { infoBox.lastChild.textContent = e.message; setupBox.lastChild.textContent = e.message; });
 }
 
+// ---------------------------------------------------------------- Director (AI bridge)
+// Works on a Director scratch folder, independent of the open Auto-Clipper session. Copy a prompt built
+// from the reviewer's notes, paste the AI's answer, validate it strictly, then build the saved plan into a
+// NEW Resolve project through the same single job slot as Export to Resolve.
+function newDirector() {
+  return { scratch: "", root: "", scratches: null, binding: null, data: null, selected: new Set(), tag: "",
+    query: "", full: false, savePrompt: true, info: null, provider: "Claude", answer: "", companionClosed: false,
+    result: null, rejected: null, previews: {}, job: null, resumed: false };
+}
+
+function directorSummary(b) {
+  return `${b.fps} fps · ${b.session_id} · digest ${b.digest} · ${b.project} · ${b.notes} note(s)`;
+}
+
+async function directorRefresh(box) {
+  const d = state.director;
+  d.data = await api("/api/director/state");
+  d.binding = d.data.binding;
+  const live = new Set(d.data.notes.map((n) => n.note_id));
+  d.selected = new Set([...d.selected].filter((id) => live.has(id)));
+  fillDirector(box);
+}
+
+function directorVisibleNotes() {
+  const d = state.director;
+  const terms = d.query.toLowerCase().split(/\s+/).filter(Boolean);
+  return d.data.notes.filter((n) => (!d.tag || n.tags.includes(d.tag)) &&
+    terms.every((t) => `${n.title} ${n.excerpt} ${n.tags.join(" ")}`.toLowerCase().includes(t)));
+}
+
+function directorCoverage(rows) {
+  return h("div", { class: "muted small" }, rows.map((r) => h("div", null,
+    h("b", null, r.name), ` video+mic: ${r.tc.video.join(", ") || "none"}`,
+    r.tc.gaps.length ? h("span", { class: "warn-text" }, `  gaps: ${r.tc.gaps.join(", ")}`) : null)));
+}
+
+function directorNotesPanel(box) {
+  const d = state.director;
+  const visible = directorVisibleNotes();
+  const tag = h("select", { onchange: (e) => { d.tag = e.target.value; fillDirector(box); } },
+    h("option", { value: "" }, "all tags"), d.data.tags.map((t) => h("option", { value: t, selected: t === d.tag ? true : null }, t)));
+  const search = h("input", { placeholder: "Search notes", value: d.query });
+  search.addEventListener("change", () => { d.query = search.value; fillDirector(box); });
+  return h("div", null,
+    h("h3", null, "1. Select notes"),
+    h("div", { class: "row" }, h("label", null, "Tag ", tag), search,
+      h("button", { class: "btn small", onclick: () => { visible.forEach((n) => d.selected.add(n.note_id)); fillDirector(box); } }, "Select shown"),
+      h("button", { class: "btn small", onclick: () => { d.selected.clear(); fillDirector(box); } }, "None"),
+      h("span", { class: "muted small" }, `${d.selected.size} selected (none selected = all ${d.data.notes.length})`)),
+    h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["", "Rev", "Review timecode", "Title", "Tags", "Note"].map((x) => h("th", null, x)))),
+      h("tbody", null, visible.map((n) => h("tr", null,
+        h("td", null, h("input", { type: "checkbox", checked: d.selected.has(n.note_id), onchange: (e) => {
+          if (e.target.checked) d.selected.add(n.note_id); else d.selected.delete(n.note_id);
+          fillDirector(box); } })),
+        h("td", { class: "muted" }, `r${n.rev}`), h("td", { class: "mono small" }, `${n.tc_in} – ${n.tc_out}`),
+        h("td", null, n.title), h("td", { class: "small" }, n.tags.join(", ")), h("td", { class: "small muted" }, n.excerpt))))),
+    directorCoverage(d.data.coverage),
+    h("div", { class: "row" },
+      h("label", null, h("input", { type: "checkbox", checked: d.full, onchange: (e) => { d.full = e.target.checked; } }), " Full transcript (larger)"),
+      h("label", null, h("input", { type: "checkbox", checked: d.savePrompt, onchange: (e) => { d.savePrompt = e.target.checked; } }),
+        " Keep prompt and response in the scratch folder"),
+      h("button", { class: "btn primary", onclick: action(async () => {
+        d.info = await api("/api/director/export", { note_ids: d.selected.size ? [...d.selected] : null,
+          full_transcript: d.full, save_prompt: d.savePrompt });
+        d.rejected = null; d.result = null;
+        fillDirector(box);
+      }) }, "Generate AI packet")));
+}
+
+function directorPromptPanel(box) {
+  const info = state.director.info;
+  if (!info) return null;
+  const area = h("textarea", { rows: 6, class: "mono", readonly: true });
+  area.value = info.prompt;
+  return h("div", null,
+    h("h3", null, "2. Copy to ChatGPT or Claude"),
+    h("div", { class: "warn-text small" }, "This contains your note and transcript text. Paste it only into a chat you approve. No file paths or media are included."),
+    h("div", { class: "row" }, h("span", { class: "mono" }, info.export_id),
+      h("span", { class: "muted small" }, `${info.chars.toLocaleString()} chars · ${info.counts.notes} note(s) · ${info.counts.spans} line(s)` +
+        (info.window_s ? ` · ±${info.window_s} s windows` : " · full transcript")),
+      h("button", { class: "btn primary", onclick: action(async () => {
+        await navigator.clipboard.writeText(info.prompt);
+        toast("Prompt copied — paste it into a new chat", "ok");
+      }) }, "Copy to clipboard")),
+    area);
+}
+
+function directorPastePanel(box) {
+  const d = state.director;
+  if (!d.info) return null;
+  const answer = h("textarea", { rows: 8, class: "mono", placeholder: "Paste the AI's JSON answer here (code fences are fine)…" });
+  answer.value = d.answer;
+  answer.addEventListener("input", () => { d.answer = answer.value; });
+  const file = h("input", { type: "file", accept: ".json,.txt" });
+  file.addEventListener("change", async () => {
+    if (file.files[0]) { d.answer = await file.files[0].text(); fillDirector(box); }
+  });
+  const provider = h("select", { onchange: (e) => { d.provider = e.target.value; } },
+    ["Claude", "ChatGPT", "Other"].map((p) => h("option", { value: p, selected: p === d.provider ? true : null }, p)));
+  return h("div", null,
+    h("h3", null, "3. Paste the AI's answer"),
+    h("div", { class: "row" }, h("label", null, "Provider ", provider), h("label", null, "or choose a file ", file)),
+    h("div", { class: "row" }, answer),
+    h("div", { class: "row" },
+      h("label", null, h("input", { type: "checkbox", checked: d.companionClosed, onchange: (e) => { d.companionClosed = e.target.checked; } }),
+        " The companion for this scratch is closed"),
+      h("button", { class: "btn primary", onclick: action(async () => {
+        d.rejected = null; d.result = null;
+        try {
+          d.result = await api("/api/director/import", { text: answer.value, provider: d.provider,
+            save_response: d.savePrompt, companion_closed: d.companionClosed });
+          toast("Plan validated and saved", "ok");
+        } catch (e) {
+          if (e.status === 422 && e.data) { d.rejected = e.data; toast("Answer rejected — see the report below", "warn"); }
+          else throw e;
+        }
+        await directorRefresh(box);
+      }) }, "Validate and save"),
+      h("span", { class: "muted small" }, "Every clip is checked against your notes' current revisions, the transcript and verified footage. Any problem saves nothing.")));
+}
+
+function directorResultPanel() {
+  const d = state.director;
+  if (d.rejected) return h("div", null, h("h3", null, "Validation report"), roughRejected(d.rejected));
+  const r = d.result;
+  if (!r) return null;
+  return h("div", null, h("h3", null, "Validation report"),
+    h("div", { class: "good-text" }, h("b", null, `Saved “${r.title}” as ${r.plan_id}: `), `${r.clips.length} entries → ${r.segments} timeline segment(s).`),
+    h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["#", "Clip", "Title", "Review timecode", "Video", "Mic", "Notes"].map((x) => h("th", null, x)))),
+      h("tbody", null, r.clips.map((c, i) => h("tr", null, h("td", { class: "muted" }, i + 1), h("td", { class: "mono" }, c.id), h("td", null, c.title),
+        c.kind === "placeholder" ? h("td", { colspan: 4, class: "warn-text small" }, `Labelled slate, ${c.seconds.toFixed(2)} s`)
+          : [h("td", { class: "mono small" }, `${c.tc_in} – ${c.tc_out}`), h("td", null, c.pov_id || "multicam"),
+            h("td", null, c.audio_pov_id || "per angle"), h("td", { class: "mono small" }, c.notes.join(", "))])))),
+    r.warnings.length ? h("details", null, h("summary", { class: "warn-text small" }, `${r.warnings.length} warning(s)`), issueList(r.warnings, "warn-text")) : null);
+}
+
+function directorPlansPanel(box) {
+  const d = state.director;
+  const job = d.job;
+  const running = job && (job.state === "running" || job.state === "preparing");
+  if (running) pollJob("director", (j) => { d.job = j; }, box, fillDirector,
+    { done: "Director plan built in Resolve", failed: "Director build stopped — see the build box" });
+  const ours = job && job.kind === "director_plan";
+  return h("div", null,
+    h("h3", null, "Saved plans"),
+    d.data.plans.length ? h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["Plan", "Source", "Clips", "Slates", "", ""].map((x) => h("th", null, x)))),
+      h("tbody", null, d.data.plans.map((p) => {
+        const pv = d.previews[p.plan_id];
+        return h("tr", null,
+          h("td", { class: "mono small" }, p.plan_id),
+          h("td", { class: "small" }, p.ai ? `AI (${p.provider}) ${p.title || ""}` : "manual"),
+          h("td", null, p.clips), h("td", null, p.placeholders),
+          h("td", { class: "small" }, pv ? (pv.error ? h("span", { class: "bad-text" }, pv.error)
+            : `${pv.segments} segments, ${pv.slates} slates, ${pv.blockers} blockers`) : h("button", { class: "btn small", onclick: action(async () => {
+              try { d.previews[p.plan_id] = await api("/api/director/plan-preview?plan_id=" + encodeURIComponent(p.plan_id)); }
+              catch (e) { d.previews[p.plan_id] = { error: e.message }; }
+              fillDirector(box);
+            }) }, "Preview")),
+          h("td", null, h("button", { class: "btn small primary", disabled: (running || !pv || pv.error || pv.blockers) ? true : null, onclick: action(async () => {
+            if (!confirm("Create a NEW disposable Resolve project named “AutoClipper DirectorA Test <timestamp>”?\n\n" +
+              "Save and close your current project and leave the Resolve Project Manager open. Existing projects are not modified.")) return;
+            d.job = await api("/api/director/build", { plan_id: p.plan_id, confirm_project_manager: true });
+            fillDirector(box);
+          }) }, "Build into NEW Resolve project…")));
+      }))) : h("div", { class: "muted small" }, "No plans yet. Validate an AI answer above."),
+    ours ? directorJobBox(job) : (running ? h("div", { class: "muted small" }, "Another Resolve job is running.") : null));
+}
+
+function directorJobBox(job) {
+  const paths = h("div", { class: "mono small muted" }, `Output folder: ${job.out_dir}`, job.readback_path ? ` · readback: ${job.readback_path}` : "");
+  if (job.state === "running" || job.state === "preparing") {
+    return h("div", { class: "resolve-job" }, h("b", null, "Building… "), `creating project “${job.project}”. Do not touch Resolve until this finishes.`, paths);
+  }
+  if (job.state === "done") {
+    const rb = job.readback || {};
+    return h("div", { class: "resolve-job ok" }, h("b", { class: "good-text" }, "Build complete. "),
+      `Project “${rb.project || job.project}”, timeline “${rb.timeline || ""}”, ${(rb.segments || []).length} segment(s)${rb.reopened ? ", verified after save and reopen" : ""}.`, paths);
+  }
+  return h("div", { class: "resolve-job bad" }, h("b", { class: "bad-text" }, "Build stopped."),
+    h("pre", { class: "setup bad-text" }, job.error || "Unknown error"), paths);
+}
+
+function fillDirector(box) {
+  while (box.childNodes.length > box.headCount) box.lastChild.remove();
+  const d = state.director;
+  if (!d.data) return;
+  appendAll(box, directorNotesPanel(box), directorPromptPanel(box), directorPastePanel(box), directorResultPanel(), directorPlansPanel(box));
+}
+
+function directorPanel() {
+  const d = state.director;
+  const scratch = h("input", { class: "grow", placeholder: "autoclipper-director-a-… folder under system temp", value: d.scratch });
+  scratch.addEventListener("input", () => { d.scratch = scratch.value; });
+  const root = h("input", { class: "grow", placeholder: "Recording folder (the --session-root used at prepare)", value: d.root });
+  root.addEventListener("input", () => { d.root = root.value; });
+  const list = h("select", { onchange: (e) => { if (e.target.value) { d.scratch = e.target.value; scratch.value = d.scratch; } } },
+    h("option", { value: "" }, "choose a scratch folder…"),
+    (d.scratches || []).map((s) => h("option", { value: s.path }, `${s.name}${s.notes === null ? "" : ` · ${s.notes} note(s)`}${s.built ? "" : " · not built"}`)));
+  const status = h("div", { class: "muted small" }, d.binding ? "✓ " + directorSummary(d.binding) : "Not bound.");
+  const box = h("div", { class: "panel" },
+    h("h2", null, "Director notes → AI edit"),
+    h("div", { class: "muted small" }, "Uses the notes in a Director scratch folder. Nothing is sent anywhere: you copy the prompt into your own chat and paste the answer back. ",
+      "The recording folder is only read; plans are saved into the scratch catalog."),
+    h("div", { class: "row" }, h("label", { class: "f grow" }, "Scratch folder", scratch), list,
+      h("button", { class: "btn small", onclick: action(async () => {
+        const r = await api("/api/pick-folder", { initial: "" }); if (r.folder) { d.scratch = r.folder; scratch.value = r.folder; } }) }, "Pick")),
+    h("div", { class: "row" }, h("label", { class: "f grow" }, "Recording folder", root),
+      h("button", { class: "btn small", onclick: action(async () => {
+        const r = await api("/api/pick-folder", { initial: "" }); if (r.folder) { d.root = r.folder; root.value = r.folder; } }) }, "Pick"),
+      h("button", { class: "btn primary", onclick: action(async () => {
+        d.binding = await api("/api/director/open", { scratch: d.scratch, session_root: d.root });
+        d.info = null; d.result = null; d.rejected = null; d.previews = {}; d.selected.clear();
+        status.textContent = "✓ " + directorSummary(d.binding);
+        await directorRefresh(box);
+      }) }, "Open")),
+    status);
+  box.headCount = box.childNodes.length;
+  if (!d.scratches) api("/api/director/scratches").then((rows) => { d.scratches = rows; if (box.isConnected && !d.binding) render(); }).catch(() => {});
+  if (d.data) fillDirector(box);
+  else if (!d.resumed) {
+    d.resumed = true;  // pick up a binding the server still holds after a page reload
+    api("/api/director/state").then((s) => { d.data = s; d.binding = s.binding; if (box.isConnected) render(); }).catch(() => {});
+  }
+  return box;
+}
+
+function renderDirector(main) {
+  if (!state.director) state.director = newDirector();
+  main.appendChild(directorPanel());
+}
+
 // ---------------------------------------------------------------- boot
 $$("#tabs button").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
 (async function boot() {
@@ -1060,7 +1449,7 @@ $$("#tabs button").forEach((b) => b.addEventListener("click", () => setTab(b.dat
     applyPayload(p);
     const want = location.hash.slice(1);
     state.tab = want && $(`#tabs button[data-tab="${want}"]`) ? want : "recordings";
-  } catch (_) { state.tab = "session"; }
+  } catch (_) { state.tab = location.hash.slice(1) === "director" ? "director" : "session"; }
   updateChrome();
   render();
 })();

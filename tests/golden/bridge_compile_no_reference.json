@@ -1,0 +1,398 @@
+{
+ "blockers": [],
+ "edit_plan": {
+  "plan_id": "p",
+  "revision_history": [],
+  "revision_id": "r1"
+ },
+ "fps": 60,
+ "mode": "director_edit_plan",
+ "schema_version": 1,
+ "segments": [
+  {
+   "angles": [
+    {
+     "handle_after_frames": 2160,
+     "handle_before_frames": 1140,
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Ada",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/a1.mp4",
+     "part_id": "a1",
+     "part_index": 1,
+     "pov_id": "ada",
+     "pov_name": "Ada",
+     "source_frame_count": 3600,
+     "source_in_frame": 1140,
+     "source_out_frame": 1440
+    },
+    {
+     "handle_after_frames": 960,
+     "handle_before_frames": 540,
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Bob",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/b1.mp4",
+     "part_id": "b1",
+     "part_index": 1,
+     "pov_id": "bob",
+     "pov_name": "Bob",
+     "source_frame_count": 1800,
+     "source_in_frame": 540,
+     "source_out_frame": 840
+    }
+   ],
+   "candidate_ids": [],
+   "duration_frames": 300,
+   "event_id": "C01",
+   "kind": "media",
+   "note_ids": [
+    "n1"
+   ],
+   "piece": 1,
+   "pieces": 1,
+   "range_source": "edit_plan",
+   "record_start_frame": 0,
+   "requested_audio_pov_id": null,
+   "requested_pov_id": null,
+   "segment_id": "001",
+   "session_end": 24.0,
+   "session_end_frame": 1440,
+   "session_start": 19.0,
+   "session_start_frame": 1140,
+   "suggestion_id": "C01",
+   "title": "Flip",
+   "unavailable": []
+  },
+  {
+   "angles": [
+    {
+     "handle_after_frames": 900,
+     "handle_before_frames": 720,
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Bob",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/b1.mp4",
+     "part_id": "b1",
+     "part_index": 1,
+     "pov_id": "bob",
+     "pov_name": "Bob",
+     "source_frame_count": 1800,
+     "source_in_frame": 720,
+     "source_out_frame": 900
+    }
+   ],
+   "audio_angle": {
+    "handle_after_frames": 900,
+    "handle_before_frames": 720,
+    "mic": {
+     "evidence": "owner confirmation + MP4 probe",
+     "expected_owner_track": 2,
+     "mp4_audio_channels": 2,
+     "mp4_audio_ordinal": 2,
+     "mp4_audio_stream_index": 2,
+     "mp4_audio_title": "Track2",
+     "resolve_channels": [
+      3,
+      4
+     ],
+     "resolve_channels_status": "expected",
+     "speaker": "Bob",
+     "status": "owner_confirmed",
+     "transcriber_track": 2
+    },
+    "mp4_path": "<ROOT>/b1.mp4",
+    "part_id": "b1",
+    "part_index": 1,
+    "pov_id": "bob",
+    "pov_name": "Bob",
+    "source_frame_count": 1800,
+    "source_in_frame": 720,
+    "source_out_frame": 900
+   },
+   "candidate_ids": [],
+   "duration_frames": 180,
+   "event_id": "C02",
+   "kind": "media",
+   "note_ids": [
+    "n2"
+   ],
+   "piece": 1,
+   "pieces": 1,
+   "range_source": "edit_plan",
+   "record_start_frame": 300,
+   "requested_audio_pov_id": "bob",
+   "requested_pov_id": "bob",
+   "segment_id": "002",
+   "session_end": 25.0,
+   "session_end_frame": 1500,
+   "session_start": 22.0,
+   "session_start_frame": 1320,
+   "suggestion_id": "C02",
+   "title": "Bob",
+   "unavailable": []
+  },
+  {
+   "angles": [],
+   "candidate_ids": [],
+   "duration_frames": 180,
+   "duration_source": "provisional",
+   "event_id": "P01",
+   "kind": "placeholder",
+   "note_ids": [],
+   "piece": 1,
+   "pieces": 1,
+   "placeholder_reason": "planned_missing_beat",
+   "range_source": "edit_plan",
+   "record_start_frame": 480,
+   "requested_audio_pov_id": null,
+   "requested_pov_id": null,
+   "segment_id": "003",
+   "suggestion_id": "P01",
+   "title": "Card",
+   "unavailable": []
+  },
+  {
+   "angles": [
+    {
+     "handle_after_frames": 3000,
+     "handle_before_frames": 300,
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Ada",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/a1.mp4",
+     "part_id": "a1",
+     "part_index": 1,
+     "pov_id": "ada",
+     "pov_name": "Ada",
+     "source_frame_count": 3600,
+     "source_in_frame": 300,
+     "source_out_frame": 600
+    }
+   ],
+   "candidate_ids": [],
+   "duration_frames": 300,
+   "event_id": "C03",
+   "kind": "media",
+   "note_ids": [
+    "n3"
+   ],
+   "piece": 1,
+   "pieces": 2,
+   "range_source": "edit_plan",
+   "record_start_frame": 660,
+   "requested_audio_pov_id": null,
+   "requested_pov_id": "ada",
+   "segment_id": "004",
+   "session_end": 10.0,
+   "session_end_frame": 600,
+   "session_start": 5.0,
+   "session_start_frame": 300,
+   "suggestion_id": "C03",
+   "title": "Edge",
+   "unavailable": [
+    {
+     "pov_id": "bob",
+     "pov_name": "Bob",
+     "reason": "no_coverage"
+    }
+   ]
+  },
+  {
+   "angles": [
+    {
+     "handle_after_frames": 2700,
+     "handle_before_frames": 600,
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Ada",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/a1.mp4",
+     "part_id": "a1",
+     "part_index": 1,
+     "pov_id": "ada",
+     "pov_name": "Ada",
+     "source_frame_count": 3600,
+     "source_in_frame": 600,
+     "source_out_frame": 900
+    }
+   ],
+   "candidate_ids": [],
+   "duration_frames": 300,
+   "event_id": "C03",
+   "kind": "media",
+   "note_ids": [
+    "n3"
+   ],
+   "piece": 2,
+   "pieces": 2,
+   "range_source": "edit_plan",
+   "record_start_frame": 960,
+   "requested_audio_pov_id": null,
+   "requested_pov_id": "ada",
+   "segment_id": "005",
+   "session_end": 15.0,
+   "session_end_frame": 900,
+   "session_start": 10.0,
+   "session_start_frame": 600,
+   "suggestion_id": "C03",
+   "title": "Edge",
+   "unavailable": []
+  }
+ ],
+ "session_folder": "<ROOT>",
+ "session_id": "synthetic",
+ "source_mapping": {
+  "fps": 60,
+  "parts": [
+   {
+    "file_identity": [
+     9,
+     1700000000000000000
+    ],
+    "index": 1,
+    "media": {
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Ada",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/a1.mp4",
+     "source_frame_count": 3600
+    },
+    "offset": "0",
+    "part_id": "a1",
+    "playable_intervals": [
+     [
+      0,
+      3600
+     ]
+    ],
+    "pov_id": "ada",
+    "session_start_frame": 0,
+    "source_path": "<ROOT>/a1.mp4"
+   },
+   {
+    "file_identity": [
+     9,
+     1700000000000000000
+    ],
+    "index": 1,
+    "media": {
+     "mic": {
+      "evidence": "owner confirmation + MP4 probe",
+      "expected_owner_track": 2,
+      "mp4_audio_channels": 2,
+      "mp4_audio_ordinal": 2,
+      "mp4_audio_stream_index": 2,
+      "mp4_audio_title": "Track2",
+      "resolve_channels": [
+       3,
+       4
+      ],
+      "resolve_channels_status": "expected",
+      "speaker": "Bob",
+      "status": "owner_confirmed",
+      "transcriber_track": 2
+     },
+     "mp4_path": "<ROOT>/b1.mp4",
+     "source_frame_count": 1800
+    },
+    "offset": "10",
+    "part_id": "b1",
+    "playable_intervals": [
+     [
+      600,
+      2400
+     ]
+    ],
+    "pov_id": "bob",
+    "session_start_frame": 600,
+    "source_path": "<ROOT>/b1.mp4"
+   }
+  ],
+  "version": 1
+ },
+ "source_mapping_digest": "<DIGEST>",
+ "warnings": [
+  {
+   "code": "game_audio_unidentified",
+   "message": "Game audio not identified."
+  }
+ ]
+}

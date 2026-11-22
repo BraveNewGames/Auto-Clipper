@@ -2,11 +2,35 @@
 import json
 import math
 from pathlib import Path
+from dataclasses import dataclass
 import shutil
 import struct
 import subprocess
 
 FFMPEG_BIN = Path("C:/Program Files/FFMPEG/5.1.2/bin")
+
+
+@dataclass(frozen=True)
+class RecordingSource:
+    path: Path | None
+    status: str  # found, stale_mkv, or missing
+
+
+def resolve_recording(folder, reference, *, require_mp4=False) -> RecordingSource:
+    """Resolve a saved recording reference without changing the session."""
+    if not reference:
+        return RecordingSource(None, "missing")
+    saved = Path(folder) / reference
+    if saved.is_file():
+        if require_mp4 and saved.suffix.lower() == ".mkv":
+            remux = saved.with_suffix(".mp4")
+            return RecordingSource(remux, "found") if remux.is_file() else RecordingSource(None, "missing")
+        return RecordingSource(saved, "found")
+    if saved.suffix.lower() == ".mkv":
+        mp4 = saved.with_suffix(".mp4")
+        if mp4.is_file():
+            return RecordingSource(mp4, "stale_mkv")
+    return RecordingSource(None, "missing")
 
 
 def probe_duration(path) -> float | None:

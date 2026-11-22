@@ -51,6 +51,11 @@ Options: `python -m autoclipper [session_folder] [--port N] [--no-browser]`.
 
 The Export tab shows the same instructions.
 
+When a saved `.mkv` reference is missing but a same-stem `.mp4` exists, the
+reviewer README points to that MP4 and expected clip filenames end in `.mp4`.
+Existing MKV files retain their `.mkv` names. CSV columns and segment timings
+do not change; a missing recording is identified in the reviewer README.
+
 ## Export to Resolve
 
 The Export tab can build a DaVinci Resolve Studio project directly from your **Keep** selections:
@@ -99,8 +104,79 @@ in session order, with timeline markers carrying the event ID, suggestion ID and
    Delete that project and export again.
 
 Audio uses Resolve multicam *Source* mode: each angle carries its owner's mic (one switchable
-pair). Game audio is reported as not identified unless the transcriber metadata names it.
+pair). New exports also have an enabled **GROUP REFERENCE AUDIO** track with the verified stereo
+Track1 mix from one covering POV per segment. Track1 must map uniquely in the MP4, differ from
+the verified owner mic, and have no label or a mix, system, or Team label. The exporter prefers
+the POV covering the most selected frames and falls back to another verified POV when needed.
+The reference track stays in place while you switch multicam angles.
+If no safe mix is identified, that segment has a gap and the preview and report show a warning.
+Before the final render, disable **GROUP REFERENCE AUDIO** in the Edit track header or mute it in
+the Edit or Fairlight mixer if you do not want the group conversation in the final mix. A disabled
+or muted track is excluded from the render. Game audio is reported as not identified unless the
+transcriber metadata names it.
 Source MP4s are imported by reference and never modified.
+
+## Rough cut (AI)
+
+The **Rough cut (AI)** panel in the Export tab turns an AI-chosen, ordered list of moments into a
+new Resolve project. It uses manual copy and paste only, with no API calls.
+
+1. Optionally enter a brief and a target length, then **Copy prompt** and paste it into a fresh
+   ChatGPT or Claude chat. The prompt contains the transcript (with line IDs), the existing AI
+   Review suggestions and Keep decisions as hints, each POV's verified video and mic coverage, the
+   JSON answer format, and an **export ID** that fingerprints the session, transcript and verified
+   recordings. Recordings that are not verified (for example, a mic that is not confirmed) are left
+   out; confirm their mics in the panel and copy the prompt again.
+2. Paste the answer and **Validate answer**. Every clip must be anchored to transcript line IDs, an
+   existing suggestion ID, or exact frames with a matching timecode. Pads are 0–10 s. Quotes must be
+   verbatim from a line inside the clip. The chosen POV (or, for `pov: null`, any camera) and the
+   chosen mic (`audio_pov`) must have verified coverage for the whole clip. Clips may come from
+   anywhere in the session, in any order. The answer is then compiled with the edit-plan compiler and
+   preflighted by the Resolve builder. Any problem saves nothing and shows a **repair prompt** for the
+   same chat. An answer for an older export ID (the session, transcript, mic confirmations or MP4s
+   changed) is refused; copy a new prompt.
+3. **Build into new Resolve project** uses the same single export job as Export to Resolve and creates
+   **AutoClipper Export `<session id>` `<timestamp>`** from the Project Manager. Each clip is a
+   multicam of the covering angles (or one fixed POV) in the answer's order, with Source-mode mics
+   unless a fixed `audio_pov` is chosen, and labelled slates for placeholders. The
+   **GROUP REFERENCE AUDIO** track uses one POV's verified Track1 mix for the whole cut where it is
+   covered, even under a fixed single-POV clip.
+
+Rough cuts never change `session.json`.
+
+## Director notes to AI edit
+
+The **7 · Director** tab turns the notes you captured in a Director scratch folder into an AI-suggested
+edit plan. It works without an open Auto-Clipper session and never opens, creates or remembers one. It
+is manual copy and paste only: no provider calls, no API keys.
+
+1. **Open** a scratch folder (the `autoclipper-director-a-*` folder printed by `director_poc prepare`,
+   under system temp) together with the **recording folder** that was used as `--session-root` at
+   prepare. Every request re-checks the build receipt, the frame clock, the verified source mapping and
+   the pinned SRT digests. The recording folder is only read.
+2. Select notes (all by default) and **Generate AI packet**. The prompt holds each note with its
+   revision, review-timeline timecodes and current text, a transcript window of +/-20 s around each
+   note (it shrinks towards 5 s to stay under 120k characters; above 400k the export is refused),
+   and each POV's verified video and mic coverage with its gaps. It contains **no file paths or part
+   IDs**, but it does contain your note and transcript text, so paste it only into a chat you approve.
+3. Paste the answer, tick **The companion for this scratch is closed**, and **Validate and save**. Every
+   clip must cite exported notes (`note_ids`) whose current revision is unchanged and not deleted, and
+   must be anchored to a note (`note`), transcript line aliases (`start_line`/`end_line`) or frames with
+   matching timecodes, overlapping a cited note's window. POV and mic coverage, verbatim quotes, pads and
+   limits are checked with the same rules as the rough cut, then the plan is compiled as a dry run. **Any
+   problem saves nothing** (the catalog stays byte-identical) and shows a report with a **repair prompt**.
+   A valid answer is saved as a new `ai-dx-<id>-<n>` plan with AI provenance (provider, export ID, prompt
+   and response hashes). Plans are never overwritten.
+4. **Preview** a saved plan, then **Build into NEW Resolve project...** (Resolve on the Project
+   Manager, your project saved and closed). It creates **AutoClipper DirectorA Test `<timestamp>`** through
+   the same single job slot as Export to Resolve. Group Reference Audio is not added to these builds.
+
+Headless equivalents: `python -m autoclipper.director_ai {export,import,plan-build} SCRATCH --session-root FOLDER`
+(see `--help`; `plan-build` needs `--dry-run` or `--confirm-project-manager`).
+
+Known limits: close the Director companion first, because the catalog has one writer per session
+(a change made between the final check and the write is refused as `E_FKB_CHANGED` when detected, but a
+write inside the few milliseconds of the swap is not); mic availability is inferred from video coverage.
 
 ## Where files go
 
@@ -108,6 +184,8 @@ Source MP4s are imported by reference and never modified.
 |---|---|
 | Session project (offsets, reviews, decisions) | `<session folder>\.autoclipper\session.json` |
 | Resolve export manifest, report and readback | `<session folder>\autoclipper_exports\resolve\<YYYYMMDD-HHMMSS>\` |
+| AI rough cut (prompt, answer, plan, manifest, report, validation) | `<session folder>\autoclipper_exports\rough-cuts\<YYYYMMDD-HHMMSS>\`; each build adds `build-<timestamp>\readback.json` |
+| Director AI bridge (exports, optional prompt/response copies) | `<scratch>\.autoclipper\director-ai\{exports,prompts,responses}\dx-<id>*`; plans go into the scratch catalog; each build adds `<scratch>\edit-<plan>-<timestamp>\{manifest.json,report.md,readback.json}` |
 | Owner mic confirmations | `<session folder>\.autoclipper\mic_confirmations.json` |
 | LosslessCut CSVs + README per reviewer | `<session folder>\autoclipper_exports\<reviewer>\<POV>_part<N>_pass<K>.csv` |
 | Recent sessions list | `%APPDATA%\AutoClipper\recent.json` |

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -9,8 +10,11 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from autoclipper.models import Part, POV, Review, Session, Suggestion
-from autoclipper.resolve_builder import build_export, describe_failure, import_sources, main
-from autoclipper.resolve_manifest import build_manifest
+from autoclipper.resolve_builder import (build_export, describe_failure, import_reference_sources,
+                                         import_sources, main, read_export, reference_xml_matches)
+from autoclipper.resolve_manifest import build_manifest, build_review_manifest, compile_edit_plan, source_mapping_digest
+
+from director_fixtures import confirmed_mics, synthetic_probe
 
 
 def make_manifest(root):
@@ -46,6 +50,17 @@ def make_manifest(root):
     }
 
 
+def add_fixture_media_mapping(manifest):
+    paths = {angle["mp4_path"] for segment in manifest["segments"]
+             for angle in (*segment["angles"], *([segment["audio_angle"]] if segment.get("audio_angle") else []))}
+    rows = []
+    for path in sorted(paths):
+        stat = Path(path).stat()
+        rows.append({"media": {"mp4_path": path}, "file_identity": [stat.st_size, stat.st_mtime_ns]})
+    manifest["source_mapping"] = {"version": 1, "parts": rows}
+    manifest["source_mapping_digest"] = source_mapping_digest(manifest)
+
+
 def fake_resolve():
     sdk, manager = Mock(), Mock()
     resolve = sdk.scriptapp.return_value
@@ -54,9 +69,11 @@ def fake_resolve():
     resolve.MULTICAM_ANGLE_NAME_CLIP = "clip"
     resolve.MULTICAM_AUDIO_SOURCE = "source"
     project, reopened = Mock(), Mock()
+    project.GetUniqueId.return_value = reopened.GetUniqueId.return_value = "scratch-project-id"
     pool = project.GetMediaPool.return_value
     timeline, reopened_timeline = pool.CreateEmptyTimeline.return_value, Mock()
-    state = {"current": None, "media": [], "video": [], "audio": [], "markers": {}}
+    state = {"current": None, "media": [], "reference_media": [], "video": [], "audio": [],
+             "audio2": [], "markers": {}, "reference_folder": None, "current_folder": "root"}
     manager.GetCurrentProject.side_effect = lambda: state["current"]
     manager.GetProjectListInCurrentFolder.return_value = []
     project.GetTimelineCount.return_value = 0
@@ -65,12 +82,34 @@ def fake_resolve():
     reopened.GetMediaPool.return_value.GetRootFolder.return_value.GetClipList.side_effect = (
         lambda: list(state["media"])
     )
+    root_folder = pool.GetRootFolder.return_value
+    root_folder.GetClipList.side_effect = lambda: list(state["media"])
+    root_folder.GetSubFolderList.side_effect = lambda: ([state["reference_folder"]]
+                                                        if state["reference_folder"] else [])
+    reopened.GetMediaPool.return_value.GetRootFolder.return_value = root_folder
+    def add_folder(_root, name):
+        folder = Mock()
+        folder.GetName.return_value = name
+        folder.GetClipList.side_effect = lambda: list(state["reference_media"])
+        state["reference_folder"] = folder
+        return folder
+    pool.AddSubFolder.side_effect = add_folder
+    pool.SetCurrentFolder.side_effect = lambda folder: state.update(
+        current_folder="root" if folder is root_folder else "reference") or True
     for item in (timeline, reopened_timeline):
         item.GetName.return_value = "synthetic-session"
+        item.GetUniqueId.return_value = "review-timeline-id"
         item.GetSettings.return_value = {"timelineFrameRate": "60"}
         item.GetStartFrame.return_value = 216000
-        item.GetItemListInTrack.side_effect = lambda kind, index: list(state[kind])
+        item.GetStartTimecode.return_value = "01:00:00:00"
+        item.GetItemListInTrack.side_effect = lambda kind, index: list(
+            state["audio2"] if kind == "audio" and index == 2 else state[kind])
         item.GetMarkerCustomData.side_effect = lambda offset: state["markers"][offset]
+        item.GetTrackCount.side_effect = lambda kind: 2 if kind == "audio" and state["reference_folder"] else 1
+        item.SetTrackName.side_effect = lambda kind, index, name: state.update(track_name=name) or True
+        item.GetTrackName.side_effect = lambda kind, index: state.get("track_name", "")
+        item.GetTrackSubType.return_value = "stereo"
+        item.GetIsTrackEnabled.return_value = True
 
     def create_project(name, _):
         project.GetName.return_value = reopened.GetName.return_value = name
@@ -124,7 +163,7 @@ def fake_resolve():
         clip.SetAudioMapping.side_effect = set_mapping
         clip.SetMarkInOut.side_effect = set_marks
         clip.ClearMarkInOut.side_effect = clear_marks
-        state["media"].append(clip)
+        state["reference_media" if state["current_folder"] == "reference" else "media"].append(clip)
         return [clip]
 
     def create_multicam(sources, options):
@@ -138,22 +177,25 @@ def fake_resolve():
 
     def append(infos):
         info, = infos
-        assert "mediaType" not in info
         start = info["recordFrame"]
         length = info["endFrame"] - info["startFrame"]
-        for kind in ("video", "audio"):
+        source_start = info["startFrame"]
+        streams = {1: ("video",), 2: ("audio",)}.get(info.get("mediaType"), ("video", "audio"))
+        items = []
+        for kind in streams:
             item = Mock()
             item.GetMediaPoolItem.return_value = info["mediaPoolItem"]
             item.GetStart.return_value = start
             item.GetEnd.return_value = start + length
             item.GetDuration.return_value = length
-            item.GetSourceStartFrame.return_value = 0
-            item.GetSourceEndFrame.return_value = length - 2
+            item.GetSourceStartFrame.return_value = source_start
+            item.GetSourceEndFrame.return_value = source_start + length - 2
             item.GetSourceAudioChannelMapping.return_value = json.dumps({
                 "track_mapping": {"1": {"channel_idx": [1, 2], "mute": False, "type": "stereo"}},
             })
-            state[kind].append(item)
-        return [state["video"][-1]]
+            state["audio2" if kind == "audio" and info["trackIndex"] == 2 else kind].append(item)
+            items.append(item)
+        return items
 
     def mark(frame, _color, _name, _note, _duration, data):
         state["markers"][frame] = data
@@ -171,6 +213,171 @@ def fake_resolve():
 
 
 class ResolveBuilderTests(unittest.TestCase):
+    def test_reference_start_getter_discrepancy_needs_matching_xml(self):
+        sdk, _, state, project, reopened = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            manifest["segments"] = manifest["segments"][:1]
+            for angle in manifest["segments"][0]["angles"]:
+                Path(angle["mp4_path"]).touch()
+            segment = manifest["segments"][0]
+            angle = segment["angles"][0]
+            track = {"status": "verified", "mp4_audio_stream_index": 1,
+                     "mp4_audio_ordinal": 1, "mp4_audio_title": "Track1",
+                     "resolve_channels": [1, 2], "resolve_channels_status": "expected"}
+            angle["reference_track"] = track
+            segment["reference_audio"] = {
+                "pov_id": angle["pov_id"], "pov_name": angle["pov_name"],
+                "part_id": angle["part_id"], "mp4_path": angle["mp4_path"],
+                "source_in_frame": angle["source_in_frame"],
+                "source_out_frame": angle["source_out_frame"],
+                "record_start_frame": 0, "duration_frames": 60, "track": track}
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), patch(
+                    "autoclipper.resolve_builder.mkdtemp", return_value=folder):
+                build_export(manifest)
+            ref = segment["reference_audio"]
+            ref.update(source_in_frame=31113, source_out_frame=31173)
+            item = state["audio2"][0]
+            item.GetSourceStartFrame.return_value = 31112
+            item.GetSourceEndFrame.return_value = 31173
+            timeline = reopened.GetTimelineByIndex(1)
+            name = f"001 {segment['segment_id']}"
+            with patch("autoclipper.resolve_builder.reference_xml_matches", return_value=True) as xml:
+                read_export(timeline, [segment], [name])
+                xml.assert_called_once_with(timeline, ref, 216000, 60)
+            with patch("autoclipper.resolve_builder.reference_xml_matches", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "source_start.*31113.*31112"):
+                    read_export(timeline, [segment], [name])
+            for source_start, source_end, duration in ((31112, 31172, 60),
+                                                       (31111, 31173, 60),
+                                                       (31112, 31173, 59)):
+                with self.subTest(source_start=source_start, source_end=source_end,
+                                  duration=duration), patch(
+                        "autoclipper.resolve_builder.reference_xml_matches", return_value=True) as xml:
+                    item.GetSourceStartFrame.return_value = source_start
+                    item.GetSourceEndFrame.return_value = source_end
+                    item.GetDuration.return_value = duration
+                    with self.assertRaisesRegex(RuntimeError, "Reference audio source or placement differs"):
+                        read_export(timeline, [segment], [name])
+                    xml.assert_not_called()
+
+    def test_reference_xml_confirms_exact_source_and_record_range(self):
+        sdk = Mock()
+        resolve = sdk.scriptapp.return_value
+        resolve.EXPORT_FCP_7_XML = "fcp7"
+        resolve.EXPORT_NONE = "none"
+        timeline = Mock()
+        timeline.GetStartFrame.return_value = 216000
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "Andres P2.mp4"
+            ref = {"mp4_path": str(source), "source_in_frame": 31113,
+                   "source_out_frame": 33093}
+
+            xml_in = 31113
+            xml_out = 33093
+            xml_start = 50100
+            xml_end = 52080
+            xml_path = source
+            xml_track = 2
+            xml_copies = 1
+
+            def export(path, _type, _subtype):
+                clip = (f'<clipitem><start>{xml_start}</start><end>{xml_end}</end>'
+                        f'<in>{xml_in}</in><out>{xml_out}</out><file id="source"/>'
+                        '</clipitem>')
+                tracks = ['<track>' + (clip * xml_copies if index == xml_track else '')
+                          + '</track>' for index in (1, 2)]
+                Path(path).write_text(
+                    '<xmeml><sequence><media><audio>' + ''.join(tracks)
+                    + '</audio></media></sequence>'
+                    + f'<file id="source"><pathurl>{xml_path.as_uri()}</pathurl></file></xmeml>',
+                    encoding="utf-8")
+                return True
+
+            timeline.Export.side_effect = export
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}):
+                self.assertTrue(reference_xml_matches(timeline, ref, 266100, 1980))
+                for wrong in ("in_early", "in_late", "out_early", "out_late",
+                              "start", "end", "path", "track", "duplicate"):
+                    with self.subTest(wrong=wrong):
+                        xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                        xml_path, xml_track, xml_copies = source, 2, 1
+                        if wrong == "in_early":
+                            xml_in = 31112
+                        elif wrong == "in_late":
+                            xml_in = 31114
+                        elif wrong == "out_early":
+                            xml_out = 33092
+                        elif wrong == "out_late":
+                            xml_out = 33094
+                        elif wrong == "start":
+                            xml_start = 50101
+                        elif wrong == "end":
+                            xml_end = 52079
+                        elif wrong == "path":
+                            xml_path = Path(folder) / "other.mp4"
+                        elif wrong == "track":
+                            xml_track = 1
+                        else:
+                            xml_copies = 2
+                        self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+
+                xml_in, xml_out, xml_start, xml_end = 31113, 33093, 50100, 52080
+                xml_path, xml_track, xml_copies = source, 2, 1
+
+                def export_false(path, _type, _subtype):
+                    export(path, _type, _subtype)
+                    return False
+
+                timeline.Export.side_effect = export_false
+                self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+                timeline.Export.side_effect = RuntimeError("Resolve export failed")
+                self.assertFalse(reference_xml_matches(timeline, ref, 266100, 1980))
+
+    def test_reference_audio_uses_separate_item_and_track_after_reopen(self):
+        sdk, _, state, project, _ = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            manifest["segments"] = manifest["segments"][:1]
+            for angle in manifest["segments"][0]["angles"]:
+                (Path(angle["mp4_path"])).touch()
+            segment = manifest["segments"][0]
+            angle = segment["angles"][0]
+            track = {"status": "verified", "mp4_audio_stream_index": 1,
+                     "mp4_audio_ordinal": 1, "mp4_audio_title": "Track1",
+                     "resolve_channels": [1, 2], "resolve_channels_status": "expected"}
+            angle["reference_track"] = track
+            segment["reference_audio"] = {
+                "pov_id": angle["pov_id"], "pov_name": angle["pov_name"],
+                "part_id": angle["part_id"], "mp4_path": angle["mp4_path"],
+                "source_in_frame": angle["source_in_frame"],
+                "source_out_frame": angle["source_out_frame"],
+                "record_start_frame": 0, "duration_frames": 60, "track": track}
+            with patch.dict(sys.modules, {"DaVinciResolveScript": sdk}), patch(
+                    "autoclipper.resolve_builder.mkdtemp", return_value=folder):
+                result = build_export(manifest)
+            self.assertEqual(len(state["audio"]), 1)
+            self.assertEqual(len(state["audio2"]), 1)
+            self.assertEqual(state["track_name"], "GROUP REFERENCE AUDIO")
+            project.GetMediaPool.return_value.CreateEmptyTimeline.return_value.AddTrack.assert_called_once_with(
+                "audio", "stereo")
+            ref = result["segments"][0]["reference_audio"]
+            self.assertEqual((ref["path"], ref["source_start"], ref["record_start"], ref["channels"]),
+                             (angle["mp4_path"], angle["source_in_frame"], 216000, [1, 2]))
+            self.assertEqual(len(state["media"]), 2)
+            self.assertEqual(len(state["reference_media"]), 1)
+
+    def test_reference_import_rejects_reused_mic_item(self):
+        pool, clip = Mock(), Mock()
+        path = Path("source.mp4").resolve()
+        pool.ImportMedia.return_value = [clip]
+        angle = {"mp4_path": str(path), "reference_track": {"mp4_audio_ordinal": 1}}
+        segment = {"reference_audio": {"mp4_path": str(path), "track": angle["reference_track"]}}
+        with self.assertRaisesRegex(RuntimeError, "reused the mic-mapped item"):
+            import_reference_sources(pool, [segment], {path: clip}, 60)
+
     def test_session_to_manifest_to_builder_dry_run(self):
         sdk = Mock()
         with tempfile.TemporaryDirectory() as folder:
@@ -267,6 +474,151 @@ class ResolveBuilderTests(unittest.TestCase):
                 with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
                     main([str(path), "--dry-run", "--result-file", str(failed)])
                 self.assertFalse(failed.exists())
+
+    def test_director_edit_build_keeps_selected_mic_and_silent_slate_after_reopen(self):
+        sdk, _, state, project, _ = fake_resolve()
+        pool = project.GetMediaPool.return_value
+        import_media = pool.ImportMedia.side_effect
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1", "placeholder"):
+                (root / f"{name}.mp4").touch()
+            segments = manifest["segments"]
+            manifest.update(mode="director_edit_plan", edit_plan={"plan_id": "demo", "revision_id": "r1"})
+            for segment in segments:
+                start = segment["record_start_frame"]
+                segment.update(kind="media", session_start_frame=start, session_end_frame=start + 60)
+                for angle in segment["angles"]:
+                    angle["source_frame_count"] = 600
+            video, audio = segments[0]["angles"]
+            segments[0].update(angles=[video], audio_angle=audio, note_ids=["note-1"])
+            slate = segments[1]
+            for field in ("session_start", "session_end", "session_start_frame", "session_end_frame"):
+                del slate[field]
+            slate.update(kind="placeholder", angles=[], placeholder_reason="planned_missing_beat", candidate_ids=[])
+            add_fixture_media_mapping(manifest)
+
+            def import_with_slate(paths):
+                clips = import_media(paths)
+                if Path(paths[0]).name == "placeholder.mp4":
+                    clip, = clips
+                    properties = clip.GetClipProperty.side_effect
+                    clip.GetClipProperty.side_effect = lambda key: "60" if key == "Frames" else properties(key)
+                return clips
+
+            pool.ImportMedia.side_effect = import_with_slate
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder),
+                  patch("autoclipper.resolve_builder.render_placeholder", return_value=root / "placeholder.mp4")
+                  as render):
+                result = build_export(manifest)
+            self.assertEqual(result["edit_plan"]["revision_id"], "r1")
+            self.assertEqual(result["segments"][0]["audio"]["path"], str(root / "b1.mp4"))
+            self.assertEqual(result["segments"][0]["audio"]["source_start"], 120)
+            self.assertEqual(result["segments"][0]["note_ids"], ["note-1"])
+            self.assertEqual(result["segments"][1]["video"]["record_start"], 216060)
+            self.assertEqual(result["segments"][1]["video"]["name"], "MISSING FOOTAGE: Moment 1")
+            self.assertEqual(len(state["video"]), 4)
+            self.assertEqual(len(state["audio"]), 3)
+            render.assert_called_once_with(root, slate, 60)
+
+    def test_director_review_preserves_blank_interior_frames_after_reopen(self):
+        sdk, _, _, project, _ = fake_resolve()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            segments = manifest["segments"]
+            manifest.update(mode="director_review", review_session_frames=[120, 360], uncovered_edges=[])
+            for segment in segments:
+                start = 120 + segment["record_start_frame"]
+                segment.update(kind="media", session_start_frame=start,
+                               session_end_frame=start + segment["duration_frames"])
+                for angle in segment["angles"]:
+                    angle["source_frame_count"] = 600
+            segments[1].update(kind="coverage_gap", angles=[])
+            add_fixture_media_mapping(manifest)
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                result = build_export(manifest)
+            self.assertEqual(result["review_session_frames"], [120, 360])
+            self.assertEqual([r["record_start_frame"] for r in result["segments"]],
+                             [216000, 216060, 216120, 216180])
+            self.assertEqual(result["segments"][1]["kind"], "coverage_gap")
+            self.assertEqual(project.GetMediaPool.return_value.AppendToTimeline.call_count, 3)
+
+    def test_director_build_records_reopened_scratch_identity(self):
+        sdk, _, _, _, reopened = fake_resolve()
+        reopened.GetUniqueId.return_value = "scratch-project-id"
+        reopened.GetTimelineByIndex.return_value.GetUniqueId.return_value = "review-timeline-id"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                result = build_export(manifest, project_name="AutoClipper DirectorA Test 20261120-010203")
+        self.assertEqual(result["project_id"], "scratch-project-id")
+        self.assertEqual(result["timeline_id"], "review-timeline-id")
+
+    def test_director_media_size_or_mtime_change_stops_both_build_modes_before_sdk_import(self):
+        for mode in ("review", "edit"):
+            for change in ("size", "mtime"):
+                with self.subTest(mode=mode, change=change), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    mp4 = root / "a1.mp4"
+                    mp4.write_bytes(b"fixture")
+                    source = Session(session_id="synthetic-session", folder=folder, povs=[
+                        POV("alpha", "Alpha", [Part("a1", video_path=mp4.name, duration=2)])
+                    ])
+                    confirmations = confirmed_mics(source)
+                    with synthetic_probe(source, 60):
+                        if mode == "review":
+                            manifest = build_review_manifest(source, confirmations=confirmations)
+                        else:
+                            manifest = compile_edit_plan(source, {
+                                "plan_id": "draft", "session_id": source.session_id, "fps": 60,
+                                "revision_id": "r1", "revision_history": [],
+                                "entries": [{"entry_id": "cut", "kind": "source", "title": "Fixture",
+                                             "session_in": 12, "session_out_exclusive": 24}],
+                            }, confirmations=confirmations)
+                    previous = mp4.stat()
+                    if change == "size":
+                        mp4.write_bytes(b"different size")
+                        os.utime(mp4, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+                    else:
+                        os.utime(mp4, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+                    sdk = Mock()
+                    with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                          patch("builtins.__import__", wraps=__import__) as imports,
+                          self.assertRaisesRegex(ValueError, "source media changed.*Rebuild.*recompile")):
+                        build_export(manifest)
+                    self.assertNotIn("DaVinciResolveScript", [call.args[0] for call in imports.call_args_list])
+                    sdk.scriptapp.assert_not_called()
+
+    def test_director_refuses_same_name_reopened_project_with_another_id(self):
+        sdk, manager, _, project, reopened = fake_resolve()
+        reopened.GetUniqueId.return_value = "different-project-id"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for stem in ("a1", "a2", "b1"):
+                (root / f"{stem}.mp4").touch()
+            name = "AutoClipper DirectorA Test 20261120-010203"
+            with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                  patch("autoclipper.resolve_builder.mkdtemp", return_value=folder),
+                  patch("autoclipper.director_poc.receipt.record_review_receipt") as record_receipt,
+                  self.assertRaisesRegex(RuntimeError, "Reopened Director project ID differs")):
+                build_export(manifest, project_name=name)
+        self.assertEqual(reopened.GetName(), name)
+        self.assertNotEqual(reopened.GetUniqueId(), project.GetUniqueId())
+        manager.LoadProject.assert_called_once_with(name)
+        reopened.GetTimelineByIndex.assert_not_called()
+        reopened.SetCurrentTimeline.assert_not_called()
+        record_receipt.assert_not_called()
 
     def test_multicam_compilation_saves_and_verifies_after_reopen(self):
         sdk, manager, state, project, reopened = fake_resolve()
@@ -430,6 +782,43 @@ class ResolveBuilderTests(unittest.TestCase):
                          "Owner Edit"):
                 with self.subTest(name=name), self.assertRaisesRegex(ValueError, "Explicit project name"):
                     build_export(manifest, dry_run=True, project_name=name)
+
+    def test_director_requires_project_manager_or_verified_default(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = make_manifest(root)
+            for name in ("a1", "a2", "b1"):
+                (root / f"{name}.mp4").touch()
+            project_name = "AutoClipper DirectorA Test 20261120-010203"
+            for active_name in ("AutoClipper Export Owner", "AutoClipper Stage2 Test Owner",
+                                "AutoClipper Stage1 Owner", "Untitled Project", None):
+                with self.subTest(active_name=active_name):
+                    sdk, manager, state, _, _ = fake_resolve()
+                    if active_name is not None:
+                        owner = Mock()
+                        owner.GetName.return_value = active_name
+                        owner.GetUniqueId.return_value = "owner-project-id"
+                        owner.GetTimelineCount.return_value = 0
+                        pool_root = owner.GetMediaPool.return_value.GetRootFolder.return_value
+                        pool_root.GetClipList.return_value = []
+                        pool_root.GetSubFolderList.return_value = []
+                        state["current"] = owner
+                    with (patch.dict(sys.modules, {"DaVinciResolveScript": sdk}),
+                          patch("autoclipper.resolve_builder.mkdtemp", return_value=folder)):
+                        if active_name not in ("Untitled Project", None):
+                            with self.assertRaisesRegex(RuntimeError, "Director requires Project Manager"):
+                                build_export(manifest, project_name=project_name)
+                            manager.CreateProject.assert_not_called()
+                            manager.SaveProject.assert_not_called()
+                        else:
+                            if active_name == "Untitled Project":
+                                manager.GetProjectListInCurrentFolder.return_value = [active_name]
+                                with self.assertRaisesRegex(RuntimeError, "Director requires Project Manager"):
+                                    build_export(manifest, project_name=project_name)
+                                manager.CreateProject.assert_not_called()
+                                manager.GetProjectListInCurrentFolder.return_value = []
+                            self.assertTrue(build_export(manifest, project_name=project_name)["reopened"])
+                            manager.CreateProject.assert_called_once()
 
     def test_owner_checkout_and_failed_reopen(self):
         sdk, manager, state, _, _ = fake_resolve()
