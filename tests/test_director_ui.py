@@ -147,6 +147,21 @@ class BindingTests(DirectorUiCase):
         refuse(self.s.scratch)
         (self.s.scratch / "build.moved").rename(self.s.scratch / "build.json")
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows junction test")
+    def test_scratch_listing_skips_junctions(self):
+        junction = self.s.temp / "autoclipper-director-a-jct"
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(self.s.scratch)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot create junction")
+        try:
+            with patch("tempfile.gettempdir", return_value=str(self.s.temp)):
+                names = [row["name"] for row in self.call("/api/director/scratches")]
+        finally:
+            os.rmdir(junction)
+        self.assertIn(self.s.scratch.name, names)
+        self.assertNotIn("autoclipper-director-a-jct", names)
+
     def test_stale_catalog_is_refused(self):
         self.s.store.update(lambda data: setattr(data, "mapping_stale", True))
         body = self.call("/api/director/open", {"scratch": str(self.s.scratch), "session_root": str(self.s.recordings)},

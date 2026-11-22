@@ -204,6 +204,77 @@ class GateTests(ImportBase):
             rc.extract_json(self.answer(), key="suggestions")
 
 
+class RemediationTests(ImportBase):
+    def test_unsaved_response_copy_warning_reaches_the_result(self):
+        real = dx._write_new
+
+        def failing(binding, names, filename, text):
+            if names == ("responses",):
+                raise OSError("disk full")
+            return real(binding, names, filename, text)
+
+        with patch("autoclipper.director_ai._write_new", failing):
+            result = self.imp(self.answer())
+        self.assertTrue(result["ok"])
+        self.assertIn("W_RESPONSE_NOT_SAVED", [w.get("code") for w in result["warnings"]])
+        self.assertEqual(len(self.s.store.load().edit_plans), 1)
+
+    def test_full_transcript_prompt_states_the_real_anchoring_rule(self):
+        full = dx.export_packet(self.b, full_transcript=True)["prompt"]
+        windowed = dx.export_packet(self.b)["prompt"]
+        self.assertIn("must overlap the range of a note it cites", full)
+        self.assertNotIn("transcript context shown for a note", full.split("OUTPUT")[0])
+        self.assertIn("transcript context shown for a note", windowed)
+        # The validator stays strict: a full-transcript export still rejects a clip far from its cited note.
+        full_id = dx.export_packet(self.b, full_transcript=True)["export_id"]
+
+        def mutate(data):
+            clip = data["clips"][1]
+            clip.update(note_ids=["N03"], start_line="S0001", end_line="S0001",
+                        quotes=[{"line": "S0001", "text": "Truck staging near the bridge"}], pov=None, audio_pov=None)
+        self.rejected(self.answer(mutate, export_id=full_id), "E_UNANCHORED")
+
+    def test_clip_on_a_part_the_compile_excluded_is_rejected(self):
+        from autoclipper import resolve_manifest as rm
+        real = rm.compile_fkb_edit_plan
+
+        def excluding(*args, **kwargs):
+            manifest = real(*args, **kwargs)
+            manifest["blockers"].append({"code": "mic_unverified", "part_id": "b1", "pov_name": "Bob",
+                                         "message": "synthetic exclusion"})
+            return manifest
+
+        before = self.catalog_bytes()
+        with patch("autoclipper.resolve_manifest.compile_fkb_edit_plan", excluding):
+            result = self.imp(self.answer())
+        self.assertFalse(result["ok"])
+        self.assertIn("excluded recording part", "\n".join(result["errors"]))
+        self.assertEqual(self.catalog_bytes(), before)
+
+    def test_changed_note_frames_with_same_revision_are_stale(self):
+        def move(data):
+            note = next(n for n in data.director_notes if n.note_id == self.s.notes[0].note_id)
+            note.frames = {"start": note.frames["start"] + 10, "end": note.frames["end"]}
+        self.s.store.update(move)
+        self.assertEqual(self.s.store.load().director_notes[0].revision, 0)
+        self.rejected(self.answer(), "E_NOTE_STALE")
+
+    def test_plan_ids_are_validated_before_use_in_folder_names(self):
+        binding = self.open()
+        for bad in ("../evil", "a/b", "a\\b", "x\n", "", ".hidden", "a" * 101, 5, None):
+            with self.subTest(plan=bad):
+                with self.assertRaises(dx.DirectorError):
+                    dx.write_edit_files(binding, bad, {})
+                with self.assertRaises(dx.DirectorError):
+                    dx.compile_plan(binding, bad)
+        self.assertEqual([p.name for p in self.s.scratch.iterdir() if p.name.startswith("edit-")], [])
+
+    def test_export_id_with_trailing_newline_is_refused(self):
+        with self.assertRaises(dx.DirectorError) as caught:
+            dx.load_export_record(self.b, self.export_id + "\n")
+        self.assertEqual(caught.exception.code, "E_EXPORT_UNKNOWN")
+
+
 class FilesTests(ImportBase):
     def test_edit_files_are_written_into_a_new_folder(self):
         plan_id = self.imp(self.answer())["plan_id"]

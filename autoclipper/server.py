@@ -991,7 +991,7 @@ class App:
             candidates = []
         for path in candidates:
             try:
-                if not path.is_dir() or path.is_symlink():
+                if not path.is_dir() or _mod("rough_cut")._is_link(path):
                     continue
                 notes = None
                 fkb = path / ".autoclipper" / "director-fkb.json"

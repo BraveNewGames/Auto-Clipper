@@ -25,7 +25,8 @@ DEFAULT_BUDGET_CHARS = 120_000
 HARD_CAP_CHARS = 400_000
 WINDOW_STEPS = (20, 15, 10, 5)
 MAX_NOTES = 200
-EXPORT_ID = re.compile(r"^dx-[0-9a-f]{12}$")
+EXPORT_ID = re.compile(r"dx-[0-9a-f]{12}")
+_PLAN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 _NOTE_ALIAS = re.compile(r"^N\d{2,4}$")
 _SPAN_ALIAS = re.compile(r"^S\d{4,6}$")
 _ID_LINE = "\x00EXPORT-ID-LINE"
@@ -354,7 +355,9 @@ def _render(binding, notes, aliases, spans, window_s, full):
         "      start_line to the end of end_line, widened by the pads;",
         "  (c) session_in_frame + session_out_frame (exclusive) plus in_tc + out_tc (the timecodes below);",
         "      no pads. Use only when you need exact frames.",
-        "  The clip must overlap the transcript context shown for a note it cites.",
+        ("  The clip must overlap the range of a note it cites (the transcript is complete, but a clip "
+         "must still touch a cited note)." if full else
+         "  The clip must overlap the transcript context shown for a note it cites."),
         "- quotes: for (b) and (c) give at least one verbatim quote {\"line\", \"text\"} from inside the clip.",
         "  Copy the text exactly. Never invent note aliases, line aliases, quotes or pov ids.",
         "- pov: null (recommended) = multicam of every camera covering the clip; or one pov id with verified",
@@ -468,7 +471,7 @@ def export_packet(binding, *, note_ids=None, tag=None, query=None, full_transcri
 
 
 def load_export_record(binding, export_id):
-    if not isinstance(export_id, str) or not EXPORT_ID.match(export_id):
+    if not isinstance(export_id, str) or not EXPORT_ID.fullmatch(export_id):
         raise DirectorError("E_EXPORT_UNKNOWN", f'"export_id" must be copied exactly from the prompt (dx-...).')
     folder = binding.scratch / ".autoclipper" / AI_FOLDER[0] / "exports"
     path = folder / f"{export_id}.json"
@@ -490,13 +493,15 @@ REMINDERS = """- Valid pov ids: {povs}. pov and audio_pov may be null (recommend
 - Every source clip needs note_ids (aliases from NOTES) and exactly one anchor: note, OR start_line +
   end_line, OR session_in_frame + session_out_frame with in_tc + out_tc. Pads are 0-10 s.
 - Quotes must be copied verbatim with the line alias of a line inside the clip.
-- The clip must overlap the transcript context shown for a note it cites.
+- The clip must overlap the transcript context shown for a note it cites (that note's own range when
+  the full transcript was exported).
 - Only use ranges inside COVERAGE from the original prompt; never invent aliases or ids."""
 
 _SOURCE_KEYS = {"id", "kind", "title", "note", "note_ids", "start_line", "end_line", "session_in_frame",
                 "session_out_frame", "in_tc", "out_tc", "pad_before", "pad_after", "pov", "audio_pov",
                 "quotes", "why", "uncertainty"}
 _TOP_KEYS = {"schema", "export_id", "title", "summary", "clips"}
+# Convention, not a security boundary: only import_response is meant to hold this token.
 _TOKEN = object()
 
 
@@ -744,7 +749,7 @@ def import_response(binding, text, *, provider, save_response=True, companion_cl
                     errors.append(f"{where}: E_NOTE_UNKNOWN: {alias} no longer exists in the catalog.")
                 elif current.deleted:
                     errors.append(f"{where}: E_NOTE_DELETED: {alias} was deleted after the prompt was copied.")
-                elif current.revision != row["revision"]:
+                elif current.revision != row["revision"] or current.frames != row["frames"]:
                     errors.append(f"{where}: E_NOTE_STALE: {alias} was exported at revision {row['revision']} "
                                   f"but is now revision {current.revision}. Copy a new prompt.")
                 elif current.source_mapping_digest != kb.source_mapping_digest:
@@ -807,7 +812,10 @@ def import_response(binding, text, *, provider, save_response=True, companion_cl
         candidate = copy.deepcopy(kb)
         candidate.edit_plans.append(copy.deepcopy(proposed))
         candidate.bind_edit_plan(candidate.edit_plans[-1])
-        return rm.compile_fkb_edit_plan(binding.source, candidate, plan_id, revision_id=revision["revision_id"])
+        compiled = rm.compile_fkb_edit_plan(binding.source, candidate, plan_id, revision_id=revision["revision_id"])
+        # gate_plan refuses a clip that still uses a part the compile itself excluded as unverified.
+        context["mapping"]["blockers"] = [dict(b) for b in compiled["blockers"] if b.get("part_id")]
+        return compiled
 
     manifest = rc.gate_plan(context, plan, result, compile_fn=compile_fn, repair=repair)
     if manifest is None:
@@ -823,7 +831,7 @@ def import_response(binding, text, *, provider, save_response=True, companion_cl
                       title=title)
     save_warning = _save_validated(binding, gated, text, bool(save_response))
     if save_warning:
-        warnings.append({"code": "W_RESPONSE_NOT_SAVED", "message": save_warning})
+        manifest["warnings"].append({"code": "W_RESPONSE_NOT_SAVED", "message": save_warning})
     all_warnings = [*manifest["warnings"]]
     result.update(ok=True, plan_id=plan_id, title=title, provider=provider, warnings=all_warnings,
                   segments=len(manifest["segments"]),
@@ -889,6 +897,8 @@ def compile_plan(binding, plan_id):
     import copy
     from . import resolve_manifest as rm
     from .resolve_builder import validate_manifest
+    if not isinstance(plan_id, str) or not _PLAN_ID.fullmatch(plan_id):
+        raise DirectorError("E_PLAN_UNKNOWN", "Unknown plan.")
     plans = [p for p in binding.kb.edit_plans if p.plan_id == plan_id]
     if len(plans) != 1:
         raise DirectorError("E_PLAN_UNKNOWN", "Unknown plan.")
@@ -916,7 +926,11 @@ def new_project_name(now=None):
 def write_edit_files(binding, plan_id, manifest, stamp=None):
     """Write edit-<plan>-<stamp>/{manifest.json,report.md} in a NEW folder inside scratch; never reused."""
     from . import resolve_manifest as rm
+    if not isinstance(plan_id, str) or not _PLAN_ID.fullmatch(plan_id):
+        raise DirectorError("E_PLAN_UNKNOWN", "Unknown plan.")
     stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not re.fullmatch(r"\d{8}-\d{6}", stamp):
+        raise DirectorError("E_WRITE", "Invalid edit folder stamp.")
     for suffix in ["", *(f"-{n}" for n in range(2, 100))]:
         name = f"edit-{plan_id}-{stamp}{suffix}"
         if not (binding.scratch / name).exists() and not _is_link(binding.scratch / name):
