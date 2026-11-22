@@ -157,6 +157,17 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
    it had already created stay in the project; and a failure after the project was saved is not rolled
    back on disk, so check Resolve and delete any leftover timeline by hand. Regular **Export to Resolve** and
    Director builds are unchanged.
+5. **Several cuts at once.** If you ask the AI for several cuts in one chat, paste them all in the same
+   answer box: either several answer objects, or one wrapper `{"cuts": [answer, answer, ...]}`
+   (each answer keeps the normal schema and the same export ID; the prompt tells the AI it may do
+   this). Every cut is validated independently and each valid one is saved with its own cut ID, as
+   for a single answer. Invalid cuts are listed with their problems and one combined repair prompt;
+   they never block the valid ones. A single answer works exactly as before. Tick the saved cuts and
+   click **Build selected into open Auto-Clipper project**: the cuts are built one at a time through
+   the same single export job, each as its own new timeline in the open project (add-timeline mode
+   above; there is no bulk new-project mode). **If a cut fails, the batch continues with the next
+   cut** and the failure is listed; cuts that were already added are kept. The batch runs in the
+   Auto-Clipper server, so closing the browser tab does not stop it.
 
 Rough cuts never change `session.json`.
 

@@ -121,7 +121,7 @@ class Scene:
         self.pool.ImportMedia.reset_mock()
         return clip
 
-    def build(self, manifest, **kwargs):
+    def build(self, manifest, timeline_name="Best of cut-1", **kwargs):
         # The shared fake keeps one global item list; give each build its own timeline contents.
         for index, old in enumerate(self.timelines):  # freeze a finished timeline; the fake reuses one mock
             if old is self.new_timeline:
@@ -132,7 +132,7 @@ class Scene:
             self.state[key].clear()
         self.state["markers"].clear()
         with patch.dict(sys.modules, {"DaVinciResolveScript": self.sdk}):
-            return build_export(manifest, add_to_open=True, timeline_name="Best of cut-1", **kwargs)
+            return build_export(manifest, add_to_open=True, timeline_name=timeline_name, **kwargs)
 
 
 class AddTimelineTests(unittest.TestCase):
@@ -360,6 +360,22 @@ class AddTimelineTests(unittest.TestCase):
             scene.build(rough_manifest(self.root, reference=True))
         scene.pool.DeleteFolders.assert_not_called()
         self.assertTrue(any("did not create" in text for text in caught.exception.cleanup_failures))
+
+    def test_sequential_cuts_make_one_timeline_each_and_a_failed_one_does_not_stop_the_rest(self):
+        scene = Scene(existing=("Old cut",), preload=[(self.root / "a1.mp4", "A", [3, 4])])
+        results = []
+        real = scene.pool.CreateMulticamClip.side_effect
+        for number in (1, 2, 3):
+            scene.pool.CreateMulticamClip.side_effect = (
+                RuntimeError("Resolve refused") if number == 2 else real)
+            try:
+                results.append(scene.build(rough_manifest(self.root), timeline_name=f"Same title cut-{number}"))
+            except RuntimeError as exc:
+                results.append(exc)
+        self.assertEqual([isinstance(r, RuntimeError) for r in results], [False, True, False])
+        self.assertEqual([t.GetName() for t in scene.timelines],
+                         ["Old cut", "Same title cut-1", "Same title cut-3"])
+        self.assertEqual(scene.timelines[0], scene.old_timelines[0])
 
     def test_rollback_failure_is_reported_not_hidden(self):
         scene = Scene()

@@ -259,6 +259,7 @@ RULES
 OUTPUT
 Return ONLY one JSON object (no prose before or after) shaped like this (<...> are placeholders):
 {example}
+If asked for several cuts, you may instead return {{"cuts": [<cut>, <cut>, ...]}}, each cut shaped as above with the same export_id.
 
 JSON schema: {json.dumps(RESPONSE_JSON_SCHEMA, separators=(",", ":"))}
 
@@ -331,6 +332,66 @@ def extract_json(text, *, key="clips"):
     if not candidates:
         raise ValueError(f'Could not find a JSON object with a "{key}" list in the pasted answer.')
     return max(candidates, key=lambda item: item[0])[1]
+
+
+MAX_CUTS = 12
+
+
+def _top_level_objects(text):
+    decoder = json.JSONDecoder()
+    found, position = [], 0
+    while True:
+        start = text.find("{", position)
+        if start < 0:
+            return found
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except ValueError:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        position = end
+
+
+def split_answers(text):
+    """Several pasted answers, or a {"cuts": [...]} wrapper, as (answers, unparsed_count).
+
+    Returns None when the paste holds at most one plain answer; callers then use the single-answer
+    path unchanged. Elements of "cuts" are returned as-is (they may be malformed; validation reports that).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if len(text) > MAX_RESPONSE_CHARS * MAX_CUTS:
+        raise ValueError(f"The pasted answers are longer than {MAX_RESPONSE_CHARS * MAX_CUTS} characters.")
+    text = text.strip().lstrip("﻿")
+    answers, wrapped = [], False
+    for variant in (text, _fixups(text)):
+        answers, wrapped = [], False
+        for obj in _top_level_objects(variant):
+            if isinstance(obj.get("cuts"), list) and "clips" not in obj:
+                wrapped = True
+                answers.extend(obj["cuts"])
+            elif "clips" in obj:
+                answers.append(obj)
+        if answers:
+            break
+    if not answers or (len(answers) == 1 and not wrapped):
+        return None
+    # An answer that is not valid JSON cannot be seen above; count the export_id fields to notice.
+    claimed = len(re.findall(r'"export_id"', text))
+    unparsed = 0 if wrapped else max(0, claimed - len(answers))
+    return answers, unparsed
+
+
+def combined_repair_prompt(context, problems, export_id):
+    """One repair prompt for every rejected cut. ``problems`` is [(label, [error, ...])]."""
+    errors = [f"{label}: {error}" for label, items in problems for error in items]
+    text = _repair_prompt(context, errors, export_id=export_id)
+    return (text.replace("Nothing was saved.", "Nothing was saved for the rejected cuts; the other cuts were saved.", 1)
+            .replace("return the COMPLETE corrected JSON object only,",
+                     'return ONLY {"cuts": [...]} holding the COMPLETE corrected version of each rejected cut '
+                     "(not the accepted ones),", 1))
 
 
 # --------------------------------------------------------------------------- validation

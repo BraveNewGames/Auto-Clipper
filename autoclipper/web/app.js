@@ -1071,8 +1071,65 @@ function roughClipRow(c, i) {
   return h("tr", null, h("td", { class: "muted" }, i + 1), h("td", { class: "mono" }, c.id), h("td", null, c.title), cells);
 }
 
+function batchJobBox(job) {
+  const labels = { queued: "waiting", running: "building…", done: "added", failed: "failed" };
+  const rows = (job.cuts || []).map((c) => h("tr", null,
+    h("td", null, c.title || c.cut_id), h("td", { class: "mono small" }, c.cut_id),
+    h("td", { class: c.state === "failed" ? "bad-text" : c.state === "done" ? "good-text" : "muted" }, labels[c.state] || c.state),
+    h("td", { class: "small" }, c.state === "done" ? `timeline “${c.timeline}”` : (c.error || "")),
+    h("td", null, c.readback_path ? openBtn("readback.json", c.readback_path) : null)));
+  const head = job.state === "running" || job.state === "preparing"
+    ? h("b", null, "Adding cuts to the open Resolve project, one at a time… Do not touch Resolve until this finishes.")
+    : job.state === "done" ? h("b", { class: "good-text" }, `All ${job.cuts.length} cut(s) added as timelines.`)
+      : h("b", { class: "bad-text" }, job.error || "Some cuts failed.");
+  return h("div", { class: "resolve-job " + (job.state === "done" ? "ok" : job.state === "failed" ? "bad" : "") },
+    head, h("table", { class: "t" }, h("thead", null, h("tr", null, ["Cut", "Cut ID", "Result", "Detail", ""].map((x) => h("th", null, x)))),
+      h("tbody", null, rows)));
+}
+
+function roughBulkResult(r, box) {
+  const job = r.job && r.job.kind === "rough_cut_batch" ? r.job : null;
+  const running = job && (job.state === "running" || job.state === "preparing");
+  if (running) pollRough(box);
+  r.selected = r.selected || new Set(r.saved.map((c) => c.cut_id));
+  return h("div", null,
+    h("div", { class: r.saved.length ? "good-text" : "bad-text" },
+      h("b", null, `${r.saved.length} cut(s) saved, ${r.rejected.length} rejected.`),
+      r.rejected.length ? " The rejected ones were not saved; the good ones were not affected." : ""),
+    (r.notices || []).map((n) => h("div", { class: "warn-text small" }, n)),
+    r.saved.length ? h("table", { class: "t" },
+      h("thead", null, h("tr", null, ["Build", "#", "Title", "Entries", "Segments", ""].map((x) => h("th", null, x)))),
+      h("tbody", null, r.saved.map((c) => h("tr", null,
+        h("td", null, h("input", { type: "checkbox", checked: r.selected.has(c.cut_id) ? true : null, disabled: running ? true : null,
+          onchange: (ev) => { if (ev.target.checked) r.selected.add(c.cut_id); else r.selected.delete(c.cut_id); } })),
+        h("td", { class: "muted" }, c.number), h("td", null, c.title), h("td", null, c.clips.length), h("td", null, c.segments),
+        h("td", null, openBtn("Open report.md", c.report_path)))))) : null,
+    r.saved.length ? h("div", { class: "row resolve-go" },
+      h("button", { class: "btn primary", disabled: running ? true : null, onclick: action(async () => {
+        const ids = r.saved.map((c) => c.cut_id).filter((id) => r.selected.has(id));
+        if (!ids.length) throw new Error("Tick at least one cut to build");
+        r.job = await api("/api/rough-cut/build-batch", { cut_ids: ids });
+        fillRough(box);
+      }) }, "Build selected into open Auto-Clipper project"),
+      h("span", { class: "muted small" }, "Keep the Auto-Clipper project you created earlier open. Cuts are built one at a time, one new timeline each. ",
+        "If a cut fails, the next one still builds and the failure is listed.")) : null,
+    job ? batchJobBox(job) : null,
+    r.rejected.length ? h("div", { class: "resolve-blockers" },
+      h("b", { class: "bad-text" }, "Rejected cuts"),
+      h("ul", { class: "issues bad-text" }, r.rejected.map((x) => h("li", null, h("b", null, x.label + ": "),
+        x.stale ? "belongs to an older prompt. Copy a new prompt." : h("ul", null, x.errors.map((e) => h("li", null, e)))))),
+      r.repair_prompt ? h("div", null,
+        h("div", { class: "row" }, h("button", { class: "btn", onclick: action(async () => {
+          await navigator.clipboard.writeText(r.repair_prompt);
+          toast("Repair prompt copied — paste it into the same chat", "ok");
+        }) }, "Copy repair prompt for all rejected cuts"),
+        h("span", { class: "muted small" }, "Paste the corrected cuts above to import them; saved cuts are kept.")),
+        h("pre", { class: "setup small" }, r.repair_prompt)) : null) : null);
+}
+
 function roughResult(r, box) {
   if (!r) return null;
+  if (r.bulk) return roughBulkResult(r, box);
   if (!r.ok) return roughRejected(r);
   const job = r.job;
   const running = job && (job.state === "running" || job.state === "preparing");
@@ -1108,7 +1165,7 @@ function fillRough(box) {
   while (box.childNodes.length > 3) box.lastChild.remove();
   const rc = state.roughCut;
   const info = rc.info;
-  const answer = h("textarea", { rows: 8, class: "mono", placeholder: "Paste the AI's JSON answer here (code fences are fine)…" });
+  const answer = h("textarea", { rows: 8, class: "mono", placeholder: "Paste the AI's JSON answer here (code fences are fine). Several answers, or {\"cuts\": [...]}, are imported together…" });
   answer.value = rc.answer;
   answer.addEventListener("input", () => { rc.answer = answer.value; });
   appendAll(box,
@@ -1124,7 +1181,8 @@ function fillRough(box) {
     h("div", { class: "row" },
       h("button", { class: "btn primary", onclick: action(async () => {
         rc.result = await api("/api/rough-cut/import", { ...roughBody(), text: answer.value });
-        toast(rc.result.ok ? "Rough cut validated and saved" : "Rough cut rejected — see the problems below", rc.result.ok ? "ok" : "warn");
+        toast(rc.result.bulk ? `${rc.result.saved.length} cut(s) saved, ${rc.result.rejected.length} rejected`
+          : rc.result.ok ? "Rough cut validated and saved" : "Rough cut rejected — see the problems below", rc.result.ok ? "ok" : "warn");
         fillRough(box);
       }) }, "Validate answer"),
       h("span", { class: "muted small" }, "Every clip is checked against the transcript and verified footage. Any problem saves nothing.")),
