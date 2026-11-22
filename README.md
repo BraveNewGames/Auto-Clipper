@@ -166,8 +166,13 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
    click **Build selected into open Auto-Clipper project**: the cuts are built one at a time through
    the same single export job, each as its own new timeline in the open project (add-timeline mode
    above; there is no bulk new-project mode). **If a cut fails, the batch continues with the next
-   cut** and the failure is listed; cuts that were already added are kept. The batch runs in the
-   Auto-Clipper server, so closing the browser tab does not stop it.
+   cut** and the failure is listed; cuts that were already added are kept. **If a build is stopped
+   after a timeout, the batch stops there**: the remaining cuts are marked "not started" with the
+   reason, because Resolve may be hung or hold a partial timeline. A pasted answer that cannot be
+   parsed as JSON is never dropped silently: the answers found and parsed are counted and the
+   unparsed one is listed as rejected. The batch runs in the Auto-Clipper server, so closing the
+   browser tab does not stop it. **Known limit: a running batch cannot be cancelled** (deferred);
+   it stops only when it finishes, hits a timeout, or the Auto-Clipper server exits.
 
 Rough cuts never change `session.json`.
 

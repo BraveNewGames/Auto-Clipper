@@ -933,6 +933,7 @@ function resolveSegmentsTable(man) {
 
 function resolveJobBox(job, box) {
   if (!job || job.state === "idle") return null;
+  if (job.kind === "rough_cut_batch") return batchJobBox(job);
   const links = h("div", { class: "row" }, openBtn("Open report.md", job.report_path), openBtn("Open export folder", job.out_dir),
     job.readback_path ? openBtn("Open readback.json", job.readback_path) : null);
   // The Director tab shows its own job box (plain paths): open-path only serves the open session folder.
@@ -1071,17 +1072,28 @@ function roughClipRow(c, i) {
   return h("tr", null, h("td", { class: "muted" }, i + 1), h("td", { class: "mono" }, c.id), h("td", null, c.title), cells);
 }
 
+// "Batch: 3 added, 0 failed" for a finished batch; progress text while it runs.
+function batchSummary(job) {
+  const rows = job.cuts || [];
+  const count = (state) => rows.filter((c) => c.state === state).length;
+  if (job.state === "running" || job.state === "preparing") {
+    return `Batch: ${count("done") + count("failed")} of ${rows.length} cut(s) finished`;
+  }
+  const skipped = count("not_started");
+  return `Batch: ${count("done")} added, ${count("failed")} failed` + (skipped ? `, ${skipped} not started` : "");
+}
+
 function batchJobBox(job) {
-  const labels = { queued: "waiting", running: "building…", done: "added", failed: "failed" };
+  const labels = { queued: "waiting", running: "building…", done: "added", failed: "failed", not_started: "not started" };
   const rows = (job.cuts || []).map((c) => h("tr", null,
     h("td", null, c.title || c.cut_id), h("td", { class: "mono small" }, c.cut_id),
     h("td", { class: c.state === "failed" ? "bad-text" : c.state === "done" ? "good-text" : "muted" }, labels[c.state] || c.state),
     h("td", { class: "small" }, c.state === "done" ? `timeline “${c.timeline}”` : (c.error || "")),
     h("td", null, c.readback_path ? openBtn("readback.json", c.readback_path) : null)));
-  const head = job.state === "running" || job.state === "preparing"
-    ? h("b", null, "Adding cuts to the open Resolve project, one at a time… Do not touch Resolve until this finishes.")
-    : job.state === "done" ? h("b", { class: "good-text" }, `All ${job.cuts.length} cut(s) added as timelines.`)
-      : h("b", { class: "bad-text" }, job.error || "Some cuts failed.");
+  const running = job.state === "running" || job.state === "preparing";
+  const head = running
+    ? h("b", null, batchSummary(job) + ". Adding cuts to the open Resolve project one at a time; do not touch Resolve until this finishes.")
+    : h("b", { class: job.state === "done" ? "good-text" : "bad-text" }, (job.summary || batchSummary(job)));
   return h("div", { class: "resolve-job " + (job.state === "done" ? "ok" : job.state === "failed" ? "bad" : "") },
     head, h("table", { class: "t" }, h("thead", null, h("tr", null, ["Cut", "Cut ID", "Result", "Detail", ""].map((x) => h("th", null, x)))),
       h("tbody", null, rows)));

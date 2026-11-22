@@ -901,12 +901,15 @@ class App:
             saved.append({"number": number, "cut_id": folder.name, "cut_dir": str(folder),
                           "report_path": str(folder / "report.md"), "title": row["title"], "clips": row["clips"],
                           "segments": len(row["manifest"]["segments"]), "warnings": row["warnings"]})
-        extra = []
-        if unparsed:
-            extra.append(f"{unparsed} pasted answer(s) were not valid JSON and were skipped. "
-                         "Paste them again (or use the {\"cuts\": [...]} form).")
+        for offset in range(1, unparsed + 1):
+            label = f"Unparsed answer {offset} of {unparsed}"
+            message = (f"The paste seems to hold {len(answers) + unparsed} answers but only {len(answers)} could be "
+                       "parsed as JSON. This one is not valid JSON (check for a missing brace or bracket, or "
+                       "text cut off); send it again complete.")
+            rejected.append({"number": None, "label": label, "errors": [message], "stale": False})
+            problems.append((label, [message]))
         return {"bulk": True, "ok": bool(saved), "export_id": export_id, "saved": saved, "rejected": rejected,
-                "notices": extra,
+                "found": len(answers) + unparsed, "parsed": len(answers), "notices": [],
                 "repair_prompt": rc.combined_repair_prompt(context, problems, export_id) if problems else ""}
 
     def rough_cut_build(self, body):
@@ -1009,7 +1012,11 @@ class App:
             with self._resolve_lock:
                 self._resolve_job = {**job, "cuts": [dict(r) for r in rows], **extra}
 
+        stop_reason = None
         for row in rows:
+            if stop_reason:
+                row.update(state="not_started", error=stop_reason)
+                continue
             row["state"] = "running"
             publish(current=row["cut_id"])
             try:
@@ -1021,14 +1028,22 @@ class App:
                     row["readback_path"] = outcome["readback_path"]
                 else:
                     row["error"] = outcome.get("error", "Unknown error")
+                if outcome.get("killed"):
+                    stop_reason = (f"Not started: the build of “{row.get('title') or row['cut_id']}” was stopped after a "
+                                   "timeout, so Resolve may be hung or hold a partial timeline. Check Resolve, "
+                                   "then build the remaining cuts again.")
             except ApiError as exc:
                 row.update(state="failed", error=str(exc))
             except Exception as exc:
                 row.update(state="failed", error=f"{type(exc).__name__}: {exc}")
-        failed = [r for r in rows if r["state"] != "done"]
-        publish(state="failed" if failed else "done", current=None,
+        failed = [r for r in rows if r["state"] == "failed"]
+        skipped = [r for r in rows if r["state"] == "not_started"]
+        added = len(rows) - len(failed) - len(skipped)
+        summary = (f"Batch: {added} added, {len(failed)} failed" + (f", {len(skipped)} not started" if skipped else "")
+                   + (". " + stop_reason if stop_reason else "."))
+        publish(state="failed" if failed or skipped else "done", current=None, summary=summary,
                 finished_at=datetime.now(timezone.utc).isoformat(),
-                **({"error": f"{len(failed)} of {len(rows)} cut(s) failed; the others were added."} if failed else {}))
+                **({"error": summary} if failed or skipped else {}))
 
     def _run_resolve_job(self, job):
         result = self._execute_builder(job)
@@ -1053,6 +1068,7 @@ class App:
         except subprocess.TimeoutExpired:
             result["error"] = (f"Resolve export timed out after {self.builder_timeout} s and was stopped. "
                                "Check Resolve before trying again.")
+            result["killed"] = True
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
         return result

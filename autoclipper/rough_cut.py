@@ -335,18 +335,33 @@ def extract_json(text, *, key="clips"):
 
 
 MAX_CUTS = 12
+MAX_FIXUP_ATTEMPTS = 60
+_EXPORT_ID_FIELD = re.compile(r'["“”]export_id["“”]')
 
 
 def _top_level_objects(text):
+    """Every top-level JSON object in a paste. Each object is decoded as written, and only if that fails
+    with the shared smart-quote and trailing-comma fixups, so one sloppy answer never hides another."""
     decoder = json.JSONDecoder()
-    found, position = [], 0
+    found, position, fixups_left = [], 0, MAX_FIXUP_ATTEMPTS
     while True:
         start = text.find("{", position)
         if start < 0:
             return found
+        value, end = None, None
         try:
             value, end = decoder.raw_decode(text, start)
         except ValueError:
+            if fixups_left > 0:
+                fixups_left -= 1
+                tail = _fixups(text[start:])
+                try:
+                    value, consumed = decoder.raw_decode(tail, 0)
+                    # Skip the same stretch of the original text: the fixups only shorten it.
+                    end = _skip_original(text, start, tail, consumed)
+                except ValueError:
+                    value = None
+        if end is None:
             position = start + 1
             continue
         if isinstance(value, dict):
@@ -354,11 +369,24 @@ def _top_level_objects(text):
         position = end
 
 
+def _skip_original(text, start, fixed_tail, consumed):
+    """Index in ``text`` just past the object that ended at ``consumed`` in the fixed-up tail."""
+    # Fixups only drop commas before a closer, so the tail is a subsequence of the original; walk both.
+    i, j = start, 0
+    while j < consumed and i < len(text):
+        if text[i] == fixed_tail[j] or text[i] in "“”‘’":
+            j += 1
+        i += 1
+    return i
+
+
 def split_answers(text):
     """Several pasted answers, or a {"cuts": [...]} wrapper, as (answers, unparsed_count).
 
     Returns None when the paste holds at most one plain answer; callers then use the single-answer
-    path unchanged. Elements of "cuts" are returned as-is (they may be malformed; validation reports that).
+    path unchanged. Elements of "cuts" are returned as-is (they may be malformed; validation reports
+    that). ``unparsed_count`` is how many more answers (by "export_id" fields) the paste seems to hold
+    than could be parsed as JSON; they are never dropped silently.
     """
     if not isinstance(text, str) or not text.strip():
         return None
@@ -366,21 +394,16 @@ def split_answers(text):
         raise ValueError(f"The pasted answers are longer than {MAX_RESPONSE_CHARS * MAX_CUTS} characters.")
     text = text.strip().lstrip("﻿")
     answers, wrapped = [], False
-    for variant in (text, _fixups(text)):
-        answers, wrapped = [], False
-        for obj in _top_level_objects(variant):
-            if isinstance(obj.get("cuts"), list) and "clips" not in obj:
-                wrapped = True
-                answers.extend(obj["cuts"])
-            elif "clips" in obj:
-                answers.append(obj)
-        if answers:
-            break
-    if not answers or (len(answers) == 1 and not wrapped):
+    for obj in _top_level_objects(text):
+        if isinstance(obj.get("cuts"), list) and "clips" not in obj:
+            wrapped = True
+            answers.extend(obj["cuts"])
+        elif "clips" in obj:
+            answers.append(obj)
+    claimed = len(_EXPORT_ID_FIELD.findall(text))
+    unparsed = max(0, claimed - len(answers))
+    if len(answers) <= 1 and not wrapped and not (unparsed and claimed >= 2):
         return None
-    # An answer that is not valid JSON cannot be seen above; count the export_id fields to notice.
-    claimed = len(re.findall(r'"export_id"', text))
-    unparsed = 0 if wrapped else max(0, claimed - len(answers))
     return answers, unparsed
 
 
