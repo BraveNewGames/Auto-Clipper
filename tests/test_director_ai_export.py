@@ -95,7 +95,7 @@ class ExportTests(unittest.TestCase):
         self.assertRegex(out["export_id"], r"^dx-[0-9a-f]{12}$")
         self.assertEqual(out["counts"]["notes"], 3)
         # No file paths, part ids or source resolution leak into the prompt.
-        for forbidden in (str(self.s.temp), "a1.mp4", "a1.srt", "b1", "recordings", "source_path", "mp4"):
+        for forbidden in (str(self.s.temp), "a1.mp4", "a1.srt", "b1.srt", "b1.mp4", "recordings", "source_path", "mp4"):
             self.assertNotIn(forbidden, prompt)
         self.assertIn("Team?", prompt)
         self.assertIn("N01 rev 0 | 01:00:20:00-01:00:23:00 | frames [1200, 1380)", prompt)
