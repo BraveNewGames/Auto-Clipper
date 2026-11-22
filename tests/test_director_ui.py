@@ -108,6 +108,17 @@ class BindingTests(DirectorUiCase):
         self.assertEqual(state["plans"], [])
         self.assertEqual({row["pov_id"] for row in state["coverage"]}, {"ada", "bob"})
 
+    def test_web_assets_have_the_director_tab(self):
+        with urllib.request.urlopen(self.base + "/") as res:
+            self.assertIn('data-tab="director"', res.read().decode("utf-8"))
+        with urllib.request.urlopen(self.base + "/app.js") as res:
+            script = res.read().decode("utf-8")
+        for needle in ("/api/director/import", "/api/director/build", "confirm_project_manager", "companion_closed"):
+            self.assertIn(needle, script)
+        # Prompt and answer text never go to browser storage.
+        self.assertNotIn("localStorage", script)
+        self.assertNotIn("sessionStorage", script)
+
     def test_binding_is_independent_of_the_session(self):
         before = (self.call("/api/recent"), (self.s.scratch / ".autoclipper").exists())
         self.bind()
