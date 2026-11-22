@@ -141,6 +141,38 @@ new Resolve project. It uses manual copy and paste only, with no API calls.
    unless a fixed `audio_pov` is chosen, and labelled slates for placeholders. The
    **GROUP REFERENCE AUDIO** track uses one POV's verified Track1 mix for the whole cut where it is
    covered, even under a fixed single-POV clip.
+4. **Add to open Auto-Clipper project** (opt-in) adds the cut as a **new timeline** to the Resolve
+   project that is open now, so you do not have to return to the Project Manager. It runs only if the
+   open project's name is `AutoClipper Export <session id> <timestamp>` (a project an Auto-Clipper
+   rough cut or export created); with no open project or any other project it refuses and changes
+   nothing. The timeline is named after the cut's title and ID (`(2)`, `(3)`… if taken). Existing
+   timelines, bins, media and clips are never renamed, overwritten or deleted. Source MP4s and the
+   GROUP REFERENCE AUDIO item already in the project with the exact mic mapping are reused; an
+   existing item that does not match is left alone and the build stops. The project's timeline frame
+   rate must match the cut. The project is saved (not closed or reopened) and only the new timeline is
+   read back. If a step fails, only the timeline and media pool items created by that run are
+   removed (items are tracked as the Resolve calls return them, so anything you add meanwhile is kept);
+   anything that cannot be removed is listed in the error. The build selects the root media pool bin and
+   restores your selected bin afterwards. Known limits: if the build process is killed on timeout, items
+   it had already created stay in the project; and a failure after the project was saved is not rolled
+   back on disk, so check Resolve and delete any leftover timeline by hand. Regular **Export to Resolve** and
+   Director builds are unchanged.
+5. **Several cuts at once.** If you ask the AI for several cuts in one chat, paste them all in the same
+   answer box: either several answer objects, or one wrapper `{"cuts": [answer, answer, ...]}`
+   (each answer keeps the normal schema and the same export ID; the prompt tells the AI it may do
+   this). Every cut is validated independently and each valid one is saved with its own cut ID, as
+   for a single answer. Invalid cuts are listed with their problems and one combined repair prompt;
+   they never block the valid ones. A single answer works exactly as before. Tick the saved cuts and
+   click **Build selected into open Auto-Clipper project**: the cuts are built one at a time through
+   the same single export job, each as its own new timeline in the open project (add-timeline mode
+   above; there is no bulk new-project mode). **If a cut fails, the batch continues with the next
+   cut** and the failure is listed; cuts that were already added are kept. **If a build is stopped
+   after a timeout, the batch stops there**: the remaining cuts are marked "not started" with the
+   reason, because Resolve may be hung or hold a partial timeline. A pasted answer that cannot be
+   parsed as JSON is never dropped silently: the answers found and parsed are counted and the
+   unparsed one is listed as rejected. The batch runs in the Auto-Clipper server, so closing the
+   browser tab does not stop it. **Known limit: a running batch cannot be cancelled** (deferred);
+   it stops only when it finishes, hits a timeout, or the Auto-Clipper server exits.
 
 Rough cuts never change `session.json`.
 

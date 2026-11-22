@@ -836,6 +836,12 @@ class App:
             raise ApiError("Paste the AI's JSON answer")
         rc, snap, fingerprint, context = self._rough_context()
         try:
+            several = rc.split_answers(text)
+        except ValueError as exc:
+            raise ApiError(str(exc))
+        if several is not None:
+            return self._rough_cut_import_many(rc, snap, fingerprint, context, body, *several)
+        try:
             result = rc.validate_response(context, text, brief=body.get("brief"),
                                           target_seconds=body.get("target_seconds"))
         except rc.RoughCutError as exc:
@@ -857,40 +863,66 @@ class App:
                                       if "reference_audio" in s and s["reference_audio"] is None))
         return out
 
+    def _rough_cut_import_many(self, rc, snap, fingerprint, context, body, answers, unparsed):
+        """Validate and save each pasted cut independently; a bad cut never blocks the good ones."""
+        if len(answers) > rc.MAX_CUTS:
+            raise ApiError(f"Too many cuts in one paste ({len(answers)}); the limit is {rc.MAX_CUTS}.")
+        saved, rejected, problems = [], [], []
+        export_id = None
+        for number, answer in enumerate(answers, 1):
+            title = answer.get("title") if isinstance(answer, dict) else None
+            label = f"Cut #{number}" + (f" ({title})" if isinstance(title, str) and title.strip() else "")
+            if not isinstance(answer, dict):
+                row = {"ok": False, "export_id": export_id, "stale": False, "warnings": [], "repair_prompt": "",
+                       "errors": ["Each entry of \"cuts\" must be a JSON object."]}
+            else:
+                text = json.dumps(answer, ensure_ascii=False, indent=1)
+                try:
+                    row = rc.validate_response(context, text, brief=body.get("brief"),
+                                               target_seconds=body.get("target_seconds"))
+                except rc.RoughCutError as exc:
+                    raise ApiError(str(exc))
+                except OSError as exc:
+                    raise ApiError(f"Could not compile the rough cut from verified inputs: {exc}", 409)
+            export_id = row.get("export_id") or export_id
+            if not row["ok"]:
+                rejected.append({"number": number, "label": label, "errors": row["errors"], "stale": row["stale"]})
+                if not row["stale"]:
+                    problems.append((label, row["errors"]))
+                continue
+            with self.lock:
+                self._unchanged(fingerprint)
+                try:
+                    folder = rc.save_cut(rc.session_cuts_root(snap), row, text)
+                except (OSError, rc.RoughCutError) as exc:
+                    rejected.append({"number": number, "label": label, "stale": False,
+                                     "errors": [f"Could not save this cut (nothing was saved for it): {exc}"]})
+                    continue
+            saved.append({"number": number, "cut_id": folder.name, "cut_dir": str(folder),
+                          "report_path": str(folder / "report.md"), "title": row["title"], "clips": row["clips"],
+                          "segments": len(row["manifest"]["segments"]), "warnings": row["warnings"]})
+        for offset in range(1, unparsed + 1):
+            label = f"Unparsed answer {offset} of {unparsed}"
+            message = (f"The paste seems to hold {len(answers) + unparsed} answers but only {len(answers)} could be "
+                       "parsed as JSON. This one is not valid JSON (check for a missing brace or bracket, or "
+                       "text cut off); send it again complete.")
+            rejected.append({"number": None, "label": label, "errors": [message], "stale": False})
+            problems.append((label, [message]))
+        return {"bulk": True, "ok": bool(saved), "export_id": export_id, "saved": saved, "rejected": rejected,
+                "found": len(answers) + unparsed, "parsed": len(answers), "notices": [],
+                "repair_prompt": rc.combined_repair_prompt(context, problems, export_id) if problems else ""}
+
     def rough_cut_build(self, body):
+        mode = body.get("mode", "new_project")
+        if mode not in ("new_project", "add_timeline"):
+            raise ApiError("Unknown rough-cut build mode", 400)
         with self._resolve_lock:
             if self._resolve_job.get("state") in ("preparing", "running"):
                 raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
             previous = self._resolve_job
             self._resolve_job = {"state": "preparing"}
         try:
-            rc, snap, fingerprint, context = self._rough_context()
-            try:
-                folder, manifest, record = rc.load_cut(rc.session_cuts_root(snap), body.get("cut_id"))
-                _mod("resolve_builder").validate_manifest(manifest)
-            except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise ApiError(f"Cannot build this rough cut: {exc}", 409)
-            options = manifest.get("rough_cut", {})
-            if record.get("export_id") != rc.prompt_export_id(
-                    context, brief=options.get("brief"), target_seconds=options.get("target_seconds")):
-                raise ApiError("The session, transcript, mic confirmations or recordings changed since this rough "
-                               "cut was validated. Copy a new prompt and import a new answer.", 409)
-            with self.lock:
-                self._unchanged(fingerprint)
-                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                name = f"build-{stamp}"
-                if (folder / name).exists():
-                    raise ApiError(f"Build folder already exists: {folder / name}. Try again in a second.", 409)
-                try:
-                    out = rc.safe_directory(folder, name)
-                except (OSError, rc.RoughCutError) as exc:
-                    raise ApiError(str(exc), 409)
-            job = {
-                "state": "running", "kind": "rough_cut", "cut_id": folder.name,
-                "project": f"AutoClipper Export {manifest['session_id']} {stamp}",
-                "out_dir": str(out), "manifest_path": str(folder / "manifest.json"),
-                "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
-            }
+            job = self._rough_build_job(body.get("cut_id"), mode == "add_timeline")
         except BaseException:
             with self._resolve_lock:
                 self._resolve_job = previous
@@ -900,11 +932,132 @@ class App:
         threading.Thread(target=self._run_resolve_job, args=(job,), daemon=True).start()
         return job
 
+    def _rough_build_job(self, cut_id, add_timeline):
+        """Validate one saved cut and reserve its build folder. Returns the job description."""
+        rc, snap, fingerprint, context = self._rough_context()
+        try:
+            folder, manifest, record = rc.load_cut(rc.session_cuts_root(snap), cut_id)
+            _mod("resolve_builder").validate_manifest(manifest)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ApiError(f"Cannot build this rough cut: {exc}", 409)
+        options = manifest.get("rough_cut", {})
+        if record.get("export_id") != rc.prompt_export_id(
+                context, brief=options.get("brief"), target_seconds=options.get("target_seconds")):
+            raise ApiError("The session, transcript, mic confirmations or recordings changed since this rough "
+                           "cut was validated. Copy a new prompt and import a new answer.", 409)
+        with self.lock:
+            self._unchanged(fingerprint)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            name = f"build-{stamp}"
+            if (folder / name).exists():
+                raise ApiError(f"Build folder already exists: {folder / name}. Try again in a second.", 409)
+            try:
+                out = rc.safe_directory(folder, name)
+            except (OSError, rc.RoughCutError) as exc:
+                raise ApiError(str(exc), 409)
+        job = {
+            "state": "running", "kind": "rough_cut", "cut_id": folder.name,
+            "project": f"AutoClipper Export {manifest['session_id']} {stamp}",
+            "out_dir": str(out), "manifest_path": str(folder / "manifest.json"),
+            "report_path": str(folder / "report.md"), "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if add_timeline:
+            title = _mod("resolve_add_timeline").safe_timeline_name(options.get("title") or "")[:80].strip()
+            job.update(mode="add_timeline", project="the open Auto-Clipper project",
+                       timeline_name=f"{title} {folder.name}".strip() if title else folder.name)
+        return job
+
+    def rough_cut_build_batch(self, body):
+        """Build several saved cuts, one after another, each as a new timeline in the open project.
+
+        Runs through the single Resolve job slot. A cut that fails is recorded and the batch continues
+        with the next one; nothing is rolled back for cuts that already succeeded.
+        """
+        rc = _mod("rough_cut")
+        ids = body.get("cut_ids")
+        if (not isinstance(ids, list) or not ids or len(ids) > rc.MAX_CUTS
+                or not all(isinstance(i, str) for i in ids) or len(set(ids)) != len(ids)):
+            raise ApiError(f"Choose between 1 and {rc.MAX_CUTS} different saved cuts", 400)
+        with self._resolve_lock:
+            if self._resolve_job.get("state") in ("preparing", "running"):
+                raise ApiError("A Resolve export is already running", 409, job=dict(self._resolve_job))
+            previous = self._resolve_job
+            self._resolve_job = {"state": "preparing"}
+        try:
+            _, snap, _, _ = self._rough_context()
+            rows = []
+            for cut_id in ids:
+                try:
+                    _, manifest, _ = rc.load_cut(rc.session_cuts_root(snap), cut_id)
+                except (OSError, KeyError, TypeError, ValueError) as exc:
+                    raise ApiError(f"Cannot build rough cut {cut_id}: {exc}", 409)
+                rows.append({"cut_id": cut_id, "title": manifest.get("rough_cut", {}).get("title"),
+                             "state": "queued"})
+            job = {"state": "running", "kind": "rough_cut_batch", "mode": "add_timeline",
+                   "project": "the open Auto-Clipper project", "cuts": rows,
+                   "started_at": datetime.now(timezone.utc).isoformat()}
+        except BaseException:
+            with self._resolve_lock:
+                self._resolve_job = previous
+            raise
+        with self._resolve_lock:
+            self._resolve_job = dict(job)
+        threading.Thread(target=self._run_batch, args=(job,), daemon=True).start()
+        return job
+
+    def _run_batch(self, job):
+        rows = job["cuts"]
+
+        def publish(**extra):
+            with self._resolve_lock:
+                self._resolve_job = {**job, "cuts": [dict(r) for r in rows], **extra}
+
+        stop_reason = None
+        for row in rows:
+            if stop_reason:
+                row.update(state="not_started", error=stop_reason)
+                continue
+            row["state"] = "running"
+            publish(current=row["cut_id"])
+            try:
+                single = self._rough_build_job(row["cut_id"], True)
+                outcome = self._execute_builder(single)
+                row.update(state=outcome["state"], timeline=single["timeline_name"], out_dir=single["out_dir"],
+                           report_path=single["report_path"])
+                if outcome["state"] == "done":
+                    row["readback_path"] = outcome["readback_path"]
+                else:
+                    row["error"] = outcome.get("error", "Unknown error")
+                if outcome.get("killed"):
+                    stop_reason = (f"Not started: the build of “{row.get('title') or row['cut_id']}” was stopped after a "
+                                   "timeout, so Resolve may be hung or hold a partial timeline. Check Resolve, "
+                                   "then build the remaining cuts again.")
+            except ApiError as exc:
+                row.update(state="failed", error=str(exc))
+            except Exception as exc:
+                row.update(state="failed", error=f"{type(exc).__name__}: {exc}")
+        failed = [r for r in rows if r["state"] == "failed"]
+        skipped = [r for r in rows if r["state"] == "not_started"]
+        added = len(rows) - len(failed) - len(skipped)
+        summary = (f"Batch: {added} added, {len(failed)} failed" + (f", {len(skipped)} not started" if skipped else "")
+                   + (". " + stop_reason if stop_reason else "."))
+        publish(state="failed" if failed or skipped else "done", current=None, summary=summary,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                **({"error": summary} if failed or skipped else {}))
+
     def _run_resolve_job(self, job):
+        result = self._execute_builder(job)
+        with self._resolve_lock:
+            self._resolve_job = {**job, **result, "finished_at": datetime.now(timezone.utc).isoformat()}
+
+    def _execute_builder(self, job):
         result = {"state": "failed"}
         readback = Path(job["out_dir"]) / "readback.json"
         try:
-            code, stdout, stderr = self.run_builder(Path(job["manifest_path"]), job["project"], readback)
+            extra = (("--add-to-open", "--timeline-name", job["timeline_name"])
+                     if job.get("mode") == "add_timeline" else None)
+            args = (Path(job["manifest_path"]), job["project"], readback)
+            code, stdout, stderr = self.run_builder(*args, extra_args=extra) if extra else self.run_builder(*args)
             if code == 0 and readback.is_file():
                 result = {"state": "done", "readback": json.loads(readback.read_text(encoding="utf-8")),
                           "readback_path": str(readback)}
@@ -915,12 +1068,12 @@ class App:
         except subprocess.TimeoutExpired:
             result["error"] = (f"Resolve export timed out after {self.builder_timeout} s and was stopped. "
                                "Check Resolve before trying again.")
+            result["killed"] = True
         except Exception as exc:
             result["error"] = f"{type(exc).__name__}: {exc}"
-        with self._resolve_lock:
-            self._resolve_job = {**job, **result, "finished_at": datetime.now(timezone.utc).isoformat()}
+        return result
 
-    def run_builder(self, manifest_path: Path, project: str, result_path: Path):
+    def run_builder(self, manifest_path: Path, project: str, result_path: Path, extra_args=None):
         """Run the builder in a separate process so a Resolve hang cannot wedge the UI.
 
         The builder writes its JSON result to result_path. The process is killed on timeout
@@ -932,8 +1085,8 @@ class App:
         if modules.is_dir():
             env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH"), str(modules)]))
         proc = subprocess.Popen(
-            [*self.builder_command, str(manifest_path), "--execute", "--project", project,
-             "--result-file", str(result_path)],
+            [*self.builder_command, str(manifest_path), "--execute",
+             *(extra_args if extra_args else ("--project", project)), "--result-file", str(result_path)],
             cwd=str(Path(__file__).resolve().parent.parent), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         with self._resolve_lock:
@@ -1198,6 +1351,7 @@ POST_ROUTES = {
     "/api/rough-cut/prompt": "rough_cut_prompt",
     "/api/rough-cut/import": "rough_cut_import",
     "/api/rough-cut/build": "rough_cut_build",
+    "/api/rough-cut/build-batch": "rough_cut_build_batch",
     "/api/director/open": "director_open",
     "/api/director/export": "director_export",
     "/api/director/import": "director_import",

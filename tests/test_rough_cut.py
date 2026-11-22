@@ -472,6 +472,255 @@ class RoughCutApiTests(unittest.TestCase):
         self.assertEqual(result_path.parent.parent, cuts / saved["cut_id"])
         self.assertEqual(self.session_json, (self.folder / ".autoclipper" / "session.json").read_bytes())
 
+    def test_add_timeline_mode_passes_builder_flags_and_default_does_not(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        saved = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})
+        seen = []
+
+        def run(manifest_path, project, result_path, extra_args=None):
+            seen.append((project, extra_args))
+            result_path.write_text(json.dumps({"project": "open", "added_timeline": True}), encoding="utf-8")
+            return 0, "", ""
+
+        self.app.run_builder = run
+        self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"], "mode": "bogus"}, expect=400)
+        self.assertEqual(self.call("/api/resolve/status")["state"], "idle")
+        job = self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"], "mode": "add_timeline"})
+        self.assertEqual(job["mode"], "add_timeline")
+        self.assertTrue(job["timeline_name"].endswith(saved["cut_id"]))
+        for ch in ':,/*?"<>|;':
+            self.assertNotIn(ch, job["timeline_name"])
+        self.assertEqual(self.wait_job()["state"], "done")
+        time.sleep(1.1)  # build folders are stamped to the second
+        self.call("/api/rough-cut/build", {"cut_id": saved["cut_id"]})
+        self.assertEqual(self.wait_job()["state"], "done")
+        self.assertEqual(seen[0][1][:2], ("--add-to-open", "--timeline-name"))
+        self.assertEqual(seen[0][1][2], job["timeline_name"])
+        self.assertRegex(seen[1][0], r"^AutoClipper Export synthetic-cut \d{8}-\d{6}$")
+        self.assertIsNone(seen[1][1])
+
+    def test_run_builder_add_timeline_command_line_has_no_project_argument(self):
+        with patch("autoclipper.server.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = ("{}", "")
+            popen.return_value.returncode = 0
+            self.app.run_builder(Path("m.json"), "ignored", Path("r.json"),
+                                 extra_args=("--add-to-open", "--timeline-name", "T"))
+        command = popen.call_args.args[0]
+        self.assertNotIn("--project", command)
+        self.assertEqual(command[-6:], ["--execute", "--add-to-open", "--timeline-name", "T",
+                                        "--result-file", "r.json"])
+
+    # ------------------------------------------------------------------ bulk import and batch build
+    CUT_B = [GOOD_CLIPS[0], GOOD_CLIPS[2]]
+    CUT_C = [GOOD_CLIPS[2], GOOD_CLIPS[3]]
+
+    def cut(self, export_id, clips, title):
+        return {"schema": rc.SCHEMA, "export_id": export_id, "title": title, "clips": clips}
+
+    def test_several_pasted_objects_save_one_cut_each(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        text = ("Here are the cuts:\n```json\n" + json.dumps(self.cut(info["export_id"], GOOD_CLIPS, "One"))
+                + "\n```\nand\n```json\n" + json.dumps(self.cut(info["export_id"], self.CUT_B, "Two")) + "\n```")
+        out = self.call("/api/rough-cut/import", {"text": text})
+        self.assertTrue(out["bulk"] and out["ok"], out)
+        self.assertEqual([c["title"] for c in out["saved"]], ["One", "Two"])
+        self.assertEqual(len({c["cut_id"] for c in out["saved"]}), 2)
+        self.assertEqual(out["rejected"], [])
+        cuts = self.folder / "autoclipper_exports" / "rough-cuts"
+        for saved in out["saved"]:
+            self.assertTrue((cuts / saved["cut_id"] / "manifest.json").is_file())
+        self.assertEqual(self.session_json, (self.folder / ".autoclipper" / "session.json").read_bytes())
+
+    def test_wrapper_object_with_cuts(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        wrapper = {"cuts": [self.cut(info["export_id"], GOOD_CLIPS, "A"), self.cut(info["export_id"], self.CUT_B, "B"),
+                            self.cut(info["export_id"], self.CUT_C, "C")]}
+        out = self.call("/api/rough-cut/import", {"text": json.dumps(wrapper)})
+        self.assertEqual([c["title"] for c in out["saved"]], ["A", "B", "C"])
+        self.assertEqual(len({c["cut_id"] for c in out["saved"]}), 3)
+
+    def test_one_bad_cut_does_not_block_the_good_ones(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        bad = self.cut(info["export_id"], [{**GOOD_CLIPS[0], "quotes": [{"line": "L0004", "text": "invented"}]},
+                                          GOOD_CLIPS[2]], "Bad")
+        stale = self.cut("rc-0123456789abcdef", GOOD_CLIPS, "Stale")
+        wrapper = {"cuts": [self.cut(info["export_id"], GOOD_CLIPS, "Good"), bad, stale, "nonsense",
+                            self.cut(info["export_id"], self.CUT_B, "Good2")]}
+        out = self.call("/api/rough-cut/import", {"text": json.dumps(wrapper)})
+        self.assertTrue(out["ok"])
+        self.assertEqual([c["title"] for c in out["saved"]], ["Good", "Good2"])
+        self.assertEqual([(r["number"], r["stale"]) for r in out["rejected"]],
+                         [(2, False), (3, True), (4, False)])
+        self.assertIn("Cut #2 (Bad)", out["repair_prompt"])
+        self.assertNotIn("Stale", out["repair_prompt"])
+        self.assertIn('{"cuts": [...]}', out["repair_prompt"])
+        self.assertIn("other cuts were saved", out["repair_prompt"])
+        cuts = self.folder / "autoclipper_exports" / "rough-cuts"
+        self.assertEqual(len([p for p in cuts.iterdir() if not p.name.startswith(".")]), 2)
+
+    def test_all_bad_cuts_save_nothing(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        wrapper = {"cuts": [self.cut(info["export_id"], [GOOD_CLIPS[0]], "Short"),
+                            self.cut(info["export_id"], [GOOD_CLIPS[2]], "Short2")]}
+        out = self.call("/api/rough-cut/import", {"text": json.dumps(wrapper)})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["saved"], [])
+        self.assertEqual(len(out["rejected"]), 2)
+        self.assertFalse((self.folder / "autoclipper_exports" / "rough-cuts").exists()
+                         and any((self.folder / "autoclipper_exports" / "rough-cuts").iterdir()))
+
+    def test_unparseable_pasted_answer_is_rejected_not_dropped(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        good = json.dumps(self.cut(info["export_id"], GOOD_CLIPS, "Good"))
+        broken = json.dumps(self.cut(info["export_id"], self.CUT_B, "Broken"))[:-20]
+        out = self.call("/api/rough-cut/import", {"text": good + "\n" + good.replace("Good", "Good2") + "\n" + broken})
+        self.assertEqual(len(out["saved"]), 2)
+        self.assertEqual((out["found"], out["parsed"]), (3, 2))
+        self.assertEqual([r["label"] for r in out["rejected"]], ["Unparsed answer 1 of 1"])
+        self.assertIn("only 2 could be parsed", out["rejected"][0]["errors"][0])
+        self.assertIn("Unparsed answer 1 of 1", out["repair_prompt"])
+
+    def test_each_pasted_answer_gets_its_own_tolerant_fixups(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        eid = info["export_id"]
+        trailing = json.dumps(self.cut(eid, GOOD_CLIPS, "Trailing comma"))[:-1] + ",}"
+        smart = json.dumps(self.cut(eid, self.CUT_B, "Smart quotes")).replace('"', "”")
+        clean = json.dumps(self.cut(eid, self.CUT_C, "Clean"))
+        for order in ((clean, trailing), (trailing, clean), (smart, clean), (clean, smart), (trailing, smart, clean)):
+            out = self.call("/api/rough-cut/import", {"text": "\n\n".join(order)})
+            self.assertTrue(out["bulk"], order)
+            self.assertEqual(len(out["saved"]), len(order), out["rejected"])
+            self.assertEqual(out["rejected"], [])
+            self.assertEqual(out["found"], out["parsed"])
+            time.sleep(0.02)
+
+    def test_a_paste_of_two_answers_never_falls_back_to_one(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        eid = info["export_id"]
+        good = json.dumps(self.cut(eid, GOOD_CLIPS, "Good"))
+        hopeless = '{"schema": "x", "export_id": "' + eid + '", "clips": [ {"id": '
+        out = self.call("/api/rough-cut/import", {"text": good + "\n" + hopeless})
+        self.assertTrue(out["bulk"])
+        self.assertEqual([c["title"] for c in out["saved"]], ["Good"])
+        self.assertEqual((out["found"], out["parsed"], len(out["rejected"])), (2, 1, 1))
+
+    def test_single_answer_path_is_unchanged(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        out = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})
+        self.assertNotIn("bulk", out)
+        self.assertTrue(out["ok"])
+        self.assertIn("cut_id", out)
+        bad = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], [GOOD_CLIPS[0]])})
+        self.assertNotIn("bulk", bad)
+        self.assertFalse(bad["ok"])
+        self.assertIsNone(rc.split_answers(answer(info["export_id"], GOOD_CLIPS)))
+        self.assertIsNone(rc.split_answers("no json here"))
+
+    def test_prompt_mentions_the_cuts_wrapper_once(self):
+        prompt = self.call("/api/rough-cut/prompt", {})["prompt"]
+        self.assertEqual(prompt.count('{"cuts": ['), 1)
+
+    def stub_batch_builder(self, fail=(), gate=None):
+        calls = []
+
+        def run(manifest_path, project, result_path, extra_args=None):
+            if gate is not None:
+                gate.wait(10)
+            calls.append((manifest_path.parent.name, extra_args))
+            if len(calls) in fail:
+                return 1, "", "Resolve refused this cut"
+            result_path.write_text(json.dumps({"project": "open", "timeline": extra_args[2],
+                                               "added_timeline": True}), encoding="utf-8")
+            return 0, "", ""
+
+        self.app.run_builder = run
+        return calls
+
+    def import_three(self):
+        info = self.call("/api/rough-cut/prompt", {})
+        wrapper = {"cuts": [self.cut(info["export_id"], GOOD_CLIPS, "Same title"),
+                            self.cut(info["export_id"], self.CUT_B, "Same title"),
+                            self.cut(info["export_id"], self.CUT_C, "Same title")]}
+        return [c["cut_id"] for c in self.call("/api/rough-cut/import", {"text": json.dumps(wrapper)})["saved"]]
+
+    def wait_batch(self):
+        for _ in range(500):
+            job = self.call("/api/resolve/status")
+            if job["state"] not in ("running", "preparing"):
+                return job
+            time.sleep(0.02)
+        self.fail("batch did not finish")
+
+    def test_batch_builds_each_cut_sequentially_with_unique_timeline_names(self):
+        ids = self.import_three()
+        gate = threading.Event()
+        calls = self.stub_batch_builder(gate=gate)
+        job = self.call("/api/rough-cut/build-batch", {"cut_ids": ids})
+        self.assertEqual(job["kind"], "rough_cut_batch")
+        self.call("/api/rough-cut/build", {"cut_id": ids[0]}, expect=409)  # one job slot
+        gate.set()
+        done = self.wait_batch()
+        self.assertEqual(done["state"], "done", done)
+        self.assertEqual([c["state"] for c in done["cuts"]], ["done"] * 3)
+        self.assertEqual([c[0] for c in calls], ids)  # in the order chosen, one at a time
+        names = [c["timeline"] for c in done["cuts"]]
+        self.assertEqual(len(set(n.casefold() for n in names)), 3)
+        self.assertTrue(all(c[1][0] == "--add-to-open" for c in calls))
+        self.assertTrue(all(c["readback_path"] for c in done["cuts"]))
+
+    def test_batch_continues_after_a_failed_cut_and_reports_it(self):
+        ids = self.import_three()
+        calls = self.stub_batch_builder(fail={2})
+        self.call("/api/rough-cut/build-batch", {"cut_ids": ids})
+        done = self.wait_batch()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c["state"] for c in done["cuts"]], ["done", "failed", "done"])
+        self.assertIn("Resolve refused this cut", done["cuts"][1]["error"])
+        self.assertEqual(done["state"], "failed")
+        self.assertEqual(done["summary"], "Batch: 2 added, 1 failed.")
+
+    def test_a_builder_timeout_stops_the_batch_and_marks_the_rest_not_started(self):
+        import subprocess
+        ids = self.import_three()
+        calls = []
+
+        def run(manifest_path, project, result_path, extra_args=None):
+            calls.append(manifest_path.parent.name)
+            if len(calls) == 2:
+                raise subprocess.TimeoutExpired("builder", 1)
+            result_path.write_text(json.dumps({"timeline": extra_args[2]}), encoding="utf-8")
+            return 0, "", ""
+
+        self.app.run_builder = run
+        self.call("/api/rough-cut/build-batch", {"cut_ids": ids})
+        done = self.wait_batch()
+        self.assertEqual(calls, ids[:2])
+        self.assertEqual([c["state"] for c in done["cuts"]], ["done", "failed", "not_started"])
+        self.assertIn("timed out", done["cuts"][1]["error"])
+        self.assertIn("stopped after a timeout", done["cuts"][2]["error"])
+        self.assertEqual(done["state"], "failed")
+        self.assertTrue(done["summary"].startswith("Batch: 1 added, 1 failed, 1 not started."), done["summary"])
+
+    def test_ordinary_failures_still_continue_and_summary_counts_a_clean_batch(self):
+        ids = self.import_three()
+        self.stub_batch_builder()
+        self.call("/api/rough-cut/build-batch", {"cut_ids": ids})
+        self.assertEqual(self.wait_batch()["summary"], "Batch: 3 added, 0 failed.")
+
+    def test_batch_rejects_bad_requests_and_stale_cuts(self):
+        ids = self.import_three()
+        calls = self.stub_batch_builder()
+        for body in ({}, {"cut_ids": []}, {"cut_ids": [ids[0], ids[0]]}, {"cut_ids": [1]}, {"cut_ids": ["x"] * 13}):
+            self.call("/api/rough-cut/build-batch", body, expect=400)
+        self.call("/api/rough-cut/build-batch", {"cut_ids": ["../../x"]}, expect=409)
+        self.assertEqual(self.call("/api/resolve/status")["state"], "idle")
+        self.call("/api/session/meta", {"notes": "changed after validation"})
+        self.call("/api/rough-cut/build-batch", {"cut_ids": ids})
+        done = self.wait_batch()
+        self.assertEqual([c["state"] for c in done["cuts"]], ["failed"] * 3)
+        self.assertIn("changed since this rough cut was validated", done["cuts"][0]["error"])
+        self.assertEqual(calls, [])
+
     def test_build_refuses_unknown_tampered_or_stale_cuts(self):
         info = self.call("/api/rough-cut/prompt", {})
         saved = self.call("/api/rough-cut/import", {"text": answer(info["export_id"], GOOD_CLIPS)})

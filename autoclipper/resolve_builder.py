@@ -229,12 +229,14 @@ def _track_label(value):
     return f"track{match[1]}" if match else label
 
 
-def import_sources(pool, media, fps):
+def import_sources(pool, media, fps, created=None):
     clips = {}
     for path, (_, name, track, ordinal, title, channels) in media.items():
         items = pool.ImportMedia([str(path)])
         require(items and len(items) == 1, f"Expected one imported clip for {path}")
         clip = items[0]
+        if created is not None:
+            created.append(clip)
         require(Path(clip.GetClipProperty("File Path")).resolve() == path, f"Imported path differs for {path}")
         require(Fraction(clip.GetClipProperty("FPS")) == fps, f"Unexpected imported rate for {path}")
         audio = json.loads(clip.GetAudioMapping())
@@ -264,6 +266,33 @@ def import_sources(pool, media, fps):
     return clips
 
 
+def import_one_reference(pool, path, track, mic_clip, fps, created=None):
+    """Import one separate reference item into the pool's current bin and map it to the mix pair."""
+    items = pool.ImportMedia([str(path)])
+    require(items and len(items) == 1, f"Could not import separate reference item for {path}")
+    clip = items[0]
+    if created is not None:
+        created.append(clip)
+    require(clip.GetUniqueId() != mic_clip.GetUniqueId(),
+            f"Resolve reused the mic-mapped item for reference audio: {path}")
+    require(Path(clip.GetClipProperty("File Path")).resolve() == path
+            and Fraction(clip.GetClipProperty("FPS")) == fps,
+            f"Reference media path or rate differs for {path}")
+    mapping = json.loads(clip.GetAudioMapping())
+    ordinal = str(track["mp4_audio_ordinal"])
+    channels = track["resolve_channels"]
+    matches = [key for key, value in mapping["track_mapping"].items()
+               if value.get("channel_idx") == channels]
+    require(matches == [ordinal] and mapping["track_mapping"][ordinal].get("type") == "stereo"
+            and not mapping.get("linked_audio")
+            and mapping.get("embedded_audio_channels", max(channels)) >= max(channels),
+            f"Reference mix stream or channel mapping differs for {path}")
+    isolate_mic(clip, track["mp4_audio_ordinal"], channels)
+    require(clip.SetName(REFERENCE_TRACK_NAME) and clip.GetName() == REFERENCE_TRACK_NAME,
+            f"Could not label reference item for {path}")
+    return clip
+
+
 def import_reference_sources(pool, segments, mic_clips, fps):
     references = {Path(ref["mp4_path"]).resolve(): ref["track"]
                   for segment in segments if (ref := segment.get("reference_audio"))}
@@ -275,27 +304,7 @@ def import_reference_sources(pool, segments, mic_clips, fps):
     clips = {}
     try:
         for path, track in references.items():
-            items = pool.ImportMedia([str(path)])
-            require(items and len(items) == 1, f"Could not import separate reference item for {path}")
-            clip = items[0]
-            require(clip.GetUniqueId() != mic_clips[path].GetUniqueId(),
-                    f"Resolve reused the mic-mapped item for reference audio: {path}")
-            require(Path(clip.GetClipProperty("File Path")).resolve() == path
-                    and Fraction(clip.GetClipProperty("FPS")) == fps,
-                    f"Reference media path or rate differs for {path}")
-            mapping = json.loads(clip.GetAudioMapping())
-            ordinal = str(track["mp4_audio_ordinal"])
-            channels = track["resolve_channels"]
-            matches = [key for key, value in mapping["track_mapping"].items()
-                       if value.get("channel_idx") == channels]
-            require(matches == [ordinal] and mapping["track_mapping"][ordinal].get("type") == "stereo"
-                    and not mapping.get("linked_audio")
-                    and mapping.get("embedded_audio_channels", max(channels)) >= max(channels),
-                    f"Reference mix stream or channel mapping differs for {path}")
-            isolate_mic(clip, track["mp4_audio_ordinal"], channels)
-            require(clip.SetName(REFERENCE_TRACK_NAME) and clip.GetName() == REFERENCE_TRACK_NAME,
-                    f"Could not label reference item for {path}")
-            clips[path] = clip
+            clips[path] = import_one_reference(pool, path, track, mic_clips[path], fps)
     finally:
         require(pool.SetCurrentFolder(root), "Could not restore source media bin")
     return clips
@@ -312,7 +321,7 @@ def append_reference(pool, timeline, segment, clips):
                 timeline.GetStartFrame() + ref["record_start_frame"], 2, audio_only=True)
 
 
-def build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps):
+def build_segment(resolve, project, pool, timeline, segment, multicam_name, clips, fps, created=None):
     sources = []
     for angle in segment["angles"]:
         clip = clips[Path(angle["mp4_path"]).resolve()]
@@ -350,6 +359,8 @@ def build_segment(resolve, project, pool, timeline, segment, multicam_name, clip
         raise
     else:
         restore_source_marks(modified)
+    if created is not None and items:
+        created.extend(items)
     require(items and len(items) == 1, f"Resolve did not create one multicam for {multicam_name}")
     multicam = items[0]
     length = segment["duration_frames"]
@@ -390,8 +401,10 @@ def render_placeholder(folder, segment, fps):
     return target
 
 
-def build_placeholder(project, pool, timeline, segment, path):
+def build_placeholder(project, pool, timeline, segment, path, created=None):
     clips = pool.ImportMedia([str(path)])
+    if created is not None and clips:
+        created.extend(clips)
     require(clips and len(clips) == 1, "Could not import the missing-footage slate")
     clip = clips[0]
     name = f"MISSING FOOTAGE: {segment['title']}"
@@ -592,9 +605,14 @@ def read_export(timeline, segments, names, placeholders=None):
     return rows
 
 
-def build_export(manifest, *, dry_run=False, project_name=None):
-    """Return the plan or a structured readback of the saved and reopened export."""
+def build_export(manifest, *, dry_run=False, project_name=None, add_to_open=False, timeline_name=None):
+    """Return the plan or a structured readback of the saved and reopened export.
+
+    add_to_open (rough cuts only) adds a timeline to the open Auto-Clipper project instead of creating one.
+    """
     media = validate_manifest(manifest)
+    if add_to_open and project_name is not None:
+        raise ValueError("Adding to the open project cannot be combined with a new project name")
     export_name = re.escape(f"{EXPORT_PREFIX}{manifest['session_id']} ")
     if project_name is not None and not re.fullmatch(
             rf"(?:{TEST_PROJECT_PREFIX}|{DIRECTOR_TEST_PREFIX}|{export_name})\d{{8}}-\d{{6}}", project_name):
@@ -606,6 +624,19 @@ def build_export(manifest, *, dry_run=False, project_name=None):
     ]
     if dry_run:
         return {"mode": "dry-run", "manifest": manifest, "warnings": warnings}
+    if add_to_open:
+        from .resolve_add_timeline import add_timeline_to_open_project
+
+        result = add_timeline_to_open_project(manifest, timeline_name)
+        result["warnings"] = warnings
+        result["limitations"] = [
+            "Added to the open project and verified from the live project after saving; it was not closed or reopened.",
+            "Source audio provides one switchable owner-mic pair. Game audio is not identified by manifest v1.",
+            "Reported source handles are not included in the marked multicam extents.",
+        ] + (["Resolve did not expose the internal angle timeline. Verify angle names, switching and "
+              "segment-specific trims for repeated source media in the UI."]
+             if any(row["angles"] is None for row in result["segments"] if "angles" in row) else [])
+        return result
     mapped_director = manifest.get("mode") in {"director_review", "director_edit_plan"}
     if not mapped_director:
         for path in media:
@@ -734,6 +765,9 @@ def build_export(manifest, *, dry_run=False, project_name=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
+    parser.add_argument("--add-to-open", action="store_true",
+                        help="Rough cuts only: add a timeline to the open Auto-Clipper project (no new project)")
+    parser.add_argument("--timeline-name", help="Base timeline name for --add-to-open (made unique)")
     parser.add_argument("--project", help="Optional new project name: AutoClipper Stage2 Test YYYYMMDD-HHMMSS "
                                           "or AutoClipper Export <session_id> YYYYMMDD-HHMMSS")
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -747,7 +781,8 @@ def main(argv=None):
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         if args.result_file is not None and args.result_file.exists():
             raise ValueError(f"Result file already exists: {args.result_file}")
-        result = build_export(manifest, dry_run=args.dry_run, project_name=args.project)
+        result = build_export(manifest, dry_run=args.dry_run, project_name=args.project,
+                              add_to_open=args.add_to_open, timeline_name=args.timeline_name)
         if args.result_file is not None:
             from .store import _write_json
             _write_json(args.result_file, result)

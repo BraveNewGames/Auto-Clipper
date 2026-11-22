@@ -259,6 +259,7 @@ RULES
 OUTPUT
 Return ONLY one JSON object (no prose before or after) shaped like this (<...> are placeholders):
 {example}
+If asked for several cuts, you may instead return {{"cuts": [<cut>, <cut>, ...]}}, each cut shaped as above with the same export_id.
 
 JSON schema: {json.dumps(RESPONSE_JSON_SCHEMA, separators=(",", ":"))}
 
@@ -331,6 +332,89 @@ def extract_json(text, *, key="clips"):
     if not candidates:
         raise ValueError(f'Could not find a JSON object with a "{key}" list in the pasted answer.')
     return max(candidates, key=lambda item: item[0])[1]
+
+
+MAX_CUTS = 12
+MAX_FIXUP_ATTEMPTS = 60
+_EXPORT_ID_FIELD = re.compile(r'["“”]export_id["“”]')
+
+
+def _top_level_objects(text):
+    """Every top-level JSON object in a paste. Each object is decoded as written, and only if that fails
+    with the shared smart-quote and trailing-comma fixups, so one sloppy answer never hides another."""
+    decoder = json.JSONDecoder()
+    found, position, fixups_left = [], 0, MAX_FIXUP_ATTEMPTS
+    while True:
+        start = text.find("{", position)
+        if start < 0:
+            return found
+        value, end = None, None
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except ValueError:
+            if fixups_left > 0:
+                fixups_left -= 1
+                tail = _fixups(text[start:])
+                try:
+                    value, consumed = decoder.raw_decode(tail, 0)
+                    # Skip the same stretch of the original text: the fixups only shorten it.
+                    end = _skip_original(text, start, tail, consumed)
+                except ValueError:
+                    value = None
+        if end is None:
+            position = start + 1
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+        position = end
+
+
+def _skip_original(text, start, fixed_tail, consumed):
+    """Index in ``text`` just past the object that ended at ``consumed`` in the fixed-up tail."""
+    # Fixups only drop commas before a closer, so the tail is a subsequence of the original; walk both.
+    i, j = start, 0
+    while j < consumed and i < len(text):
+        if text[i] == fixed_tail[j] or text[i] in "“”‘’":
+            j += 1
+        i += 1
+    return i
+
+
+def split_answers(text):
+    """Several pasted answers, or a {"cuts": [...]} wrapper, as (answers, unparsed_count).
+
+    Returns None when the paste holds at most one plain answer; callers then use the single-answer
+    path unchanged. Elements of "cuts" are returned as-is (they may be malformed; validation reports
+    that). ``unparsed_count`` is how many more answers (by "export_id" fields) the paste seems to hold
+    than could be parsed as JSON; they are never dropped silently.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if len(text) > MAX_RESPONSE_CHARS * MAX_CUTS:
+        raise ValueError(f"The pasted answers are longer than {MAX_RESPONSE_CHARS * MAX_CUTS} characters.")
+    text = text.strip().lstrip("﻿")
+    answers, wrapped = [], False
+    for obj in _top_level_objects(text):
+        if isinstance(obj.get("cuts"), list) and "clips" not in obj:
+            wrapped = True
+            answers.extend(obj["cuts"])
+        elif "clips" in obj:
+            answers.append(obj)
+    claimed = len(_EXPORT_ID_FIELD.findall(text))
+    unparsed = max(0, claimed - len(answers))
+    if len(answers) <= 1 and not wrapped and not (unparsed and claimed >= 2):
+        return None
+    return answers, unparsed
+
+
+def combined_repair_prompt(context, problems, export_id):
+    """One repair prompt for every rejected cut. ``problems`` is [(label, [error, ...])]."""
+    errors = [f"{label}: {error}" for label, items in problems for error in items]
+    text = _repair_prompt(context, errors, export_id=export_id)
+    return (text.replace("Nothing was saved.", "Nothing was saved for the rejected cuts; the other cuts were saved.", 1)
+            .replace("return the COMPLETE corrected JSON object only,",
+                     'return ONLY {"cuts": [...]} holding the COMPLETE corrected version of each rejected cut '
+                     "(not the accepted ones),", 1))
 
 
 # --------------------------------------------------------------------------- validation
