@@ -212,8 +212,8 @@ class FilesTests(ImportBase):
         folder = dx.write_edit_files(binding, plan_id, manifest, stamp="20261121-000000")
         self.assertEqual(folder.name, f"edit-{plan_id}-20261121-000000")
         self.assertTrue((folder / "manifest.json").is_file() and (folder / "report.md").is_file())
-        with self.assertRaises(dx.DirectorError):
-            dx.write_edit_files(binding, plan_id, manifest, stamp="20261121-000000")
+        again = dx.write_edit_files(binding, plan_id, manifest, stamp="20261121-000000")
+        self.assertEqual(again.name, folder.name + "-2")  # a folder is never reused
         self.assertRegex(dx.new_project_name(), r"^AutoClipper DirectorA Test \d{8}-\d{6}$")
 
     def test_unknown_plan(self):

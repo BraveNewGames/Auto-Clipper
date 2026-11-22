@@ -917,13 +917,120 @@ def write_edit_files(binding, plan_id, manifest, stamp=None):
     """Write edit-<plan>-<stamp>/{manifest.json,report.md} in a NEW folder inside scratch; never reused."""
     from . import resolve_manifest as rm
     stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
-    name = f"edit-{plan_id}-{stamp}"
-    target = binding.scratch / name
-    if target.exists() or _is_link(target):
-        raise DirectorError("E_WRITE", f"{name} already exists. Try again in a second.")
+    for suffix in ["", *(f"-{n}" for n in range(2, 100))]:
+        name = f"edit-{plan_id}-{stamp}{suffix}"
+        if not (binding.scratch / name).exists() and not _is_link(binding.scratch / name):
+            break
+    else:
+        raise DirectorError("E_WRITE", "Could not choose a new edit folder name.")
     folder = safe_directory(binding.scratch, name)
     manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     for filename, content in (("manifest.json", manifest_text), ("report.md", rm.render_report(manifest))):
         with open(folder / filename, "x", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
     return folder
+
+
+# --------------------------------------------------------------------------- CLI (testing and troubleshooting)
+
+def _copy_to_clipboard(text):
+    import tkinter
+    root = tkinter.Tk()
+    root.withdraw()
+    try:
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+    finally:
+        root.destroy()
+
+
+def _write_user_file(path, text):
+    with open(path, "x", encoding="utf-8", newline="\n") as handle:  # never overwrite
+        handle.write(text)
+
+
+def main(argv=None):
+    """``python -m autoclipper.director_ai {export,import,plan-build} SCRATCH --session-root FOLDER ...``"""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(prog="director_ai", description=(__doc__ or "").splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("export", "import", "plan-build"):
+        cmd = commands.add_parser(name)
+        cmd.add_argument("scratch", type=Path, help="Scratch folder printed by director_poc prepare")
+        cmd.add_argument("--session-root", type=Path, required=True,
+                         help="Recording folder used as --session-root at prepare (read only)")
+        if name == "export":
+            cmd.add_argument("--notes", nargs="+", help="Note ids to include (default: all live notes)")
+            cmd.add_argument("--tag")
+            cmd.add_argument("--query")
+            cmd.add_argument("--full-transcript", action="store_true")
+            cmd.add_argument("--no-save-prompt", action="store_true", help="Keep hashes only in scratch")
+            cmd.add_argument("--out", type=Path, help="New file that receives the prompt")
+            cmd.add_argument("--copy", action="store_true", help="Copy the prompt to the clipboard")
+        elif name == "import":
+            cmd.add_argument("response", type=Path, help="Text file with the AI's answer")
+            cmd.add_argument("--provider", default="unspecified")
+            cmd.add_argument("--companion-closed", action="store_true",
+                             help="Confirm the Director companion for this scratch is closed")
+            cmd.add_argument("--no-save-response", action="store_true")
+            cmd.add_argument("--repair-out", type=Path, help="New file that receives the repair prompt")
+        else:
+            cmd.add_argument("plan_id")
+            cmd.add_argument("--dry-run", action="store_true", help="Compile and write files; do not contact Resolve")
+            cmd.add_argument("--confirm-project-manager", action="store_true",
+                             help="Resolve is open on the Project Manager and the current project is saved and closed")
+    args = parser.parse_args(argv)
+    try:
+        binding = open_scratch(str(args.scratch), str(args.session_root))
+        if args.command == "export":
+            out = export_packet(binding, note_ids=args.notes, tag=args.tag, query=args.query,
+                                full_transcript=args.full_transcript, save_prompt=not args.no_save_prompt)
+            if args.out:
+                _write_user_file(args.out, out["prompt"])
+            if args.copy:
+                _copy_to_clipboard(out["prompt"])
+            print(json.dumps({k: v for k, v in out.items() if k != "prompt"}, indent=2))
+            return 0
+        if args.command == "import":
+            text = args.response.read_text(encoding="utf-8-sig")
+            result = import_response(binding, text, provider=args.provider, save_response=not args.no_save_response,
+                                     companion_closed=args.companion_closed)
+            if not result["ok"]:
+                sys.stdout.write(result["report"] + "\n")
+                if result["repair_prompt"]:
+                    if args.repair_out:
+                        _write_user_file(args.repair_out, result["repair_prompt"])
+                        print(f"Repair prompt written to {args.repair_out}")
+                    else:
+                        sys.stdout.write("\n" + result["repair_prompt"])
+                return 1
+            print(json.dumps({"plan_id": result["plan_id"], "export_id": result["export_id"],
+                              "segments": result["segments"], "warnings": len(result["warnings"])}, indent=2))
+            return 0
+        if not (args.dry_run or args.confirm_project_manager):
+            raise DirectorError("E_CONFIRM", "Pass --dry-run, or --confirm-project-manager to build in Resolve.")
+        manifest, summary = compile_plan(binding, args.plan_id)
+        if summary["blockers"]:
+            raise DirectorError("E_COMPILE", "The plan has blockers: " + "; ".join(
+                b["message"] for b in summary["blocker_rows"]))
+        folder = write_edit_files(binding, args.plan_id, manifest)
+        if args.dry_run:
+            print(json.dumps({"edit_dir": str(folder), "segments": summary["segments"], "slates": summary["slates"]},
+                             indent=2))
+            return 0
+        from .resolve_builder import build_export
+        name = new_project_name()
+        built = build_export(manifest, project_name=name)
+        with open(folder / "build.json", "x", encoding="utf-8", newline="\n") as handle:
+            json.dump(built, handle, indent=2, ensure_ascii=False)
+        print(f"Reopened {name} / {built.get('timeline')}")
+        return 0
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        parser.exit(2, f"{parser.prog}: {exc}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
